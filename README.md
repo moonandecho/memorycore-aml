@@ -157,7 +157,13 @@ Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_TH
 
 - [mnemosyne-memory](https://github.com/mnemosyne-oss/mnemosyne) — MIT,
   by AxDSan. The in-process memory engine used by `LocalBackend`.
+- [fastembed](https://github.com/qdrant/fastembed) — Apache-2.0,
+  by Qdrant. ONNX embedding runtime that loads the bundled models.
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — MIT.
 - [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5) — MIT,
   by Beijing Academy of Artificial Intelligence. Default Chinese embedding model.
 - [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) — MIT,
   by Beijing Academy of Artificial Intelligence. Bundled English embedding model.
+
+The bundled ONNX model files carry their own license notice; see
+[memorycore/assets/fastembed-cache/THIRD_PARTY_MODELS.md](memorycore/assets/fastembed-cache/THIRD_PARTY_MODELS.md).

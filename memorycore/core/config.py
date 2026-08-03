@@ -45,14 +45,27 @@ MNEMOSYNE_DATA_DIR = os.environ.get(
 if "MNEMOSYNE_DATA_DIR" not in os.environ:
     os.environ["MNEMOSYNE_DATA_DIR"] = MNEMOSYNE_DATA_DIR
 
+# Fastembed cache directory — where the ONNX embedding model lives.
+# The model is bundled with the package (memorycore/assets/fastembed-cache/)
+# and auto-deployed into this directory on first use (never downloads).
+# Default ~/.memorycore/fastembed; override with MNEMOSYNE_FASTEMBED_CACHE_DIR.
+MNEMOSYNE_FASTEMBED_CACHE_DIR = os.environ.get(
+    "MNEMOSYNE_FASTEMBED_CACHE_DIR",
+    os.path.normpath(os.path.join(MNEMOSYNE_DATA_DIR, "..", "fastembed")),
+)
+if "MNEMOSYNE_FASTEMBED_CACHE_DIR" not in os.environ:
+    os.environ["MNEMOSYNE_FASTEMBED_CACHE_DIR"] = MNEMOSYNE_FASTEMBED_CACHE_DIR
+
 # Local embedding model — fastembed built-in (no API key needed).
-# bge-small-zh-v1.5: Chinese-optimised, 512-dim, MIT license, ~50 MB.
-# Set MNEMOSYNE_EMBEDDING_API_URL to use an external API instead.
+# bge-small-zh-v1.5: Chinese-optimised, 512-dim, MIT license.
+# The model is shipped inside the package; no download needed.
+# Set MNEMOSYNE_EMBEDDING_API_URL to use an external embedding API instead
+# (e.g. Ollama, OpenAI, local llama.cpp).
 if "MNEMOSYNE_EMBEDDING_MODEL" not in os.environ:
     os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = "BAAI/bge-small-zh-v1.5"
-# Deliberately do NOT set MNEMOSYNE_EMBEDDING_API_URL so the library uses
-# fastembed (local ONNX) by default. Users who want Ollama / OpenAI / etc.
-# can set MNEMOSYNE_EMBEDDING_API_URL themselves.
+# Deliberately do NOT set MNEMOSYNE_EMBEDDING_API_URL — the library uses
+# local fastembed by default.  No HF_ENDPOINT / NO_EMBEDDINGS flags are set;
+# the model is available locally so zero network is required.
 
 # ---- LLM (optional, merge enhancement for ambiguous groups) ----
 # Used by overflow merge when rule-based dedup cannot resolve an ambiguous

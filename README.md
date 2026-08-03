@@ -41,27 +41,31 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 ```bash
 pip install origin-memorycore
 
-# That's it! MemoryCore now runs entirely locally:
-#   - Hot tier: MEMORY.md / USER.md (default ~/.hermes/memories)
-#   - Cold tier: SQLite via mnemosyne-memory (default ~/.memorycore/data)
+# That's it! MemoryCore runs entirely locally:
+#   - Hot tier:  MEMORY.md / USER.md (default ~/.hermes/memories)
+#   - Cold tier: SQLite via mnemosyne-memory (default ~/.memorycore/data/)
+#   - Embedding: BAAI/bge-small-zh-v1.5 bundled — no download, no network
 python -m memorycore.server          # stdio transport (default)
 ```
 
-On first run the local embedding model (`BAAI/bge-small-zh-v1.5`, ~50 MB,
-MIT license) is downloaded automatically via fastembed. If your network
-cannot reach huggingface.co, fastembed will try the GCS mirror first.
+The embedding model is **shipped inside the package**.  On first run
+MemoryCore automatically deploys it from the package into
+`~/.memorycore/fastembed/` (one-time copy, ~91 MB).  No huggingface.co
+access, no GCS mirror, no network at all.
 
-**Troubleshooting the first download:**
+**Data directory layout** (all under `~/.memorycore/`):
 
-- If the download fails (e.g. behind a restrictive firewall), you can
-  point `MNEMOSYNE_EMBEDDING_API_URL` at any OpenAI-compatible embedding
-  API (Ollama, local llama.cpp, etc.) and set `MNEMOSYNE_EMBEDDING_MODEL`
-  to the model name served by that endpoint.
-- The data directory defaults to `~/.memorycore/data`.  Override with
-  `MNEMOSYNE_DATA_DIR`.
+```
+~/.memorycore/
+├── data/          # SQLite database (MNEMOSYNE_DATA_DIR)
+└── fastembed/     # ONNX embedding model (auto-deployed on first use)
+```
+
+Override with `MNEMOSYNE_DATA_DIR` or `MNEMOSYNE_FASTEMBED_CACHE_DIR`.
+
+**Optional — use an external embedding API** instead of the bundled model:
 
 ```bash
-# Example: use Ollama bge-m3 instead of fastembed
 export MNEMOSYNE_EMBEDDING_API_URL="http://localhost:11434/v1"
 export MNEMOSYNE_EMBEDDING_MODEL="bge-m3"
 ```
@@ -117,8 +121,9 @@ See [examples/cold-store-contract.md](examples/cold-store-contract.md) for the f
 | `MEMORYCORE_COLD_BACKEND` | `local` | Cold-tier backend: `local` (in-process) or `remote` (MCP) |
 | `MNEMOSYNE_URL` | *(empty)* | Cold-tier MCP endpoint (required for `remote` mode) |
 | `MNEMOSYNE_DATA_DIR` | `~/.memorycore/data` | Local SQLite data directory |
-| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-zh-v1.5` | Local embedding model (512-dim, Chinese) |
-| `MNEMOSYNE_EMBEDDING_API_URL` | *(empty)* | External embedding API (unset = fastembed built-in) |
+| `MNEMOSYNE_FASTEMBED_CACHE_DIR` | `~/.memorycore/fastembed` | Local ONNX embedding model cache |
+| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-zh-v1.5` | Local embedding model (512-dim, Chinese, MIT) |
+| `MNEMOSYNE_EMBEDDING_API_URL` | *(empty)* | External embedding API (unset = bundled model, zero network) |
 | `MEMORY_DIR` | `~/.hermes/memories` | Hot-tier directory (`MEMORY.md` / `USER.md`) |
 | `MNEMOSYNE_TIMEOUT` | `10.0` | Cold-tier request timeout (remote mode, seconds) |
 

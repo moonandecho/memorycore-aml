@@ -8,7 +8,10 @@ Two backends, same interface (remember/recall/update/forget/stats):
 Selection: env MEMORYCORE_COLD_BACKEND, default "local".
 """
 import json
+import os
+import shutil
 import urllib.error
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .core.config import COLD_BACKEND, MNEMOSYNE_URL  # noqa: E402
@@ -28,13 +31,63 @@ class LocalBackend:
     shapes to match the remote backend's dict contracts.
 
     Data lands in the directory specified by MNEMOSYNE_DATA_DIR
-    (default ~/.memorycore/data).  Embeddings use fastembed by default
-    (model BAAI/bge-small-zh-v1.5, ~50 MB download on first use).
+    (default ~/.memorycore/data).  The embedding model is shipped inside
+    the package (memorycore/assets/fastembed-cache/) and auto-deployed
+    into the fastembed cache directory on first use — no network download.
     """
 
     def __init__(self):
+        self._ensure_model_cache()
         from mnemosyne import Mnemosyne  # noqa: E402
         self._engine = Mnemosyne(session_id="memorycore")
+
+    # -- model cache deployment ----------------------------------------
+
+    @staticmethod
+    def _ensure_model_cache() -> None:
+        """Ensure the embedding model is present in the fastembed cache dir.
+
+        On first use the model is copied from the package's bundled assets
+        into the user's cache directory.  This is a one-time operation;
+        subsequent runs detect the existing cache and skip the copy.
+
+        If MNEMOSYNE_EMBEDDING_API_URL is set the user has opted into an
+        external embedding API — skip cache deployment entirely.
+        """
+        if os.environ.get("MNEMOSYNE_EMBEDDING_API_URL"):
+            return  # user opted for external API, no local model needed
+
+        cache_dir = Path(os.environ.get(
+            "MNEMOSYNE_FASTEMBED_CACHE_DIR",
+            os.path.expanduser("~/.memorycore/fastembed"),
+        ))
+        model_dir = cache_dir / "models--Qdrant--bge-small-zh-v1.5"
+        if model_dir.is_dir():
+            return  # already deployed
+
+        # Locate the bundled asset (works in editable installs and wheels)
+        asset_src = Path(__file__).resolve().parent / "assets" / "fastembed-cache"
+        if not asset_src.is_dir():
+            raise RuntimeError(
+                "Bundled embedding model not found at "
+                f"{asset_src}. "
+                "Reinstall the package or set "
+                "MNEMOSYNE_EMBEDDING_API_URL to use an external API."
+            )
+
+        try:
+            # copytree requires the destination NOT to exist;
+            # we pass dirs_exist_ok=True so it merges into an existing
+            # directory (the library may have created skeleton dirs).
+            shutil.copytree(
+                str(asset_src), str(cache_dir),
+                symlinks=True, dirs_exist_ok=True,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to deploy embedding model from {asset_src} "
+                f"to {cache_dir}: {exc}"
+            ) from exc
 
     # -- remember -------------------------------------------------------
 

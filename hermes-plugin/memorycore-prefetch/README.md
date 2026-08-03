@@ -3,11 +3,12 @@
 > ⚠️ **EXPERIMENTAL — known limitations at scale.** This plugin uses an
 > adaptive threshold with a fixed absolute floor (0.45).  Measurements on
 > synthetic cold tiers at 1000–3000 entries show the noise ceiling rises
-> to 0.73, admitting 87–89% of noise through the 0.45 floor.  For
-> medium-to-large cold tiers, prefer the reranker two-stage solution
-> (dense recall + cross-encoder such as bge-reranker-v2-m3).  See
-> [../../docs/ADAPTIVE_THRESHOLD.md § 大库实测](../../docs/ADAPTIVE_THRESHOLD.md#大库实测与-reranker-二阶段方案-2026-08-04)
-> for the full measurements and the production solution.
+> to 0.73, admitting 87–89% of noise through the 0.45 floor.  For this
+> reason per-turn prefetch is **off by default**: the primary retrieval
+> path is on-demand recall via the `memorycore_recall` tool, which avoids
+> the noise problem entirely by letting the agent query with intent.
+> See [../../docs/ADAPTIVE_THRESHOLD.md](../../docs/ADAPTIVE_THRESHOLD.md)
+> for the full measurements.
 
 A thin [Hermes Agent](https://github.com/NousResearch/hermes-agent) memory
 provider plugin. It provides a **static cold-store index block** via

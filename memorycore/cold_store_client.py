@@ -156,31 +156,53 @@ class LocalBackend:
     def stats(self) -> Dict[str, Any]:
         """Cold-tier statistics. Returns {total, embeddings, ...} matching remote.
 
-        Maps the library's get_stats() shape to the remote contract:
-          - total       = total_memories (legacy + BEAM working + episodic)
-          - embeddings  = number of memories with vector representations
+        Queries SQLite directly for accurate counts:
+          - total       = COUNT(*) FROM working_memory (session-scoped)
+          - embeddings  = COUNT(*) FROM vec_working_rowids (shadow table,
+                           readable without the sqlite-vec extension)
+
+        Avoids the library's get_stats() which double-counts
+        (legacy memories + BEAM working) and misses vec_working.
         """
-        s = self._engine.get_stats()
-        beam = s.get("beam", {})
-        wm = beam.get("working_memory", {})
-        ep = beam.get("episodic_memory", {})
-        total = (
-            s.get("total_memories", 0)
-            + wm.get("total", 0)
-            + ep.get("total", 0)
-        )
-        embeddings = (
-            wm.get("with_embeddings", 0)
-            + ep.get("with_embeddings", 0)
-        )
+        conn = self._engine.conn  # has sqlite-vec loaded
+        total = conn.execute(
+            "SELECT COUNT(*) FROM working_memory"
+            " WHERE session_id = ?",
+            ("memorycore",),
+        ).fetchone()[0]
+
+        embeddings = 0
+        try:
+            embeddings = conn.execute(
+                "SELECT COUNT(*) FROM vec_working_rowids"
+            ).fetchone()[0]
+        except Exception:
+            pass  # shadow table may not exist yet
+
+        ep_total = conn.execute(
+            "SELECT COUNT(*) FROM episodic_memory"
+            " WHERE session_id = ?",
+            ("memorycore",),
+        ).fetchone()[0]
+
         return {
             "total": total,
             "embeddings": embeddings,
-            "database": s.get("database", ""),
-            "mode": s.get("mode", "beam"),
+            "database": str(self._engine.db_path),
+            "mode": "beam",
             "beam": {
-                "working_memory": wm,
-                "episodic_memory": ep,
+                "working_memory": {
+                    "total": total,
+                    "consolidated": 0,
+                    "unconsolidated": total,
+                    "last": None,
+                },
+                "episodic_memory": {
+                    "total": ep_total,
+                    "last": None,
+                    "vectors": embeddings,
+                    "vec_type": "sqlite-vec",
+                },
             },
         }
 

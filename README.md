@@ -1,8 +1,8 @@
 # origin-memorycore
 
-**MCP memory tiering server for LLM agents — hot local tier + cold remote tier with automatic overflow.**
+**MCP memory tiering server for LLM agents — hot local tier + cold tier (local SQLite or remote service) with automatic overflow.**
 
-MemoryCore gives your LLM agent a two-tier memory system: frequently-used behavioral knowledge (preferences, rules, corrections) stays in a fast local file tier, while low-frequency facts are automatically migrated to a remote memory service. No more one-blob memory files that grow forever or lose important preferences to truncation.
+MemoryCore gives your LLM agent a two-tier memory system: frequently-used behavioral knowledge (preferences, rules, corrections) stays in a fast local file tier, while low-frequency facts are automatically migrated to a cold tier — an in-process SQLite engine by default, or a remote memory service if you configure one. No more one-blob memory files that grow forever or lose important preferences to truncation.
 
 Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `streamable-http` / stdio standard. Works with any MCP client, tested with [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
@@ -32,14 +32,14 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 │    └─ cold_store_client.py  →  LocalBackend (SQLite, in-process)         │
 │                               or RemoteBackend (MCP streamable-http)     │
 └──────────────────────────────────────────────────────────────────────────┘
-                     LocalBackend: mnemosyne-memory (pid)
+                     LocalBackend: mnemosyne-memory (in-process engine)
                      RemoteBackend: remote MCP memory service
 ```
 
 ## Quick Start (single machine — zero external services)
 
 ```bash
-pip install origin-memorycore
+pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
 
 # That's it! MemoryCore runs entirely locally:
 #   - Hot tier:  MEMORY.md / USER.md (default ~/.hermes/memories)
@@ -78,7 +78,6 @@ OpenAI-compatible embedding API:
 
 ```bash
 export MNEMOSYNE_EMBEDDING_API_URL="http://localhost:11434/v1"
-export MNEMOSYNE_EMBEDDING_MODEL="bge-m3"
 export MNEMOSYNE_EMBEDDING_MODEL="bge-m3"
 ```
 
@@ -156,8 +155,8 @@ Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_TH
 
 ### Third-party licenses
 
-- [mnemosyne-memory](https://github.com/abdias/mnemosyne) — MIT,
-  © Abdias J. The in-process memory engine used by `LocalBackend`.
+- [mnemosyne-memory](https://github.com/mnemosyne-oss/mnemosyne) — MIT,
+  by AxDSan. The in-process memory engine used by `LocalBackend`.
 - [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5) — MIT,
   by Beijing Academy of Artificial Intelligence. Default Chinese embedding model.
 - [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) — MIT,

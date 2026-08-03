@@ -71,15 +71,18 @@ _OVERFLOW_RETRY_DELTA = 5  # soft trigger must see >=5% growth since last overfl
                             # re-running on every write)
 
 # --- adaptive threshold config -------------------------------------------
-_BASELINE_INIT = 0.69        # initial baseline: median batch-max dense_score
+_BASELINE_INIT = 0.70        # initial baseline: median batch-max dense_score
                              # from top_k=3 semantic queries (46 samples)
-_ABS_FLOOR = 0.45            # absolute floor: below this, never inject
+_ABS_FLOOR = 0.45            # lower guardrail: below this, never inject
+                             # (calibrated on small cold tier; known to
+                             #  admit noise at 1000+ entries — see
+                             #  docs/ADAPTIVE_THRESHOLD.md § 大库实测)
 _BASELINE_WINDOW = 200       # rolling sample window
 _BASELINE_RECALC_EVERY = 50  # recompute median every N new samples
 # water-level bands -> coefficients
 _WATER_LOW = 50_000          # <50K tokens → low water
 _WATER_MID = 150_000         # 50K~150K → mid water
-_COEF_LOW = 0.80
+_COEF_LOW = 0.90
 _COEF_MID = 0.90
 _COEF_HIGH = 1.00
 # compression-point correction (combined scheme)

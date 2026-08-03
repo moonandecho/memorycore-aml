@@ -18,7 +18,6 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
   - **Cold-write dedup**: before writing to the cold tier, a semantic recall + LLM judge checks for duplicates and updates existing entries instead of creating redundant ones.
   - **Capacity hard gate**: cold tier enforces a soft limit (6000 entries, triggers one maintenance pass) and a hard limit (10000 entries, forces maintenance loops) — prevents unbounded growth.
   - **Recycle bin** (`trash_store.py`): deleted cold-tier entries are moved to `~/.memorycore/trash.json` with a 30-day expiry. Recalling a trashed entry with fresh semantic evidence restores it ("recall to revive").
-- **Adaptive recall threshold** — the optional Hermes plugin (`hermes-plugin/`) recalls the cold tier every turn, but only injects matches that clear a semantic threshold that adapts to context pressure: low water → more recall, high water (near compression) → less, saving tokens. The threshold baseline self-evolves from your real recall scores (statistics in [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md)).
 - **Graceful degradation** — cold tier unreachable? Writes fail loudly (never silently dropped), overflow keeps local entries, health check returns local status with `cold.error`.
 - **Zero core modification** — designed as a drop-in companion; your agent's built-in memory tools keep working.
 
@@ -123,7 +122,20 @@ Exposed tools:
 | `memorycore_run_cold_storage_maintenance()` | Cold-tier governance pass |
 | `memorycore_get_memory_usage()` | Hot-tier usage + cold-tier stats + thresholds |
 
-## Hermes integration (optional): adaptive per-turn prefetch
+## Hermes integration — per-turn prefetch (EXPERIMENTAL)
+
+> ⚠️ **Experimental.** The per-turn prefetch plugin is provided for
+> experimentation and small-scale use.  **Known limitation**: the adaptive
+> threshold's fixed absolute floor (0.45) was calibrated on ~37 memories;
+> at 1000–3000 entries the noise ceiling rises to 0.73 and the floor
+> admits 87–89% of noise.  The recommended path for medium-to-large cold
+> tiers is a **reranker two-stage pipeline** (dense recall + cross-encoder
+> reranker such as bge-reranker-v2-m3).  For details see
+> [docs/ADAPTIVE_THRESHOLD.md § 大库实测](docs/ADAPTIVE_THRESHOLD.md#大库实测与-reranker-二阶段方案-2026-08-04).
+>
+> **For production use** MemoryCore exposes `memorycore_recall` as the
+> primary read path — call it on-demand when you need cold-tier context;
+> it requires no extra service, no plugin, and no threshold tuning.
 
 The MCP server is client-agnostic. For **Hermes Agent** there is an
 optional companion plugin that makes the cold tier participate in every
@@ -132,9 +144,9 @@ conversation turn:
 - Every turn it recalls the cold tier (top-3) and injects matches into
   context — but only those clearing an **adaptive semantic threshold**:
   `max(0.45, rolling_baseline × coefficient)`, where the coefficient
-  tightens with context water level (low 0.80 / mid 0.90 / high 1.00).
+  tightens with context water level (low 0.90 / mid 0.90 / high 1.00).
 - Baseline self-evolves: rolling median of your real recall scores,
-  persisted to `baseline.json`; delete it to reset.
+  persisted to `baseline.json`; delete it to reset to `0.70`.
 - Design & statistics: [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
 - Install/activate/requirements: [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md).
 

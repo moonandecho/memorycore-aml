@@ -1,5 +1,14 @@
 # memorycore-prefetch — Hermes Agent plugin (adaptive recall)
 
+> ⚠️ **EXPERIMENTAL — known limitations at scale.** This plugin uses an
+> adaptive threshold with a fixed absolute floor (0.45).  Measurements on
+> synthetic cold tiers at 1000–3000 entries show the noise ceiling rises
+> to 0.73, admitting 87–89% of noise through the 0.45 floor.  For
+> medium-to-large cold tiers, prefer the reranker two-stage solution
+> (dense recall + cross-encoder such as bge-reranker-v2-m3).  See
+> [../../docs/ADAPTIVE_THRESHOLD.md § 大库实测](../../docs/ADAPTIVE_THRESHOLD.md#大库实测与-reranker-二阶段方案-2026-08-04)
+> for the full measurements and the production solution.
+
 A thin [Hermes Agent](https://github.com/NousResearch/hermes-agent) memory
 provider plugin. Every turn it recalls the cold tier (top-3) and injects the
 best matches into the agent context — but only when they clear an
@@ -18,7 +27,7 @@ public `register_memory_provider` hook and ships **zero tools**.
 
 ```
 threshold = max(ABS_FLOOR 0.45, rolling_baseline × coefficient)
-coefficient = low water 0.80 / mid water 0.90 / high water 1.00
+coefficient = low water 0.90 / mid water 0.90 / high water 1.00
 ```
 
 - **Water level** is estimated from the full conversation history via
@@ -31,10 +40,12 @@ coefficient = low water 0.80 / mid water 0.90 / high water 1.00
 - **Baseline self-evolves**: every recall records the batch-max `dense_score`
   into a 200-sample rolling window; the median is recomputed every 50 samples
   and atomically persisted to `baseline.json` next to this file. Delete that
-  file to reset to the initial value (`0.69`, measured from real top_k=3
+  file to reset to the initial value (`0.70`, measured from real top_k=3
   semantic queries — see `docs/ADAPTIVE_THRESHOLD.md` for the statistics).
-- **Absolute floor 0.45** blocks noise: unrelated queries top out at 0.403,
-  relevant ones start at 0.471 (measured separation band).
+- **Absolute floor 0.45** acts as a lower guardrail: unrelated queries
+  top out at ~0.40, relevant ones start at ~0.47 (measured separation band
+  on a small cold tier).  At scale (1000+ entries) this floor is
+  insufficient — see the Known Limitations section above.
 
 Cold tier access goes through the same `ColdStoreClient` factory as the
 server: `MEMORYCORE_COLD_BACKEND=local` (default, in-process SQLite) or

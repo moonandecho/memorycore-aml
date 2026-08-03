@@ -51,6 +51,11 @@ class LocalBackend:
         into the user's cache directory.  This is a one-time operation;
         subsequent runs detect the existing cache and skip the copy.
 
+        The cache uses real files only — no symlinks, no blobs directory.
+        This is compatible with all platforms (macOS, Linux, Windows)
+        because huggingface_hub's local_files_only path only checks
+        ``os.path.isfile()``, not symlink integrity.
+
         If MNEMOSYNE_EMBEDDING_API_URL is set the user has opted into an
         external embedding API — skip cache deployment entirely.
         """
@@ -63,7 +68,13 @@ class LocalBackend:
         ))
         model_dir = cache_dir / "models--Qdrant--bge-small-zh-v1.5"
         if model_dir.is_dir():
-            return  # already deployed
+            # Already deployed — validate the ONNX file is a real model,
+            # not a git-symlink text stub (Windows edge case).
+            onnx = model_dir / "snapshots" / "46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59" / "model_optimized.onnx"
+            if onnx.is_file() and onnx.stat().st_size < 1024:
+                shutil.rmtree(str(model_dir))  # corrupt stub, redeploy
+            else:
+                return
 
         # Locate the bundled asset (works in editable installs and wheels)
         asset_src = Path(__file__).resolve().parent / "assets" / "fastembed-cache"
@@ -76,12 +87,9 @@ class LocalBackend:
             )
 
         try:
-            # copytree requires the destination NOT to exist;
-            # we pass dirs_exist_ok=True so it merges into an existing
-            # directory (the library may have created skeleton dirs).
             shutil.copytree(
                 str(asset_src), str(cache_dir),
-                symlinks=True, dirs_exist_ok=True,
+                dirs_exist_ok=True,
             )
         except OSError as exc:
             raise RuntimeError(

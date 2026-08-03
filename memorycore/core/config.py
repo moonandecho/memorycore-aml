@@ -78,6 +78,14 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 LLM_TIMEOUT = 15.0
 
+# ---- cold tier capacity hard gate (Task C) ----
+# Before writing to the cold tier, check total entries: beyond SOFT_LIMIT run
+# one maintenance pass first; beyond HARD_LIMIT force maintenance in a loop
+# until back under SOFT_LIMIT (max 5 rounds).  With sqlite-vec enabled the
+# retrieval latency is no longer the bottleneck, so limits can be generous.
+COLD_SOFT_LIMIT = 6000   # soft: run maintenance once before writing
+COLD_HARD_LIMIT = 10000  # hard: force maintenance to shrink before writing
+
 # ---- 冷热判定关键词 (热数据特征: 每轮都要用的偏好/准则/纠正/常量) ----
 HOT_KEYWORDS = [
     "偏好", "准则", "原则", "禁止", "必须", "习惯", "要求",
@@ -89,4 +97,6 @@ HOT_KEYWORDS = [
 STALE_MARKERS = [
     "已修复", "已解决", "已切换", "已退役", "已停用",
     "已迁移", "已删除", "已完成", "不再使用", "已废弃",
+    # Task B3: 状态进行时标记, 用于过时清理 (长条目含此类标记交 LLM 判定)
+    "落地中", "进行中", "规划中", "待定", "未完成",
 ]

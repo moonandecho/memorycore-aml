@@ -14,9 +14,9 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from .local_store import LocalStore  # noqa: E402
 from .cold_store_client import ColdStoreClient  # noqa: E402
-from .core.config import SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO  # noqa: E402
+from .core.config import SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOFT_LIMIT, COLD_HARD_LIMIT  # noqa: E402
 from .core.classifier import classify, COLD, STALE  # noqa: E402
-from .core.overflow import run_overflow  # noqa: E402
+from .core.overflow import run_overflow, _recall_safe, _find_best_match, _merge_two_entries  # noqa: E402
 from .core.maintenance import run_maintenance  # noqa: E402
 
 mcp = FastMCP("memorycore")
@@ -47,6 +47,36 @@ def _force_overflow_to_target(t: str) -> None:
             return
 
 
+def _check_cold_capacity() -> None:
+    """Cold-tier capacity hard gate: check total entries before writing (Task C).
+
+    - > HARD_LIMIT: force maintenance in a loop until under SOFT_LIMIT (max 5)
+    - > SOFT_LIMIT: run one maintenance pass before continuing
+    - cold tier unreachable: skip (never block the write)
+    """
+    try:
+        stats = _client.stats()
+    except Exception:
+        return  # cold tier unreachable → degrade, skip
+
+    cold_total = stats.get("total", 0)
+
+    if cold_total > COLD_HARD_LIMIT:
+        # force maintenance to shrink, max 5 rounds
+        for _ in range(5):
+            run_maintenance(_client)
+            try:
+                stats = _client.stats()
+                cold_total = stats.get("total", 0)
+            except Exception:
+                break
+            if cold_total <= COLD_SOFT_LIMIT:
+                break
+    elif cold_total > COLD_SOFT_LIMIT:
+        # one maintenance pass before continuing
+        run_maintenance(_client)
+
+
 # ---------------------------------------------------------------------------
 # 工具 1: store_fact — 写入统一入口
 # ---------------------------------------------------------------------------
@@ -72,7 +102,42 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
                                "note": "过时状态记录, 不迁移不写入"}, ensure_ascii=False)
 
         if d == COLD:
-            # 冷数据 → 直接下沉 cold tier, 不占本地
+            # Task C: capacity hard gate — check cold-tier size before writing
+            _check_cold_capacity()
+
+            # Task A: cold data → dedup-check first, avoid cross-layer duplicates
+            try:
+                existing = _recall_safe(_client, content)
+            except Exception as e:
+                return json.dumps({"status": "error",
+                                   "detail": f"cold tier unreachable, write failed: {e}"},
+                                  ensure_ascii=False)
+
+            if existing:
+                matched = _find_best_match(content, existing)
+                if matched:
+                    if matched["level"] == "same":
+                        return json.dumps({"status": "cold_duplicate",
+                                           "detail": "cold tier already has this fact, skip"},
+                                          ensure_ascii=False)
+                    elif matched["level"] == "similar":
+                        merged = _merge_two_entries(content, matched["content"])
+                        try:
+                            r = _client.update(matched["id"], merged)
+                            if r.get("status") == "updated":
+                                return json.dumps({"status": "cold_updated",
+                                                   "memory_id": matched["id"],
+                                                   "detail": "merged into existing cold entry"},
+                                                  ensure_ascii=False)
+                            return json.dumps({"status": "error",
+                                               "detail": f"update merge failed: {r}"},
+                                              ensure_ascii=False)
+                        except Exception as e:
+                            return json.dumps({"status": "error",
+                                               "detail": f"update merge exception: {e}"},
+                                              ensure_ascii=False)
+
+            # no match → remember (original logic)
             r = _client.remember(content, importance=importance, scope=scope)
             if r.get("status") == "stored":
                 return json.dumps({"status": "cold_stored", "memory_id": r.get("memory_id"),

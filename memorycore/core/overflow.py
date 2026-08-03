@@ -223,8 +223,8 @@ def _norm_sentence(s: str) -> str:
     """规范化句子用于去重: 去空白/标点, 保留括号内容, 小写。
 
     括号内容 (路径/注释/别名如 Code Drive、SMB 共享) 是语义核心,
-    删除会导致同义句 \"D 盘=/home/echo/D (Code Drive...)\" 与
-    \"D 盘=Code Drive (path=/home/echo/D...)\" 规范化后反而不同。
+    删除会导致同义句 "D 盘=/home/user/D (Code Drive...)" 与
+    "D 盘=Code Drive (path=/home/user/D...)" 规范化后反而不同。
     """
     s = re.sub(r"[\s，。！？；;、,：:·\-—/\\=_]+", "", s)
     return s.lower()

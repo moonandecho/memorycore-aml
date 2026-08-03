@@ -14,6 +14,7 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 - **Six-step overflow** — capacity baseline → dedup → stale filtering → merge → safe write (cold first, then delete local) → verification.
 - **Cold-tier maintenance** — dedup merge, stale cleanup, conflict resolution, embedding integrity check.
 - **Capacity control** — soft threshold (overflow once before writing) / hard threshold (force overflow) / target ratio. Defaults: 60% / 80% / 40% of a 5000-char limit.
+- **Adaptive recall threshold** — the optional Hermes plugin (`hermes-plugin/`) recalls the cold tier every turn, but only injects matches that clear a semantic threshold that adapts to context pressure: low water → more recall, high water (near compression) → less, saving tokens. The threshold baseline self-evolves from your real recall scores (statistics in [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md)).
 - **Graceful degradation** — cold tier unreachable? Writes fail loudly (never silently dropped), overflow keeps local entries, health check returns local status with `cold.error`.
 - **Zero core modification** — designed as a drop-in companion; your agent's built-in memory tools keep working.
 
@@ -34,6 +35,13 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 └──────────────────────────────────────────────────────────────────────────┘
                      LocalBackend: mnemosyne-memory (in-process engine)
                      RemoteBackend: remote MCP memory service
+
+Optional (Hermes Agent only): hermes-plugin/memorycore-prefetch
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │ MemoryProvider plugin (per-turn cold recall, adaptive threshold)      │
+  │   sync_turn → water level → coefficient → threshold                   │
+  │   prefetch  → ColdStoreClient.recall_results(top_k=3) → filtered      │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start (single machine — zero external services)
@@ -110,6 +118,26 @@ Exposed tools:
 | `memorycore_trigger_overflow(target)` | Run six-step overflow, target ≤40% |
 | `memorycore_run_cold_storage_maintenance()` | Cold-tier governance pass |
 | `memorycore_get_memory_usage()` | Hot-tier usage + cold-tier stats + thresholds |
+
+## Hermes integration (optional): adaptive per-turn prefetch
+
+The MCP server is client-agnostic. For **Hermes Agent** there is an
+optional companion plugin that makes the cold tier participate in every
+conversation turn:
+
+- Every turn it recalls the cold tier (top-3) and injects matches into
+  context — but only those clearing an **adaptive semantic threshold**:
+  `max(0.45, rolling_baseline × coefficient)`, where the coefficient
+  tightens with context water level (low 0.80 / mid 0.90 / high 1.00).
+- Baseline self-evolves: rolling median of your real recall scores,
+  persisted to `baseline.json`; delete it to reset.
+- Design & statistics: [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
+- Install/activate/requirements: [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md).
+
+```bash
+cp -r hermes-plugin/memorycore-prefetch ~/.hermes/plugins/
+hermes config set memory.provider memorycore-prefetch   # next session
+```
 
 ## Cold Store Contract
 

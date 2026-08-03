@@ -45,16 +45,19 @@ class LocalBackend:
 
     @staticmethod
     def _ensure_model_cache() -> None:
-        """Ensure the embedding model is present in the fastembed cache dir.
+        """Ensure all bundled embedding models are present in the cache dir.
 
-        On first use the model is copied from the package's bundled assets
-        into the user's cache directory.  This is a one-time operation;
-        subsequent runs detect the existing cache and skip the copy.
+        On first use each model is copied from the package's bundled assets
+        into the user's fastembed cache directory.  This is a one-time
+        operation per model; subsequent runs skip models already deployed.
 
         The cache uses real files only — no symlinks, no blobs directory.
-        This is compatible with all platforms (macOS, Linux, Windows)
-        because huggingface_hub's local_files_only path only checks
-        ``os.path.isfile()``, not symlink integrity.
+        Compatible with macOS, Linux, and Windows (huggingface_hub's
+        local_files_only path only checks ``os.path.isfile()``).
+
+        Windows edge case: git on Windows may convert symlinks to tiny
+        text stubs.  If any deployed .onnx file is < 1 KB the model
+        directory is removed and redeployed from the bundled assets.
 
         If MNEMOSYNE_EMBEDDING_API_URL is set the user has opted into an
         external embedding API — skip cache deployment entirely.
@@ -66,36 +69,53 @@ class LocalBackend:
             "MNEMOSYNE_FASTEMBED_CACHE_DIR",
             os.path.expanduser("~/.memorycore/fastembed"),
         ))
-        model_dir = cache_dir / "models--Qdrant--bge-small-zh-v1.5"
-        if model_dir.is_dir():
-            # Already deployed — validate the ONNX file is a real model,
-            # not a git-symlink text stub (Windows edge case).
-            onnx = model_dir / "snapshots" / "46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59" / "model_optimized.onnx"
-            if onnx.is_file() and onnx.stat().st_size < 1024:
-                shutil.rmtree(str(model_dir))  # corrupt stub, redeploy
-            else:
-                return
 
-        # Locate the bundled asset (works in editable installs and wheels)
-        asset_src = Path(__file__).resolve().parent / "assets" / "fastembed-cache"
-        if not asset_src.is_dir():
+        asset_root = Path(__file__).resolve().parent / "assets" / "fastembed-cache"
+        if not asset_root.is_dir():
             raise RuntimeError(
-                "Bundled embedding model not found at "
-                f"{asset_src}. "
+                "Bundled embedding model assets not found at "
+                f"{asset_root}. "
                 "Reinstall the package or set "
                 "MNEMOSYNE_EMBEDDING_API_URL to use an external API."
             )
 
-        try:
-            shutil.copytree(
-                str(asset_src), str(cache_dir),
-                dirs_exist_ok=True,
-            )
-        except OSError as exc:
+        # Discover all bundled model directories
+        asset_models = sorted(
+            p for p in asset_root.iterdir()
+            if p.is_dir() and p.name.startswith("models--")
+        )
+        if not asset_models:
             raise RuntimeError(
-                f"Failed to deploy embedding model from {asset_src} "
-                f"to {cache_dir}: {exc}"
-            ) from exc
+                f"No models--* directories found in {asset_root}"
+            )
+
+        for asset_model in asset_models:
+            cache_model = cache_dir / asset_model.name
+            if cache_model.is_dir():
+                # Validate: any .onnx file that exists but is a tiny
+                # text stub (< 1 KB) means the cache is corrupt
+                # (Windows git symlink→text conversion).
+                corrupt = False
+                for onnx in cache_model.rglob("*.onnx"):
+                    if onnx.is_file() and onnx.stat().st_size < 1024:
+                        corrupt = True
+                        break
+                if corrupt:
+                    shutil.rmtree(str(cache_model))
+                else:
+                    continue  # model already healthy, skip copy
+
+            # Deploy this model from assets to cache
+            try:
+                shutil.copytree(
+                    str(asset_model), str(cache_model),
+                    dirs_exist_ok=True,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to deploy embedding model {asset_model.name} "
+                    f"to {cache_model}: {exc}"
+                ) from exc
 
     # -- remember -------------------------------------------------------
 

@@ -44,29 +44,41 @@ pip install origin-memorycore
 # That's it! MemoryCore runs entirely locally:
 #   - Hot tier:  MEMORY.md / USER.md (default ~/.hermes/memories)
 #   - Cold tier: SQLite via mnemosyne-memory (default ~/.memorycore/data/)
-#   - Embedding: BAAI/bge-small-zh-v1.5 bundled — no download, no network
+#   - Embedding: BAAI/bge-small-zh-v1.5 (Chinese) bundled — no download
 python -m memorycore.server          # stdio transport (default)
 ```
 
-The embedding model is **shipped inside the package**.  On first run
-MemoryCore automatically deploys it from the package into
-`~/.memorycore/fastembed/` (one-time copy, ~91 MB).  No huggingface.co
-access, no GCS mirror, no network at all.
+Two embedding models are **shipped inside the package** (Chinese + English).
+On first run MemoryCore auto-deploys them from the package into
+`~/.memorycore/fastembed/` (one-time copy, ~155 MB total).  No network access,
+no huggingface.co, no GCS mirror — zero download, ever.
 
 **Data directory layout** (all under `~/.memorycore/`):
 
 ```
 ~/.memorycore/
 ├── data/          # SQLite database (MNEMOSYNE_DATA_DIR)
-└── fastembed/     # ONNX embedding model (auto-deployed on first use)
+└── fastembed/     # ONNX embedding models (auto-deployed on first use)
 ```
 
 Override with `MNEMOSYNE_DATA_DIR` or `MNEMOSYNE_FASTEMBED_CACHE_DIR`.
 
-**Optional — use an external embedding API** instead of the bundled model:
+### Language switching
+
+Default is Chinese (`BAAI/bge-small-zh-v1.5`, 512-dim).  Switch to
+English (384-dim) with an env var — the model is already on disk:
+
+```bash
+export MNEMOSYNE_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"
+python -m memorycore.server
+```
+
+For other languages or stronger multilingual recall, point at any
+OpenAI-compatible embedding API:
 
 ```bash
 export MNEMOSYNE_EMBEDDING_API_URL="http://localhost:11434/v1"
+export MNEMOSYNE_EMBEDDING_MODEL="bge-m3"
 export MNEMOSYNE_EMBEDDING_MODEL="bge-m3"
 ```
 
@@ -147,4 +159,6 @@ Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_TH
 - [mnemosyne-memory](https://github.com/abdias/mnemosyne) — MIT,
   © Abdias J. The in-process memory engine used by `LocalBackend`.
 - [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5) — MIT,
-  by Beijing Academy of Artificial Intelligence. Default local embedding model.
+  by Beijing Academy of Artificial Intelligence. Default Chinese embedding model.
+- [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) — MIT,
+  by Beijing Academy of Artificial Intelligence. Bundled English embedding model.

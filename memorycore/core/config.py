@@ -57,9 +57,12 @@ if "MNEMOSYNE_FASTEMBED_CACHE_DIR" not in os.environ:
     os.environ["MNEMOSYNE_FASTEMBED_CACHE_DIR"] = MNEMOSYNE_FASTEMBED_CACHE_DIR
 
 # Local embedding model — fastembed built-in (no API key needed).
-# bge-small-zh-v1.5: Chinese-optimised, 512-dim, MIT license.
-# The model is shipped inside the package; no download needed.
-# Set MNEMOSYNE_EMBEDDING_API_URL to use an external embedding API instead
+# Two models are bundled in the package:
+#   BAAI/bge-small-zh-v1.5  (default) — Chinese-optimised, 512-dim, MIT
+#   BAAI/bge-small-en-v1.5            — English-optimised, 384-dim, MIT
+# Switch languages by setting this env var; the model is already on disk
+# (zero download).  For other languages or custom models, set
+# MNEMOSYNE_EMBEDDING_API_URL to use an external embedding API instead
 # (e.g. Ollama, OpenAI, local llama.cpp).
 if "MNEMOSYNE_EMBEDDING_MODEL" not in os.environ:
     os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = "BAAI/bge-small-zh-v1.5"

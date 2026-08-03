@@ -128,10 +128,9 @@ Exposed tools:
 > experimentation and small-scale use.  **Known limitation**: the adaptive
 > threshold's fixed absolute floor (0.45) was calibrated on ~37 memories;
 > at 1000–3000 entries the noise ceiling rises to 0.73 and the floor
-> admits 87–89% of noise.  The recommended path for medium-to-large cold
-> tiers is a **reranker two-stage pipeline** (dense recall + cross-encoder
-> reranker such as bge-reranker-v2-m3).  For details see
-> [docs/ADAPTIVE_THRESHOLD.md § 大库实测](docs/ADAPTIVE_THRESHOLD.md#大库实测与-reranker-二阶段方案-2026-08-04).
+> admits 87–89% of noise — which is why per-turn prefetch is **off by
+> default**.  For details see
+> [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
 >
 > **For production use** MemoryCore exposes `memorycore_recall` as the
 > primary read path — call it on-demand when you need cold-tier context;

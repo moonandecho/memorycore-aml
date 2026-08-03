@@ -148,9 +148,12 @@ A global statistical baseline is robust to per-query outliers.
 2. **top1–top2 分差 (gap12)**: scene gap12 中位 0.0096 vs noise 0.0047，分布重叠；gate ≥ 0.02 噪声仍剩 8% 但 scene 只剩 24.5%（误杀 75%）。
 3. **kNN 相对距离**: scene 相对距离中位 3.0 vs noise 4.0，分布重叠；gate ≥ 2.0 语义误杀 67.5%。
 
-### 交叉编码器 reranker 验证（生产版采用）
+### 交叉编码器 reranker 验证（调研记录; 生产版已退役）
 
-生产版（私有部署）采用 **reranker 二阶段**方案替代固定阈值：
+> ⚠️ 2026-08-04 用户拍板: reranker 路线不再启用（生产版与开源版均不采用），
+> llama-rerank.service 已退役归档。本节为当时调研与验证记录, 保留供参考。
+
+生产版曾采用 **reranker 二阶段**方案替代固定阈值（2026-08-04 退役）:
 
 - **第一阶段**: dense 召回 (top_k=3, bge-m3 1024-dim)
 - **第二阶段**: bge-reranker-v2-m3 交叉编码器精判（通过 llama.cpp `--reranking` 模式；注意 Ollama 官方不支持 rerank API）
@@ -161,7 +164,7 @@ A global statistical baseline is robust to per-query outliers.
 ### 定位声明
 
 - **开源版** (`origin-memorycore`): 保持轻量——推荐用法为 `memorycore_recall` 按需召回，不引入额外服务或依赖。per-turn prefetch 插件（`hermes-plugin/memorycore-prefetch/`）标记为 **Experimental**，已知局限见上。
-- **生产版**（私有部署）: 采用 reranker 二阶段 (dense 召回 + bge-reranker-v2-m3 精判)，阈值 -2.0（真实数据校准; 真相关 ≥ +0.4, 噪声 ≤ -2.9），由 reranker 分数做最终准入判断。
+- **生产版**（私有部署, 2026-08-04 已退役）: 曾采用 reranker 二阶段 (dense 召回 + bge-reranker-v2-m3 精判)，阈值 -2.0（真实数据校准; 真相关 ≥ +0.4, 噪声 ≤ -2.9）。现与开源版一致: 按需召回为主, prefetch 降级实验特性。
 
 ## Reproducing the measurements
 

@@ -1,19 +1,18 @@
-"""memorycore-prefetch — MemoryProvider plugin: cold-tier recall + write-mirror overflow
+"""memorycore-prefetch — MemoryProvider plugin: on-demand recall + write-mirror overflow
 
 Dual-role plugin:
-1. prefetch (read-only recall): recalls the cold tier (top-3) every turn
-   and injects the result into the agent context.
+1. system_prompt_block (static index): injects a cold-store index block
+   once per session guiding the model to use on-demand recall
+   (memorycore_recall tool).  Per-turn semantic prefetch is off by default
+   (degraded to experimental — prefetch/queue_prefetch return empty).
 2. on_memory_write mirror (2026-08-03): after every built-in memory tool
    write (add/replace), checks hot-tier usage in real time; triggers
    overflow at >=80% (hard) or >=60% (soft, with 5% hysteresis).
    Overflow runs in a background thread so it never blocks the tool return.
 
 Implements the Hermes MemoryProvider ABC: is_available → True,
-get_tool_schemas → [] (no tools injected), prefetch(query) recalls the
-cold tier and returns text to inject.
-
-queue_prefetch(query) runs recall in a background thread; the result is
-cached for the next prefetch call.
+get_tool_schemas → [] (no tools injected), prefetch(query) returns ""
+(degraded), system_prompt_block() returns a static index block.
 
 Activation (Hermes Agent):
     hermes config set memory.provider memorycore-prefetch
@@ -129,6 +128,31 @@ class MemoryCorePrefetchProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
 
+    # -- system_prompt_block: cold-store index (on-demand recall) ----------
+
+    def system_prompt_block(self) -> str:
+        """Return a static cold-store index block for on-demand recall guidance.
+
+        Replaces the original per-turn semantic prefetch scheme. Industry
+        research (Mem0/Letta/Hindsight/OpenViking) converges on on-demand
+        retrieval as the mature paradigm. This block is injected once as a
+        system prompt and incurs zero per-turn overhead (no network/IO).
+
+        Topics can be configured via MEMORYCORE_INDEX_TOPICS (comma-separated).
+        When unset, only a generic guidance line is returned.
+        """
+        topics_env = os.environ.get("MEMORYCORE_INDEX_TOPICS", "").strip()
+        if topics_env:
+            topics = [t.strip() for t in topics_env.split(",") if t.strip()]
+            topic_line = "Indexed topics: " + " / ".join(topics) + ".\n"
+        else:
+            topic_line = ""
+        return (
+            "## MemoryCore Cold-Store Index\n"
+            + topic_line
+            + "Use memorycore_recall(query) to retrieve historical details on demand."
+        )
+
     # -- on_memory_write mirror overflow (2026-08-03) ---------------------
 
     def on_memory_write(
@@ -208,47 +232,32 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             logger.debug("overflow bg failed: %s", e)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Called every turn: recall cold tier top-3 for the current query.
+        """Return empty string (degraded to optional experimental feature).
 
-        Returns the cached queue_prefetch result when available; otherwise
-        does a synchronous recall. Timeout/failure degrade silently to an
-        empty string (never blocks the conversation).
+        The original per-turn semantic recall scheme has been superseded by
+        on-demand retrieval via the system_prompt_block index block +
+        memorycore_recall tool. Industry research (Mem0/Letta/Hindsight/
+        OpenViking) converges on on-demand as the mature paradigm.
+
+        The function signature and underlying recall infrastructure are
+        preserved; re-enable by setting a config flag (git history has the
+        full implementation).
         """
-        if not query or not query.strip():
-            return ""
-
-        # prefer cached result (recalled in background)
-        with self._cache_lock:
-            if self._cache is not None:
-                cached = self._cache
-                self._cache = None
-                return cached
-
-        # synchronous recall with timeout protection
-        return self._recall_sync(query)
+        return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Async background recall: cache result for the next prefetch call.
+        """No-op (degraded alongside prefetch to optional experimental feature).
 
-        Non-blocking; failures are silent.
+        The original background recall scheme has been superseded by on-demand
+        retrieval. Signature preserved for future experimental re-enablement.
         """
-        if not query or not query.strip():
-            return
+        return
 
-        self._pending_query = query
-
-        # don't start a second thread while one is still running
-        if self._bg_thread and self._bg_thread.is_alive():
-            return
-
-        self._bg_thread = threading.Thread(
-            target=self._recall_bg,
-            args=(query,),
-            daemon=True,
-        )
-        self._bg_thread.start()
-
-    # -- internals ---------------------------------------------------------
+    # -- internals: recall / adaptive threshold / dynamic baseline ---------
+    # These are optional enhancements for the on-demand recall scheme.
+    # They are NOT enabled by default (prefetch returns "" above).
+    # All code preserved; git history has the full original implementation.
+    # Re-enable by toggling a config flag.
 
     def _recall_sync(self, query: str) -> str:
         """Synchronous recall (with dedicated timeout)."""

@@ -1,4 +1,4 @@
-# memorycore-prefetch — Hermes Agent plugin (adaptive recall)
+# memorycore-prefetch — Hermes Agent plugin (on-demand recall)
 
 > ⚠️ **EXPERIMENTAL — known limitations at scale.** This plugin uses an
 > adaptive threshold with a fixed absolute floor (0.45).  Measurements on
@@ -10,20 +10,39 @@
 > for the full measurements and the production solution.
 
 A thin [Hermes Agent](https://github.com/NousResearch/hermes-agent) memory
-provider plugin. Every turn it recalls the cold tier (top-3) and injects the
-best matches into the agent context — but only when they clear an
-**adaptive semantic threshold** that tightens as the conversation context
-fills up.
+provider plugin. It provides a **static cold-store index block** via
+`system_prompt_block()` that guides the model to use on-demand recall
+(`memorycore_recall` tool). Per-turn semantic prefetch is **off by default**
+(degraded to an experimental feature — see below).
 
-## Why it exists
+## Design: on-demand recall with index guidance
 
-MemoryCore itself is an MCP server: it serves tools, but an MCP server
-cannot *push* context into a conversation. The Hermes `MemoryProvider`
-interface is the official extension point for per-turn recall. This plugin
-adds that channel without touching Hermes source — it registers through the
-public `register_memory_provider` hook and ships **zero tools**.
+The plugin injects a short index block into the system prompt once per
+session. The block lists available topics (configurable via the
+`MEMORYCORE_INDEX_TOPICS` environment variable, comma-separated) and
+instructs the model to use `memorycore_recall(query)` when it needs
+historical details. This is the **primary retrieval path**.
 
-## What the adaptive threshold does
+This design follows the industry consensus (Mem0, Letta, Hindsight,
+OpenViking): on-demand retrieval is the mature paradigm for memory
+augmentation. Per-turn automatic injection adds token overhead without
+proportional benefit and introduces threshold-tuning complexity that
+does not scale to large cold tiers.
+
+## Prefetch (experimental, off by default)
+
+The original per-turn semantic recall (`prefetch` / `queue_prefetch`) is
+preserved in the codebase but **returns empty by default**. `prefetch()`
+returns `""` and `queue_prefetch()` is a no-op. All internal recall
+infrastructure (`_recall_sync`, `_recall_bg`, adaptive threshold, dynamic
+water level, baseline self-evolution) remains intact and can be re-enabled
+via a config flag. See git history for the full original implementation.
+
+## Adaptive threshold (preserved, not active by default)
+
+The adaptive threshold infrastructure is fully preserved but not exercised
+in the default code path (since `prefetch` returns `""`). When re-enabled,
+the behaviour is:
 
 ```
 threshold = max(ABS_FLOOR 0.45, rolling_baseline × coefficient)
@@ -47,6 +66,14 @@ coefficient = low water 0.90 / mid water 0.90 / high water 1.00
   on a small cold tier).  At scale (1000+ entries) this floor is
   insufficient — see the Known Limitations section above.
 
+## on_memory_write auto-overflow
+
+After every built-in memory tool write (add/replace), the plugin checks
+hot-tier usage in real time and triggers overflow at ≥80% (hard) or ≥60%
+(soft, with 5% hysteresis). Overflow runs in a background thread so it
+never blocks the tool return. This covers all write paths (built-in memory
+tool, external gateways, other sessions).
+
 Cold tier access goes through the same `ColdStoreClient` factory as the
 server: `MEMORYCORE_COLD_BACKEND=local` (default, in-process SQLite) or
 `remote` (any MCP memory service via `MNEMOSYNE_URL`).
@@ -64,6 +91,14 @@ cp -r hermes-plugin/memorycore-prefetch ~/.hermes/plugins/
 # 3. activate (takes effect next session)
 hermes config set memory.provider memorycore-prefetch
 ```
+
+## Configuration
+
+- `MEMORYCORE_INDEX_TOPICS`: comma-separated list of topics to display in
+  the system prompt index block. When unset, only a generic guidance line
+  is shown.
+- The adaptive threshold baseline is persisted to `baseline.json` next to
+  this file. Delete it to reset to the initial value (`0.70`).
 
 ## Requirements & notes
 

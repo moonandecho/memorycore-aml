@@ -14,6 +14,10 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 - **Six-step overflow** — capacity baseline → dedup → stale filtering → merge → safe write (cold first, then delete local) → verification.
 - **Cold-tier maintenance** — dedup merge, stale cleanup, conflict resolution, embedding integrity check.
 - **Capacity control** — soft threshold (overflow once before writing) / hard threshold (force overflow) / target ratio. Defaults: 60% / 80% / 40% of a 5000-char limit.
+- **Triple governance (v3)** — three layers of protection for cold-tier data integrity:
+  - **Cold-write dedup**: before writing to the cold tier, a semantic recall + LLM judge checks for duplicates and updates existing entries instead of creating redundant ones.
+  - **Capacity hard gate**: cold tier enforces a soft limit (6000 entries, triggers one maintenance pass) and a hard limit (10000 entries, forces maintenance loops) — prevents unbounded growth.
+  - **Recycle bin** (`trash_store.py`): deleted cold-tier entries are moved to `~/.memorycore/trash.json` with a 30-day expiry. Recalling a trashed entry with fresh semantic evidence restores it ("recall to revive").
 - **Adaptive recall threshold** — the optional Hermes plugin (`hermes-plugin/`) recalls the cold tier every turn, but only injects matches that clear a semantic threshold that adapts to context pressure: low water → more recall, high water (near compression) → less, saving tokens. The threshold baseline self-evolves from your real recall scores (statistics in [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md)).
 - **Graceful degradation** — cold tier unreachable? Writes fail loudly (never silently dropped), overflow keeps local entries, health check returns local status with `cold.error`.
 - **Zero core modification** — designed as a drop-in companion; your agent's built-in memory tools keep working.
@@ -138,6 +142,17 @@ conversation turn:
 cp -r hermes-plugin/memorycore-prefetch ~/.hermes/plugins/
 hermes config set memory.provider memorycore-prefetch   # next session
 ```
+
+## Notes for sqlite-vec users
+
+If you enable sqlite-vec vector indexing for the Mnemosyne cold tier, be aware
+that `beam.py`'s `_wm_vec_search_sqlite` uses a raw similarity formula
+`sim = 1 - distance / (2 * EMBEDDING_DIM)` that collapses float32 distances to
+~1.0, making the dynamic threshold effectively useless (all results pass).
+
+**Patch**: in the float32 branch, replace the formula with
+`sim = 1 - d² / 2` — this gives the exact cosine similarity for normalised
+vectors and restores correct threshold behaviour.
 
 ## Cold Store Contract
 

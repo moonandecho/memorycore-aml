@@ -1,8 +1,12 @@
-"""memorycore-prefetch — Hermes MemoryProvider plugin: per-turn cold-tier recall
+"""memorycore-prefetch — MemoryProvider plugin: cold-tier recall + write-mirror overflow
 
-Thin read-only plugin that recalls the cold tier (top-3) every turn and
-injects the result into the agent context. Governance logic lives in the
-MemoryCore MCP server; this plugin only does prefetch (read-only recall).
+Dual-role plugin:
+1. prefetch (read-only recall): recalls the cold tier (top-3) every turn
+   and injects the result into the agent context.
+2. on_memory_write mirror (2026-08-03): after every built-in memory tool
+   write (add/replace), checks hot-tier usage in real time; triggers
+   overflow at >=80% (hard) or >=60% (soft, with 5% hysteresis).
+   Overflow runs in a background thread so it never blocks the tool return.
 
 Implements the Hermes MemoryProvider ABC: is_available → True,
 get_tool_schemas → [] (no tools injected), prefetch(query) recalls the
@@ -33,18 +37,38 @@ from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
-# Use the open-source cold_store_client (pip-installed origin-memorycore).
+# Use the open-source memorycore package (pip-installed origin-memorycore).
 # Fallback: repo root two levels up (development mode, not pip-installed).
 try:
     from memorycore.cold_store_client import ColdStoreClient  # noqa: E402
+    from memorycore.local_store import LocalStore  # noqa: E402
+    from memorycore.core.config import (  # noqa: E402
+        SOFT_THRESHOLD,
+        HARD_THRESHOLD,
+        CHAR_LIMIT_MEMORY,
+        CHAR_LIMIT_USER,
+    )
+    from memorycore.core.overflow import run_overflow  # noqa: E402
 except ImportError:
     _REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     sys.path.insert(0, _REPO_ROOT)
     from memorycore.cold_store_client import ColdStoreClient  # noqa: E402
+    from memorycore.local_store import LocalStore  # noqa: E402
+    from memorycore.core.config import (  # noqa: E402
+        SOFT_THRESHOLD,
+        HARD_THRESHOLD,
+        CHAR_LIMIT_MEMORY,
+        CHAR_LIMIT_USER,
+    )
+    from memorycore.core.overflow import run_overflow  # noqa: E402
 
 _TOP_K = 3
 _PREFETCH_TIMEOUT = 5.0   # prefetch-specific timeout, shorter than default 10s
 _QUEUE_TIMEOUT = 8.0      # background queue slightly more generous
+
+# --- on_memory_write auto-overflow (2026-08-03) ---
+_OVERFLOW_RETRY_DELTA = 5  # soft trigger must see >=5% growth since last overflow (avoid
+                            # re-running on every write)
 
 # --- adaptive threshold config -------------------------------------------
 _BASELINE_INIT = 0.69        # initial baseline: median batch-max dense_score
@@ -86,6 +110,12 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         self._baseline_value: float = _BASELINE_INIT
         self._sample_count_since_recalc: int = 0
         self._load_baseline()
+        # on_memory_write auto-overflow state
+        self._overflow_lock = threading.Lock()
+        self._overflow_thread: Optional[threading.Thread] = None
+        # target -> last post-overflow usage pct; soft trigger requires
+        # current > last + _OVERFLOW_RETRY_DELTA (debounce)
+        self._last_overflow_pct: Dict[str, int] = {}
 
     def is_available(self) -> bool:
         return True
@@ -95,6 +125,84 @@ class MemoryCorePrefetchProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
+
+    # -- on_memory_write mirror overflow (2026-08-03) ---------------------
+
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called after every built-in memory tool write: check usage, auto-overflow.
+
+        Closes the gap left by plan B — automatic overflow now covers *all*
+        writes (built-in memory tool, WeChat gateway, other sessions), not
+        just store_fact.
+
+        remove only reduces usage, never triggers overflow.
+        add/replace check usage and trigger when thresholds are crossed.
+        Overflow runs in a background thread so the memory tool return is
+        never blocked.
+        """
+        if action == "remove":
+            return
+        if target not in ("memory", "user"):
+            return
+        try:
+            limit = CHAR_LIMIT_MEMORY if target == "memory" else CHAR_LIMIT_USER
+            store = LocalStore()
+            pct = store.usage_pct(target, limit)
+            hard = int(HARD_THRESHOLD * 100)
+            soft = int(SOFT_THRESHOLD * 100)
+            if pct >= hard:
+                logger.info(
+                    "on_memory_write: %s at %d%% >= hard %d%%, force overflow",
+                    target, pct, hard,
+                )
+                self._spawn_overflow(target)
+            else:
+                last = self._last_overflow_pct.get(target, 0)
+                if pct >= soft and pct > last + _OVERFLOW_RETRY_DELTA:
+                    logger.info(
+                        "on_memory_write: %s at %d%% >= soft %d%%, overflow "
+                        "(last after=%d%%)", target, pct, soft, last,
+                    )
+                    self._spawn_overflow(target)
+        except Exception as e:
+            logger.debug("on_memory_write check failed: %s", e)
+
+    def _spawn_overflow(self, target: str) -> None:
+        """Launch overflow in a background thread (at most one at a time)."""
+        with self._overflow_lock:
+            if self._overflow_thread and self._overflow_thread.is_alive():
+                logger.debug("overflow already running, skip")
+                return
+            self._overflow_thread = threading.Thread(
+                target=self._run_overflow_bg,
+                args=(target,),
+                daemon=True,
+            )
+            self._overflow_thread.start()
+
+    def _run_overflow_bg(self, target: str) -> None:
+        """Background overflow: reuses MemoryCore run_overflow (no logic copy).
+
+        When the cold tier is unreachable, run_overflow accumulates errors
+        internally and keeps local entries — no data is lost.
+        Records post-overflow usage so the next soft trigger can debounce.
+        """
+        try:
+            store = LocalStore()
+            client = ColdStoreClient()  # default 10s timeout, needed for dedup
+            stat = run_overflow(store, client, target)
+            pct_after = int(str(stat.get("usage_after", "0%")).rstrip("%") or 0)
+            with self._overflow_lock:
+                self._last_overflow_pct[target] = pct_after
+            logger.info("overflow auto-done target=%s %s", target, stat)
+        except Exception as e:
+            logger.debug("overflow bg failed: %s", e)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Called every turn: recall cold tier top-3 for the current query.

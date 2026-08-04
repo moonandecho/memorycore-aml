@@ -17,7 +17,7 @@ import difflib
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from .classifier import classify, should_keep_local, HOT, COLD, STALE
+from .classifier import classify, classify_user_pref, should_keep_local, HOT, COLD, STALE
 
 # ---- 相似度阈值 ------------------------------------------------------------
 
@@ -63,6 +63,80 @@ def run_overflow(store, client, target: str) -> dict:
 
     stat["chars_before"] = store.char_count(target)
     stat["usage_before"] = f"{store.usage_pct(target)}%"
+
+    # ---- Step 0 (仅 user): 长条目拆分 (B 溢流治理) -------------------
+    # 对 USER.md 长条目 (>150字) 逐句分类, 核心句合并留本地, 长尾句沉冷层。
+    # 安全顺序: 先写冷层确认 stored → 再替换本地; 任一失败 → 本地保留不丢。
+    if target == "user":
+        split_new_entries = []
+        for entry in entries:
+            if len(entry) <= 150:
+                split_new_entries.append(entry)
+                continue
+            # 按句切分
+            raw_sentences = re.split(r"[。！？;；\n]", entry)
+            sentences = [s.strip() for s in raw_sentences if s.strip()]
+            if not sentences:
+                split_new_entries.append(entry)
+                continue
+            core_sents, sink_sents = [], []
+            for s in sentences:
+                if classify_user_pref(s, sentence_level=True) == "core":
+                    core_sents.append(s)
+                else:
+                    sink_sents.append(s)
+            sink_chars = sum(len(s) for s in sink_sents)
+            # 值得拆: 可沉 >= 30% 且 >= 40 字
+            if sink_chars < max(40, len(entry) * 0.3):
+                split_new_entries.append(entry)  # 不值得拆, 整条保留
+                continue
+            # 下沉: 所有 sink 句先尝试冷迁移 (原子性: 任一失败 → 整条保留原样)
+            all_sink_ok = True
+            for s in sink_sents:
+                cold_ok = False
+                try:
+                    existing = _recall_safe(client, s)
+                except Exception:
+                    existing = None
+                if existing:
+                    matched = _find_best_match(s, existing)
+                    if matched and matched["level"] == "same":
+                        cold_ok = True  # 冷层已有, 算已存
+                    elif matched and matched["level"] == "similar":
+                        merged_s = _merge_two_entries(s, matched["content"])
+                        try:
+                            r = client.update(matched["id"], merged_s)
+                            if r.get("status") == "updated":
+                                cold_ok = True
+                        except Exception:
+                            pass
+                if not cold_ok:
+                    try:
+                        r = client.remember(s, importance=0.5, scope="global")
+                        if r.get("status") == "stored":
+                            cold_ok = True
+                    except Exception:
+                        pass
+                if not cold_ok:
+                    all_sink_ok = False
+                    break  # 任一 sink 句失败 → 中止, 整条保留
+
+            if not all_sink_ok:
+                # 任一 sink 句冷迁移失败 → 整条保留原样 (不拆不沉)
+                split_new_entries.append(entry)
+                stat["errors"] += 1
+                continue
+
+            # 全部 sink 句冷迁移成功 → 应用拆分
+            stat["overflowed"] += len(sink_sents)
+            if core_sents:
+                new_entry = "。".join(core_sents) + "。"
+                split_new_entries.append(new_entry)
+            # 核心句为空 + sink 全成功 → 纯长尾条目全部下沉, 本地不留 (预期行为)
+        # 重建文件反映拆分结果
+        _rebuild_file(store, target, split_new_entries)
+        entries = split_new_entries
+        stat["chars_after_split"] = store.char_count(target)
 
     # ---- Step 4: 同类事实合并 (先于下沉) ---------------------------------
     merged_entries, merge_count = _merge_local_fragments(entries)

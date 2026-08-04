@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 from .local_store import LocalStore  # noqa: E402
 from .cold_store_client import ColdStoreClient  # noqa: E402
 from .core.config import SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOFT_LIMIT, COLD_HARD_LIMIT  # noqa: E402
-from .core.classifier import classify, COLD, STALE  # noqa: E402
+from .core.classifier import classify, classify_user_pref, COLD, STALE  # noqa: E402
 from .core.overflow import run_overflow, _recall_safe, _find_best_match, _merge_two_entries  # noqa: E402
 from .core.maintenance import run_maintenance  # noqa: E402
 
@@ -94,14 +94,27 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
         JSON: {"status": "stored"|"cold_stored"|"stale"|"error", "detail": "..."}
     """
     try:
-        decision = classify(content, importance=importance)
-        d = decision["decision"]
+        # A write routing: target="user" uses classify_user_pref (USER.md governance)
+        is_user = (target == "user")
+        if is_user:
+            d = classify_user_pref(content, importance=importance,
+                                   sentence_level=False)
+            stale_reason = None  # classify_user_pref returns no reason dict
+        else:
+            decision = classify(content, importance=importance)
+            d = decision["decision"]
+            stale_reason = decision.get("reason", "")
 
-        if d == STALE:
-            return json.dumps({"status": "stale", "detail": decision["reason"],
+        if d == STALE or d == "stale":
+            if is_user:
+                return json.dumps({"status": "stale",
+                                   "detail": "stale status record (USER.md), not written"},
+                                  ensure_ascii=False)
+            return json.dumps({"status": "stale", "detail": stale_reason,
                                "note": "过时状态记录, 不迁移不写入"}, ensure_ascii=False)
 
-        if d == COLD:
+        go_cold = (is_user and d == "sink") or (not is_user and d == COLD)
+        if go_cold:
             # Task C: capacity hard gate — check cold-tier size before writing
             _check_cold_capacity()
 
@@ -140,8 +153,9 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
             # no match → remember (original logic)
             r = _client.remember(content, importance=importance, scope=scope)
             if r.get("status") == "stored":
+                cold_detail = "USER.md long-tail fact stored to cold tier" if is_user else "低频事实已下沉冷层"
                 return json.dumps({"status": "cold_stored", "memory_id": r.get("memory_id"),
-                                   "detail": "低频事实已下沉冷层"}, ensure_ascii=False)
+                                   "detail": cold_detail}, ensure_ascii=False)
             return json.dumps({"status": "error", "detail": f"cold tier write failed: {r}"},
                               ensure_ascii=False)
 

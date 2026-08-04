@@ -1,8 +1,20 @@
 # origin-memorycore
 
-**MCP memory tiering server for LLM agents — hot local tier + cold tier (local SQLite or remote service) with automatic overflow.**
+**MemoryCore is a memory governance layer for LLM agents.**
 
-MemoryCore gives your LLM agent a two-tier memory system: frequently-used behavioral knowledge (preferences, rules, corrections) stays in a fast local file tier, while low-frequency facts are automatically migrated to a cold tier — an in-process SQLite engine by default, or a remote memory service if you configure one. No more one-blob memory files that grow forever or lose important preferences to truncation.
+Agents accumulate memory fast — preferences, facts, decisions — and memory that isn't maintained quietly degrades: duplicates accumulate, stale facts linger, the hot tier fills up and starts rejecting writes. MemoryCore keeps that from happening.
+
+It works as a two-tier memory system:
+- **Hot tier** — frequently-used behavioral knowledge (preferences, rules, corrections) in a fast local file, always in context.
+- **Cold tier** — low-frequency facts, automatically migrated out, stored in an in-process SQLite engine (or a remote memory service if you configure one).
+
+Between the two, a governance core keeps memory healthy:
+- **Write-time dedup** — similar facts are merged before storing, not duplicated.
+- **Capacity control** — soft/hard thresholds trigger overflow before the hot tier is full, so it never rejects writes.
+- **Cold-tier governance** — periodic dedup/cleanup passes keep the cold tier findable as it grows.
+- **Recycle bin** — deleted entries get a 30-day grace period; recalling a trashed entry revives it.
+
+The result: the hot tier stays within budget, the cold tier stays findable, and memory remains maintainable no matter how much the agent accumulates.
 
 Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `streamable-http` / stdio standard. Works with any MCP client, tested with [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
@@ -10,14 +22,14 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 
 ## Features
 
+- **Memory governance (the core)** — three layers of protection for cold-tier data integrity:
+  - **Cold-write dedup**: before writing to the cold tier, a semantic recall + LLM judge checks for duplicates and updates existing entries instead of creating redundant ones.
+  - **Capacity hard gate**: cold tier enforces a soft limit (6000 entries, triggers one maintenance pass) and a hard limit (10000 entries, forces maintenance loops) — prevents unbounded growth.
+  - **Recycle bin** (`trash_store.py`): deleted cold-tier entries are moved to `~/.memorycore/trash.json` with a 30-day expiry. Recalling a trashed entry with fresh semantic evidence restores it ("recall to revive").
 - **Cold/hot routing** — every write is classified: high-importance or preference-like → hot (local); low-frequency fact → cold (remote); stale status record → dropped.
 - **Six-step overflow** — capacity baseline → dedup → stale filtering → merge → safe write (cold first, then delete local) → verification.
 - **Cold-tier maintenance** — dedup merge, stale cleanup, conflict resolution, embedding integrity check.
 - **Capacity control** — soft threshold (overflow once before writing) / hard threshold (force overflow) / target ratio. Defaults: 60% / 80% / 40% of a 5000-char limit.
-- **Triple governance (v3)** — three layers of protection for cold-tier data integrity:
-  - **Cold-write dedup**: before writing to the cold tier, a semantic recall + LLM judge checks for duplicates and updates existing entries instead of creating redundant ones.
-  - **Capacity hard gate**: cold tier enforces a soft limit (6000 entries, triggers one maintenance pass) and a hard limit (10000 entries, forces maintenance loops) — prevents unbounded growth.
-  - **Recycle bin** (`trash_store.py`): deleted cold-tier entries are moved to `~/.memorycore/trash.json` with a 30-day expiry. Recalling a trashed entry with fresh semantic evidence restores it ("recall to revive").
 - **Graceful degradation** — cold tier unreachable? Writes fail loudly (never silently dropped), overflow keeps local entries, health check returns local status with `cold.error`.
 - **Zero core modification** — designed as a drop-in companion; your agent's built-in memory tools keep working.
 

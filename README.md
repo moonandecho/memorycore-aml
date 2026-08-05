@@ -53,9 +53,12 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 
 Optional (Hermes Agent only): hermes-plugin/memorycore-prefetch
   ┌───────────────────────────────────────────────────────────────────────┐
-  │ MemoryProvider plugin (per-turn cold recall, adaptive threshold)      │
-  │   sync_turn → water level → coefficient → threshold                   │
-  │   prefetch  → ColdStoreClient.recall_results(top_k=3) → filtered      │
+  │ MemoryProvider plugin (dual-channel recall, EXPERIMENTAL, off by default) │
+  │   system_prompt_block → static index (always active)                  │
+  │   prefetch → ColdStoreClient.recall_results(top_k=10)                 │
+  │            → optional reranker (MEMORYCORE_RERANK_URL)                │
+  │            → session + hot-tier dedup → top-3 injection               │
+  │   Enable: MEMORYCORE_PREFETCH_ENABLED=1                               │
   └───────────────────────────────────────────────────────────────────────┘
 ```
 

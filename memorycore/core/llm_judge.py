@@ -139,3 +139,62 @@ def judge_stale(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if "decision" not in result:
         return None
     return result
+
+
+# ---- judge_reversal: LLM 语义反转兜底 (2026-08-06 实现) ----
+
+
+def judge_reversal(entries):
+    """判定两条条目是否语义反转 (不依赖显式否定词, 靠 LLM 语义理解)。
+
+    仅当规则反转检测 (_is_reversal_pair) 因缺少否定词返回 False,
+    但两条同主题 + 时间可判时才调用。LLM 不可用 -> 返回 None -> 保守保留。
+    """
+    if not LLM_API_KEY:
+        return None
+    if len(entries) != 2:
+        return None
+
+    older = entries[0]
+    newer = entries[1]
+    old_id = older.get("id", "?")
+    new_id = newer.get("id", "?")
+    old_content = older.get("content", "")
+    new_content = newer.get("content", "")
+    old_ts = older.get("timestamp", "?")
+    new_ts = newer.get("timestamp", "?")
+
+    prompt = (
+        "你是记忆语义判定助手。以下是一对同主题的冷层记忆条目,"
+        "新条目没有显式的否定词(如不/没/停止/取消),"
+        "但可能表达了与旧条目相反/矛盾的偏好或事实。"
+        "请判断新条目是否语义上否定了/替代了旧条目:\n\n"
+        "[旧条目] 时间:" + old_ts + "\n"
+        "ID:" + old_id + "\n"
+        "内容:" + old_content + "\n\n"
+        "[新条目] 时间:" + new_ts + "\n"
+        "ID:" + new_id + "\n"
+        "内容:" + new_content + "\n\n"
+        "判定规则:\n"
+        "1. 如果新条目表达的是与旧条目相反/矛盾的偏好/事实/结论"
+        "(例如:旧说喜欢X新说改喜欢Y;旧说用方案A新说换成方案B;"
+        "旧说启用新说已替换) -> reversal\n"
+        "2. 如果新条目只是补充/细化/更新旧条目,"
+        "不构成矛盾(例如:旧说喜欢X新说也喜欢Y;旧说配置A新说配置A改端口)"
+        " -> not_reversal\n"
+        "3. 如果两条描述不同的事实/对象/场景 -> not_reversal\n"
+        "4. 如果拿不准 -> not_reversal(宁留不误删)\n"
+        '5. 只输出 JSON: {"decision":"reversal"|"not_reversal",'
+        '"older_id":"' + old_id + '","newer_id":"' + new_id + '",'
+        '"reason":"一句话判据(中文)"}\n'
+        "6. 不添加推断,不修改事实,不自由发挥"
+    )
+
+    result = _call_llm(prompt)
+    if result is None:
+        return None
+    if "decision" not in result:
+        return None
+    result.setdefault("older_id", old_id)
+    result.setdefault("newer_id", new_id)
+    return result

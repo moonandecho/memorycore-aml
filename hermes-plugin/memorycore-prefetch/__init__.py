@@ -1,8 +1,8 @@
 """memorycore-prefetch — MemoryProvider plugin: dual-channel recall + write-mirror overflow
 
 Dual-role plugin:
-1. prefetch (per-turn semantic recall): recalls the cold tier (top-10),
-   optionally re-ranks via a cross-encoder, and injects top-3 into context.
+1. prefetch (per-turn semantic recall): recalls the cold tier (top-20),
+   optionally re-ranks via a cross-encoder, and injects top-5 into context.
    **Off by default** (EXPERIMENTAL) — set MEMORYCORE_PREFETCH_ENABLED=1.
 2. on_memory_write mirror (2026-08-03): after every built-in memory tool
    write (add/replace), checks hot-tier usage in real time; triggers
@@ -64,8 +64,8 @@ except ImportError:
     )
     from memorycore.core.overflow import run_overflow  # noqa: E402
 
-_RECALL_CANDIDATES = 10    # first-stage recall candidates (before reranker)
-_INJECT_TOP_N = 3          # max injected after reranker ranking
+_RECALL_CANDIDATES = 20    # first-stage recall candidates (before reranker)
+_INJECT_TOP_N = 5          # max injected after reranker ranking
 _PREFETCH_TIMEOUT = 5.0    # prefetch-specific timeout, shorter than default 10s
 _QUERY_MAX_LEN = 1000      # recall query max chars (matches reranker query limit)
 
@@ -85,13 +85,12 @@ _OVERFLOW_RETRY_DELTA = 5  # soft trigger must see >=5% growth since last overfl
 #   Response: {"results": [{"index": 0, "relevance_score": 8.5}, ...]}
 #
 # Calibration (bge-reranker-v2-m3):
-#   True relevant (self-recall):  +8~+11
-#   True relevant (paraphrase):   ~-0.07
-#   Partially related (adjacent): +0.85
-#   Definitely unrelated:         -4~-11
-#   Threshold -2.0 sits in the safe gap between -0.1 and -4.
-_RERANK_THRESHOLD = -2.0
-_RERANK_TIMEOUT = 3.0
+#   True relevant typically scores >= -3.5; unrelated < -5.
+#   Threshold -3.5 sits in the gap (relaxed from -2.0 to keep more
+#   true relevant entries; tiered injection below filters by importance).
+_RERANK_THRESHOLD = -3.5
+_RERANK_TIER_HIGH = 0.7    # tiered injection: importance >= this sorts first
+_RERANK_TIMEOUT = 5.0
 _RERANK_QUERY_MAX = 1000   # context truncation (bge-reranker training limit 1024)
 _RERANK_DOC_MAX = 500      # memory entry truncation
 
@@ -248,8 +247,8 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         """Per-turn cold-tier recall with optional reranker refinement.
 
         **Off by default (EXPERIMENTAL).** Set MEMORYCORE_PREFETCH_ENABLED=1
-        to enable. When enabled: recalls top-10 from cold tier → optional
-        reranker filtering → dedup → injects top-3 into context.
+        to enable. When enabled: recalls top-20 from cold tier → optional
+        reranker filtering → dedup → injects top-5 into context.
 
         When disabled (default), returns empty string — no per-turn overhead.
         """
@@ -348,8 +347,13 @@ class MemoryCorePrefetchProvider(MemoryProvider):
                 res["rerank_score"] = sc
                 if sc >= _RERANK_THRESHOLD:
                     kept.append(res)
-            kept.sort(key=lambda r: r.get("rerank_score", 0), reverse=True)
-            kept = kept[:_INJECT_TOP_N]
+            # tiered injection: high-importance entries first, then by
+            # rerank score within each tier; threshold uses raw score.
+            hi = [r for r in kept if (r.get("importance", 0.5) or 0.5) >= _RERANK_TIER_HIGH]
+            lo = [r for r in kept if (r.get("importance", 0.5) or 0.5) < _RERANK_TIER_HIGH]
+            hi.sort(key=lambda r: r.get("rerank_score", 0), reverse=True)
+            lo.sort(key=lambda r: r.get("rerank_score", 0), reverse=True)
+            kept = (hi + lo)[:_INJECT_TOP_N]
             logger.info(
                 "prefetch rerank: kept=%d/%d thr=%.2f top=%d",
                 len(kept), len(results), _RERANK_THRESHOLD, _INJECT_TOP_N)

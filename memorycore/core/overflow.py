@@ -27,6 +27,13 @@ _RECALL_SCORE_SAME = 0.80     # recall dense_score >= 此值视为高度匹配
 _RECALL_SCORE_SIMILAR = 0.48  # recall dense_score >= 此值视为同主题
 _RECALL_TOP_K = 3             # 查重时的召回数
 _MIN_TEXT_RATIO = 0.15        # 最低字面相似度门禁 (防向量误匹配)
+# ---- 用户偏好摘要锚点 (P4) --------------------------------------------------
+
+_ANCHOR_PREFIX = "[用户偏好摘要]"   # 内容前缀: 识别/查重/召回锚点
+_ANCHOR_IMPORTANCE = 0.8        # 高 importance → prefetch 分层注入高档
+_ANCHOR_MAX_CHARS = 800         # 锚点长度上限 (超限截断保留头部)
+_ANCHOR_QUERY = "[用户偏好摘要]"  # recall 查已有锚点 (前缀强关键词)
+
 
 
 # ---- 主入口 ----------------------------------------------------------------
@@ -51,6 +58,9 @@ def run_overflow(store, client, target: str) -> dict:
         "kept": 0,
         "errors": 0,
     }
+
+    # P4: 收集本次下沉的用户偏好内容, 溢流末统一更新冷层摘要锚点
+    anchor_parts: List[str] = []
 
     # ---- Step 1: 容量基线统计 --------------------------------------------
     entries = store.entries(target)
@@ -129,6 +139,7 @@ def run_overflow(store, client, target: str) -> dict:
 
             # 全部 sink 句冷迁移成功 → 应用拆分
             stat["overflowed"] += len(sink_sents)
+            anchor_parts.extend(sink_sents)  # P4: 下沉的偏好长尾进锚点
             if core_sents:
                 new_entry = "。".join(core_sents) + "。"
                 split_new_entries.append(new_entry)
@@ -157,16 +168,95 @@ def run_overflow(store, client, target: str) -> dict:
         if d == STALE:
             _handle_stale(store, client, target, entry, stat)
         elif d == COLD:
+            if target == "user" and classify_user_pref(
+                    entry, sentence_level=True) == "sink":
+                anchor_parts.append(entry)  # P4: 整条下沉的用户侧偏好进锚点
             _handle_cold_migration(store, client, target, entry, stat)
         else:
             stat["kept"] += 1
 
     # ---- Step 6: 验证 ----------------------------------------------------
+    if target == "user" and anchor_parts:
+        _update_pref_anchor(client, store, anchor_parts, stat)
     stat["chars_after"] = store.char_count(target)
     stat["usage_after"] = f"{store.usage_pct(target)}%"
     stat["target"] = target
     return stat
 
+
+
+
+# ---- P4: 用户偏好摘要锚点 --------------------------------------------------
+
+def _update_pref_anchor(client, store, new_parts: List[str], stat: dict) -> None:
+    """维护冷层用户偏好摘要锚点。
+
+    用户偏好内容下沉时, 不散落丢失, 合并成一条高 importance 锚点,
+    作为 prefetch 召回的用户偏好画像总索引。
+
+    规则拼接 + 增量更新 (自包含零依赖, 关键词覆盖优先):
+      - 首次建立: 并入 USER.md 当前 core 偏好 → 初始即完整画像
+      - 后续溢流: 合入本次下沉的偏好内容 (句级去重)
+      - 已有锚点用 recall 前缀查询定位 (避开词法盲区)
+      - 失败只记 errors, 不阻塞溢流 (散条已正常下沉, 锚点是附加索引)
+    """
+    if not new_parts:
+        return
+    # 新内容内部去重
+    dedup_parts = []
+    for p in new_parts:
+        if p not in dedup_parts:
+            dedup_parts.append(p)
+    # 查已有锚点
+    anchor_item = None
+    try:
+        for m in client.recall_results(_ANCHOR_QUERY, top_k=5):
+            if _ANCHOR_PREFIX in (m.get("content") or ""):
+                anchor_item = m
+                break
+    except Exception:
+        stat["errors"] += 1
+        return
+    # 基础内容: 已有锚点正文 或 (首次) USER.md 当前 core 偏好
+    if anchor_item:
+        base = (anchor_item.get("content") or "").replace(
+            _ANCHOR_PREFIX, "", 1).strip()
+    else:
+        base = ""
+        try:
+            core_entries = [
+                e for e in store.entries("user")
+                if classify_user_pref(e, sentence_level=True) == "core"
+            ]
+            base = "。".join(core_entries)
+        except Exception:
+            pass
+    # 合入新内容 (句级去重)
+    merged = base
+    for p in dedup_parts:
+        if p not in merged:
+            merged = f"{merged}。{p}" if merged else p
+    merged = merged.strip("。 ")
+    if len(merged) > _ANCHOR_MAX_CHARS:
+        merged = merged[:_ANCHOR_MAX_CHARS - 1].rstrip("。 ") + "。"
+    content = f"{_ANCHOR_PREFIX} {merged}"
+    # 写冷层 (update 或 remember)
+    try:
+        if anchor_item:
+            r = client.update(anchor_item["id"], content)
+            if r.get("status") == "updated":
+                stat["anchor_updated"] = stat.get("anchor_updated", 0) + 1
+            else:
+                stat["errors"] += 1
+        else:
+            r = client.remember(content, importance=_ANCHOR_IMPORTANCE,
+                                scope="global")
+            if r.get("status") == "stored":
+                stat["anchor_created"] = stat.get("anchor_created", 0) + 1
+            else:
+                stat["errors"] += 1
+    except Exception:
+        stat["errors"] += 1
 
 # ---- Step 2+5: 冷迁移 ----------------------------------------------------
 

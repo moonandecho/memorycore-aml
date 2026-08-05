@@ -1,26 +1,28 @@
-"""memorycore-prefetch — MemoryProvider plugin: on-demand recall + write-mirror overflow
+"""memorycore-prefetch — MemoryProvider plugin: dual-channel recall + write-mirror overflow
 
 Dual-role plugin:
-1. system_prompt_block (static index): injects a cold-store index block
-   once per session guiding the model to use on-demand recall
-   (memorycore_recall tool).  Per-turn semantic prefetch is off by default
-   (degraded to experimental — prefetch/queue_prefetch return empty).
+1. prefetch (per-turn semantic recall): recalls the cold tier (top-10),
+   optionally re-ranks via a cross-encoder, and injects top-3 into context.
+   **Off by default** (EXPERIMENTAL) — set MEMORYCORE_PREFETCH_ENABLED=1.
 2. on_memory_write mirror (2026-08-03): after every built-in memory tool
    write (add/replace), checks hot-tier usage in real time; triggers
    overflow at >=80% (hard) or >=60% (soft, with 5% hysteresis).
    Overflow runs in a background thread so it never blocks the tool return.
 
+Also provides a static cold-store index block via system_prompt_block()
+that guides the model to use on-demand recall (memorycore_recall tool).
+This index block is always active regardless of the prefetch switch.
+
 Implements the Hermes MemoryProvider ABC: is_available → True,
-get_tool_schemas → [] (no tools injected), prefetch(query) returns ""
-(degraded), system_prompt_block() returns a static index block.
+get_tool_schemas → [] (no tools injected).
 
 Activation (Hermes Agent):
     hermes config set memory.provider memorycore-prefetch
     # and copy/link this directory into ~/.hermes/plugins/memorycore-prefetch/
 
-This plugin depends on the Hermes Agent runtime (agent.memory_provider,
-agent.model_metadata, agent.models_dev). It is a Hermes-specific
-integration; the MemoryCore server itself stays client-agnostic.
+This plugin depends on the Hermes Agent runtime (agent.memory_provider).
+It is a Hermes-specific integration; the MemoryCore server itself stays
+client-agnostic.
 """
 
 import json
@@ -30,6 +32,7 @@ import statistics
 import sys
 import tempfile
 import threading
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -61,33 +64,45 @@ except ImportError:
     )
     from memorycore.core.overflow import run_overflow  # noqa: E402
 
-_TOP_K = 3
-_PREFETCH_TIMEOUT = 5.0   # prefetch-specific timeout, shorter than default 10s
-_QUEUE_TIMEOUT = 8.0      # background queue slightly more generous
+_RECALL_CANDIDATES = 10    # first-stage recall candidates (before reranker)
+_INJECT_TOP_N = 3          # max injected after reranker ranking
+_PREFETCH_TIMEOUT = 5.0    # prefetch-specific timeout, shorter than default 10s
+_QUERY_MAX_LEN = 1000      # recall query max chars (matches reranker query limit)
 
 # --- on_memory_write auto-overflow (2026-08-03) ---
-_OVERFLOW_RETRY_DELTA = 5  # soft trigger must see >=5% growth since last overflow (avoid
-                            # re-running on every write)
+_OVERFLOW_RETRY_DELTA = 5  # soft trigger must see >=5% growth since last overflow
+                            # (debounce — avoid re-running on every write)
 
-# --- adaptive threshold config -------------------------------------------
+# --- reranker two-stage refinement (2026-08-05) ---
+# Configure MEMORYCORE_RERANK_URL to enable cross-encoder reranking.
+# When unset, the plugin automatically degrades to a dense-score fallback
+# (top-1 only, tighter threshold). Reranker call failures/timeouts also
+# trigger the same graceful degradation — never blocks, never errors out.
+#
+# Set MEMORYCORE_RERANK_URL to the full reranker endpoint URL
+# (e.g. http://your-reranker-host:8899/rerank).
+#   POST {"query": q, "documents": docs}
+#   Response: {"results": [{"index": 0, "relevance_score": 8.5}, ...]}
+#
+# Calibration (bge-reranker-v2-m3):
+#   True relevant (self-recall):  +8~+11
+#   True relevant (paraphrase):   ~-0.07
+#   Partially related (adjacent): +0.85
+#   Definitely unrelated:         -4~-11
+#   Threshold -2.0 sits in the safe gap between -0.1 and -4.
+_RERANK_THRESHOLD = -2.0
+_RERANK_TIMEOUT = 3.0
+_RERANK_QUERY_MAX = 1000   # context truncation (bge-reranker training limit 1024)
+_RERANK_DOC_MAX = 500      # memory entry truncation
+
+# --- dynamic baseline threshold (fixed coefficient, no water-level bands) ---
 _BASELINE_INIT = 0.70        # initial baseline: median batch-max dense_score
-                             # from top_k=3 semantic queries (46 samples)
-_ABS_FLOOR = 0.45            # lower guardrail: below this, never inject
-                             # (calibrated on small cold tier; known to
-                             #  admit noise at 1000+ entries — see
-                             #  docs/ADAPTIVE_THRESHOLD.md § 大库实测)
+                             # (N=3000 core+scene, bootstrap CI [0.678, 0.716])
+_ABS_FLOOR = 0.45            # lower guardrail (not a noise barrier at scale;
+                             #  the reranker handles noise separation)
 _BASELINE_WINDOW = 200       # rolling sample window
 _BASELINE_RECALC_EVERY = 50  # recompute median every N new samples
-# water-level bands -> coefficients
-_WATER_LOW = 50_000          # <50K tokens → low water
-_WATER_MID = 150_000         # 50K~150K → mid water
-_COEF_LOW = 0.90
-_COEF_MID = 0.90
-_COEF_HIGH = 1.00
-# compression-point correction (combined scheme)
-_COMPRESS_RATIO = 0.7        # config compression.threshold
-_COMPRESS_FORCE_MID = 0.5    # tokens > compress_at*0.5 → at least mid
-_COMPRESS_FORCE_HIGH = 0.8   # tokens > compress_at*0.8 → force high
+_COEF = 0.90                 # fixed coefficient (water-level bands removed)
 # baseline persistence file
 _BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline.json")
 
@@ -97,21 +112,15 @@ class MemoryCorePrefetchProvider(MemoryProvider):
 
     def __init__(self):
         super().__init__()
-        self._cache: Optional[str] = None
-        self._cache_lock = threading.Lock()
-        self._pending_query: Optional[str] = None
-        self._bg_thread: Optional[threading.Thread] = None
-        # adaptive-threshold state
-        self._water_lock = threading.Lock()
-        self._water_level: Optional[str] = None  # 'low' | 'mid' | 'high'
-        self._last_tokens: int = 0
-        self._last_messages: Optional[List[Dict[str, Any]]] = None
-        self._context_window: Optional[int] = None  # cached on first use
+        # dynamic baseline state
         self._baseline_lock = threading.Lock()
         self._baseline_samples: List[float] = []
         self._baseline_value: float = _BASELINE_INIT
         self._sample_count_since_recalc: int = 0
         self._load_baseline()
+        # injection dedup state (2026-08-05): per-session id set + hot-tier full text
+        self._injected_ids: set = set()
+        self._hot_text: str = ""
         # on_memory_write auto-overflow state
         self._overflow_lock = threading.Lock()
         self._overflow_thread: Optional[threading.Thread] = None
@@ -123,20 +132,22 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        pass
+        """Reset per-session dedup state and load hot-tier full text."""
+        self._injected_ids = set()
+        self._hot_text = self._load_hot_layer_text()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
 
-    # -- system_prompt_block: cold-store index (on-demand recall) ----------
+    # -- system_prompt_block: cold-store index (always active) -------------
 
     def system_prompt_block(self) -> str:
         """Return a static cold-store index block for on-demand recall guidance.
 
-        Replaces the original per-turn semantic prefetch scheme. Industry
-        research (Mem0/Letta/Hindsight/OpenViking) converges on on-demand
-        retrieval as the mature paradigm. This block is injected once as a
-        system prompt and incurs zero per-turn overhead (no network/IO).
+        This block is injected once as a system prompt and incurs zero
+        per-turn overhead (no network/IO). It complements the optional
+        per-turn prefetch — when prefetch is enabled, both channels coexist
+        (static index + active injection).
 
         Topics can be configured via MEMORYCORE_INDEX_TOPICS (comma-separated).
         When unset, only a generic guidance line is returned.
@@ -231,74 +242,201 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         except Exception as e:
             logger.debug("overflow bg failed: %s", e)
 
+    # -- prefetch / queue_prefetch (dual-channel, EXPERIMENTAL) ------------
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return empty string (degraded to optional experimental feature).
+        """Per-turn cold-tier recall with optional reranker refinement.
 
-        The original per-turn semantic recall scheme has been superseded by
-        on-demand retrieval via the system_prompt_block index block +
-        memorycore_recall tool. Industry research (Mem0/Letta/Hindsight/
-        OpenViking) converges on on-demand as the mature paradigm.
+        **Off by default (EXPERIMENTAL).** Set MEMORYCORE_PREFETCH_ENABLED=1
+        to enable. When enabled: recalls top-10 from cold tier → optional
+        reranker filtering → dedup → injects top-3 into context.
 
-        The function signature and underlying recall infrastructure are
-        preserved; re-enable by setting a config flag (git history has the
-        full implementation).
+        When disabled (default), returns empty string — no per-turn overhead.
         """
-        return ""
+        if os.environ.get("MEMORYCORE_PREFETCH_ENABLED", "").strip() != "1":
+            return ""
+        try:
+            return self._recall_sync(query)
+        except Exception as e:
+            logger.debug("prefetch failed: %s", e)
+            return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """No-op (degraded alongside prefetch to optional experimental feature).
+        """No-op (background prefetch cache removed in 2026-08-05).
 
-        The original background recall scheme has been superseded by on-demand
-        retrieval. Signature preserved for future experimental re-enablement.
+        The background recall cache was never consumed by the sync path,
+        resulting in duplicate recall+rerank work every turn with no benefit.
+        Signature preserved for Hermes compatibility.
         """
         return
 
-    # -- internals: recall / adaptive threshold / dynamic baseline ---------
-    # These are optional enhancements for the on-demand recall scheme.
-    # They are NOT enabled by default (prefetch returns "" above).
-    # All code preserved; git history has the full original implementation.
-    # Re-enable by toggling a config flag.
+    # -- internals: recall / reranker / dedup / formatting -----------------
 
     def _recall_sync(self, query: str) -> str:
-        """Synchronous recall (with dedicated timeout)."""
+        """Synchronous recall with dedicated timeout.
+
+        Pipeline: query preprocessing → cold-tier recall (10 candidates) →
+        reranker refinement (if configured) → session dedup → hot-tier dedup →
+        format injection block.
+
+        When the reranker is not configured or unavailable, falls back to
+        dense-score top-1 with a tightened threshold.
+        """
+        q = self._preprocess_query(query)
+        if not q:
+            return ""
         try:
             client = ColdStoreClient(timeout=_PREFETCH_TIMEOUT)
-            results = client.recall_results(query, top_k=_TOP_K)
-            results = self._filter_by_threshold(results)
+            results = client.recall_results(q, top_k=_RECALL_CANDIDATES)
+            self._record_baseline(results)
+            results, rerank_ok = self._apply_rerank_filter(q, results)
+            if not rerank_ok:
+                results = self._filter_by_threshold(results)
+            results = self._dedupe_injected(results)
+            results = self._dedupe_hot_layer(results)
             return self._format_results(results)
         except Exception as e:
             logger.debug("memorycore-prefetch sync recall failed: %s", e)
             return ""
 
-    def _recall_bg(self, query: str) -> None:
-        """Background-thread recall."""
+    def _record_baseline(self, results: list) -> None:
+        """Record batch-max dense_score into the rolling baseline.
+
+        Always uses dense scores (not reranker scores) so the baseline
+        remains calibrated regardless of reranker availability.
+        """
+        if not results:
+            return
+        top1 = max(r.get("dense_score", 0) for r in results)
+        if top1:
+            self._record_score(top1)
+
+    def _apply_rerank_filter(self, query: str, results: list):
+        """Reranker two-stage refinement: absolute threshold → sort → inject top-N.
+
+        Reads MEMORYCORE_RERANK_URL from environment. When unset or the
+        reranker call fails/times out, returns (results, False) to signal
+        the caller to fall back to dense-score filtering.
+
+        Returns (kept, ok):
+        - ok=True: reranker succeeded, kept is the filtered list (may be empty).
+        - ok=False: reranker unavailable, caller should use dense fallback.
+        """
+        if not results:
+            return results, True
+        rerank_url = os.environ.get("MEMORYCORE_RERANK_URL", "").strip()
+        if not rerank_url:
+            return results, False
         try:
-            client = ColdStoreClient(timeout=_QUEUE_TIMEOUT)
-            results = client.recall_results(query, top_k=_TOP_K)
-            results = self._filter_by_threshold(results)
-            formatted = self._format_results(results)
-            with self._cache_lock:
-                self._cache = formatted
+            docs = [r.get("content", "")[:_RERANK_DOC_MAX] for r in results]
+            q = query[:_RERANK_QUERY_MAX]
+            body = json.dumps({"query": q, "documents": docs}).encode()
+            req_url = rerank_url
+            req = urllib.request.Request(
+                req_url, data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=_RERANK_TIMEOUT) as resp:
+                data = json.load(resp)
+            scores = {item["index"]: item.get("relevance_score")
+                      for item in data.get("results", [])}
+            kept = []
+            for i, res in enumerate(results):
+                sc = scores.get(i)
+                if sc is None:
+                    continue
+                res = dict(res)
+                res["rerank_score"] = sc
+                if sc >= _RERANK_THRESHOLD:
+                    kept.append(res)
+            kept.sort(key=lambda r: r.get("rerank_score", 0), reverse=True)
+            kept = kept[:_INJECT_TOP_N]
+            logger.info(
+                "prefetch rerank: kept=%d/%d thr=%.2f top=%d",
+                len(kept), len(results), _RERANK_THRESHOLD, _INJECT_TOP_N)
+            return kept, True
         except Exception as e:
-            logger.debug("memorycore-prefetch bg recall failed: %s", e)
-            # cache an empty result so the next turn doesn't retry
-            with self._cache_lock:
-                if self._cache is None:
-                    self._cache = ""
+            logger.debug("prefetch rerank unavailable, fallback dense: %s", e)
+            return results, False
 
     @staticmethod
     def _format_results(results: List[Dict[str, Any]]) -> str:
-        """Format recall results into injectable text."""
+        """Format recall results into injectable text.
+
+        Score display matches the filtering path: rerank_score when
+        reranker was used, dense_score when on the fallback path.
+        """
         if not results:
             return ""
         lines = []
         for r in results:
-            score = r.get("dense_score", 0)
+            if "rerank_score" in r:
+                score = r.get("rerank_score", 0)
+            else:
+                score = r.get("dense_score", 0)
             content = r.get("content", "")
             lines.append(f"- [{score:.2f}] {content}")
         return "## MemoryCore Recall\n" + "\n".join(lines)
 
-    # -- adaptive water-level threshold -------------------------------------
+    @staticmethod
+    def _preprocess_query(query: str) -> str:
+        """Query preprocessing: strip, empty guard, length truncation.
+
+        Truncation prevents embedding dilution on very long messages.
+        Complex intent extraction is deferred to a future iteration.
+        """
+        q = (query or "").strip()
+        if not q:
+            return ""
+        if len(q) > _QUERY_MAX_LEN:
+            q = q[:_QUERY_MAX_LEN]
+        return q
+
+    def _load_hot_layer_text(self) -> str:
+        """Load hot-tier MEMORY.md + USER.md full text for dedup (2026-08-05).
+
+        Cold-tier entries whose content already appears verbatim in the
+        hot tier are skipped — the agent already has this information.
+        When local files are unreadable, returns empty string (fail-safe:
+        no false-positive dedup kills).
+        """
+        try:
+            store = LocalStore()
+            parts = []
+            for path in (store.memory_path, store.user_path):
+                try:
+                    parts.append(path.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    pass
+            return "\n".join(parts)
+        except Exception as e:
+            logger.debug("hot layer load failed: %s", e)
+            return ""
+
+    def _dedupe_injected(self, results: list) -> list:
+        """Session-level dedup: skip entries already injected this session."""
+        kept = []
+        for r in results:
+            rid = r.get("id")
+            if rid is not None and rid in self._injected_ids:
+                continue
+            kept.append(r)
+            if rid is not None:
+                self._injected_ids.add(rid)
+        return kept
+
+    def _dedupe_hot_layer(self, results: list) -> list:
+        """Hot-tier dedup: skip entries whose content already exists in hot tier."""
+        if not self._hot_text:
+            return results
+        kept = []
+        for r in results:
+            content = r.get("content", "")
+            if content and content in self._hot_text:
+                continue
+            kept.append(r)
+        return kept
+
+    # -- dynamic baseline threshold (fixed coefficient) --------------------
 
     def sync_turn(
         self,
@@ -308,68 +446,20 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Official Hermes interface: called after every turn with the full
-        conversation history. Only estimates and caches the water level;
-        writes nothing.
+        """Official Hermes interface: called after every turn.
+
+        Water-level estimation was removed in 2026-08-05; the threshold
+        now uses a fixed coefficient (0.90) regardless of context fullness.
+        Signature preserved for Hermes compatibility.
         """
-        try:
-            if messages:
-                self._last_messages = messages
-                level, tokens = self._estimate_water_level(messages)
-                with self._water_lock:
-                    self._water_level = level
-                    self._last_tokens = tokens
-        except Exception as e:
-            logger.debug("water level estimate failed: %s", e)
-            with self._water_lock:
-                self._water_level = None
+        pass
 
-    def _estimate_water_level(self, messages) -> tuple:
-        """Estimate context water level, return (band, tokens)."""
-        from agent.model_metadata import estimate_messages_tokens_rough
-        tokens = estimate_messages_tokens_rough(messages or [])
-        # absolute bands
-        if tokens < _WATER_LOW:
-            level = 'low'
-        elif tokens < _WATER_MID:
-            level = 'mid'
-        else:
-            level = 'high'
-        # compression-point correction
-        window = self._get_context_window()
-        compress_at = window * _COMPRESS_RATIO
-        if tokens > compress_at * _COMPRESS_FORCE_HIGH:
-            level = 'high'
-        elif tokens > compress_at * _COMPRESS_FORCE_MID and level == 'low':
-            level = 'mid'
-        return level, tokens
+    def _compute_threshold(self) -> float:
+        """Fixed-coefficient threshold: baseline × 0.90, clamped to _ABS_FLOOR.
 
-    def _get_context_window(self) -> int:
-        """Look up the current model's context window; cached. Default 1M."""
-        if self._context_window is not None:
-            return self._context_window
-        window = 1_000_000
-        try:
-            import yaml
-            config_path = os.path.expanduser("~/.hermes/config.yaml")
-            with open(config_path) as f:
-                cfg = yaml.safe_load(f) or {}
-            model_cfg = cfg.get("model", {})
-            provider_id = model_cfg.get("provider", "")
-            model_id = model_cfg.get("default", "")
-            if provider_id and model_id:
-                from agent.models_dev import get_model_info
-                info = get_model_info(provider_id, model_id)
-                if info and info.context_window:
-                    window = info.context_window
-        except Exception as e:
-            logger.debug("get_context_window failed, using 1M default: %s", e)
-        self._context_window = window
-        return window
-
-    def _compute_threshold(self, level: str) -> float:
-        coef = {'low': _COEF_LOW, 'mid': _COEF_MID, 'high': _COEF_HIGH}[level]
-        return max(_ABS_FLOOR, self._current_baseline() * coef)
+        Water-level bands (_COEF_LOW/MID/HIGH) were removed in 2026-08-05.
+        """
+        return max(_ABS_FLOOR, self._current_baseline() * _COEF)
 
     def _record_score(self, top1: float) -> None:
         """Record the batch max dense_score of each recall; roll the window
@@ -388,7 +478,7 @@ class MemoryCorePrefetchProvider(MemoryProvider):
                     self._persist_baseline()
 
     def _current_baseline(self) -> float:
-        """Return the current baseline."""
+        """Return the current baseline value."""
         with self._baseline_lock:
             return self._baseline_value
 
@@ -407,7 +497,7 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             self._baseline_value = _BASELINE_INIT
 
     def _persist_baseline(self) -> None:
-        """Atomically persist the baseline."""
+        """Atomically persist the baseline to disk."""
         try:
             data = {
                 "samples": self._baseline_samples,
@@ -427,30 +517,22 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             logger.debug("baseline persist failed: %s", e)
 
     def _filter_by_threshold(self, results: list) -> list:
-        """Filter by the current band threshold; also record the batch max
-        dense_score into the baseline.
+        """Fallback path (reranker unavailable): inject only top-1 with
+        tightened threshold. Dense scores alone cannot reliably separate
+        intent at scale, so we err on the side of silence.
 
-        The baseline represents "the best semantic quality this query could
-        recall", so we take the batch MAX rather than results[0] (the server
-        sorts by blended score; the first result is not necessarily the
-        highest dense score).
+        Baseline recording is handled separately by _record_baseline.
         """
         if not results:
             return []
-        # water level read lock (sync_turn writes from a background thread)
-        with self._water_lock:
-            level = self._water_level or 'mid'
-        threshold = self._compute_threshold(level)
-        # record batch max dense_score as a baseline sample
-        top1_score = max(r.get('dense_score', 0) for r in results)
-        if top1_score:
-            self._record_score(top1_score)
-        kept = [r for r in results if r.get('dense_score', 0) >= threshold]
-        logger.debug(
-            "prefetch filter: level=%s threshold=%.3f kept=%d/%d",
-            level, threshold, len(kept), len(results),
-        )
-        return kept
+        threshold = self._compute_threshold()
+        best = max(results, key=lambda r: r.get("dense_score", 0))
+        if best.get("dense_score", 0) >= threshold:
+            return [best]
+        logger.info(
+            "prefetch fallback: top-1 dense=%.3f < thr=%.3f, drop all",
+            best.get("dense_score", 0), threshold)
+        return []
 
 
 def register(ctx) -> None:

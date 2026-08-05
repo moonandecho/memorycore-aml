@@ -1,71 +1,69 @@
-# memorycore-prefetch — Hermes Agent plugin (on-demand recall)
+# memorycore-prefetch — Hermes Agent plugin (dual-channel recall)
 
-> ⚠️ **EXPERIMENTAL — known limitations at scale.** This plugin uses an
-> adaptive threshold with a fixed absolute floor (0.45).  Measurements on
-> synthetic cold tiers at 1000–3000 entries show the noise ceiling rises
-> to 0.73, admitting 87–89% of noise through the 0.45 floor.  For this
-> reason per-turn prefetch is **off by default**: the primary retrieval
-> path is on-demand recall via the `memorycore_recall` tool, which avoids
-> the noise problem entirely by letting the agent query with intent.
-> See [../../docs/ADAPTIVE_THRESHOLD.md](../../docs/ADAPTIVE_THRESHOLD.md)
-> for the full measurements.
+> ⚠️ **EXPERIMENTAL — off by default.** Per-turn prefetch is provided for
+> experimentation and small-scale use. The primary retrieval path is
+> on-demand recall via the `memorycore_recall` tool, which avoids the
+> noise problem entirely by letting the agent query with intent. See
+> [../../docs/ADAPTIVE_THRESHOLD.md](../../docs/ADAPTIVE_THRESHOLD.md)
+> for measurement data and the rationale for the default-off posture.
 
 A thin [Hermes Agent](https://github.com/NousResearch/hermes-agent) memory
-provider plugin. It provides a **static cold-store index block** via
-`system_prompt_block()` that guides the model to use on-demand recall
-(`memorycore_recall` tool). Per-turn semantic prefetch is **off by default**
-(degraded to an experimental feature — see below).
+provider plugin. It provides:
 
-## Design: on-demand recall with index guidance
+1. A **static cold-store index block** via `system_prompt_block()` (always
+   active) that guides the model to use on-demand recall
+   (`memorycore_recall` tool). Topics are configurable via the
+   `MEMORYCORE_INDEX_TOPICS` environment variable (comma-separated).
+2. **Per-turn semantic prefetch** (opt-in via `MEMORYCORE_PREFETCH_ENABLED=1`):
+   recalls the cold tier (top-10), optionally re-ranks via a cross-encoder,
+   and injects the top-3 into context.
+3. **on_memory_write auto-overflow**: after every built-in memory tool write,
+   checks hot-tier usage and triggers overflow at thresholds.
 
-The plugin injects a short index block into the system prompt once per
-session. The block lists available topics (configurable via the
-`MEMORYCORE_INDEX_TOPICS` environment variable, comma-separated) and
-instructs the model to use `memorycore_recall(query)` when it needs
-historical details. This is the **primary retrieval path**.
+## Design: dual-channel recall
 
-This design follows the industry consensus (Mem0, Letta, Hindsight,
-OpenViking): on-demand retrieval is the mature paradigm for memory
-augmentation. Per-turn automatic injection adds token overhead without
-proportional benefit and introduces threshold-tuning complexity that
-does not scale to large cold tiers.
+When prefetch is **disabled** (default), the plugin injects only a static
+index block via `system_prompt_block()`. The agent uses `memorycore_recall`
+on demand — zero per-turn overhead, no noise problem.
 
-## Prefetch (experimental, off by default)
+When prefetch is **enabled** (`MEMORYCORE_PREFETCH_ENABLED=1`), both channels
+coexist:
+- **Static index** (always present) — topic overview + recall guidance.
+- **Active injection** (every turn) — top-3 cold-tier memories, filtered
+  through the pipeline below.
 
-The original per-turn semantic recall (`prefetch` / `queue_prefetch`) is
-preserved in the codebase but **returns empty by default**. `prefetch()`
-returns `""` and `queue_prefetch()` is a no-op. All internal recall
-infrastructure (`_recall_sync`, `_recall_bg`, adaptive threshold, dynamic
-water level, baseline self-evolution) remains intact and can be re-enabled
-via a config flag. See git history for the full original implementation.
-
-## Adaptive threshold (preserved, not active by default)
-
-The adaptive threshold infrastructure is fully preserved but not exercised
-in the default code path (since `prefetch` returns `""`). When re-enabled,
-the behaviour is:
+## Prefetch pipeline (when enabled)
 
 ```
-threshold = max(ABS_FLOOR 0.45, rolling_baseline × coefficient)
-coefficient = low water 0.90 / mid water 0.90 / high water 1.00
+query → preprocess → cold-tier recall (10 candidates)
+  → reranker refinement (if MEMORYCORE_RERANK_URL configured)
+     or dense-score top-1 fallback (if no reranker)
+  → session dedup → hot-tier dedup → inject top-3
 ```
 
-- **Water level** is estimated from the full conversation history via
-  `estimate_messages_tokens_rough` after each turn (`sync_turn`):
-  `<50K tokens → low`, `50K–150K → mid`, `>150K → high`, plus a
-  compression-point correction for smaller context windows.
-- **Low water → lower threshold → more recall injected** (context is cheap).
-- **High water → higher threshold → less injected** (saves tokens near
-  compression).
+- **Reranker (optional)**: when `MEMORYCORE_RERANK_URL` is set to a
+  cross-encoder endpoint (e.g. `http://your-reranker-host:8899/rerank`), the plugin
+  sends a POST with `{"query": q, "documents": docs}` and filters by
+  absolute threshold (-2.0), then injects the top-3 by rerank_score.
+- **Fallback (default)**: when no reranker is configured, the plugin
+  injects only the single best dense-score match if it clears
+  `max(0.45, baseline × 0.90)`. This conservative fallback prioritises
+  silence over noise.
+
+## Dynamic baseline threshold
+
+```
+threshold = max(0.45, rolling_baseline × 0.90)
+```
+
+- **Fixed coefficient 0.90** — no water-level bands (removed in 2026-08-05).
 - **Baseline self-evolves**: every recall records the batch-max `dense_score`
   into a 200-sample rolling window; the median is recomputed every 50 samples
   and atomically persisted to `baseline.json` next to this file. Delete that
-  file to reset to the initial value (`0.70`, measured from real top_k=3
-  semantic queries — see `docs/ADAPTIVE_THRESHOLD.md` for the statistics).
-- **Absolute floor 0.45** acts as a lower guardrail: unrelated queries
-  top out at ~0.40, relevant ones start at ~0.47 (measured separation band
-  on a small cold tier).  At scale (1000+ entries) this floor is
-  insufficient — see the Known Limitations section above.
+  file to reset to the initial value (`0.70`).
+- **Absolute floor 0.45** acts as a lower guardrail. At scale (1000+ entries)
+  it is not a noise barrier — the reranker handles noise separation when
+  configured; the fallback path tightens to top-1.
 
 ## on_memory_write auto-overflow
 
@@ -95,20 +93,23 @@ hermes config set memory.provider memorycore-prefetch
 
 ## Configuration
 
-- `MEMORYCORE_INDEX_TOPICS`: comma-separated list of topics to display in
-  the system prompt index block. When unset, only a generic guidance line
-  is shown.
-- The adaptive threshold baseline is persisted to `baseline.json` next to
-  this file. Delete it to reset to the initial value (`0.70`).
+| Variable | Default | Description |
+|---|---|---|
+| `MEMORYCORE_PREFETCH_ENABLED` | *(unset)* | Set to `1` to enable per-turn prefetch (EXPERIMENTAL) |
+| `MEMORYCORE_RERANK_URL` | *(unset)* | Full cross-encoder endpoint URL (e.g. `http://your-reranker-host:8899/rerank`). When unset, falls back to dense-score top-1 |
+| `MEMORYCORE_INDEX_TOPICS` | *(unset)* | Comma-separated topics for the system prompt index block |
+
+The adaptive threshold baseline is persisted to `baseline.json` next to
+this file. Delete it to reset to the initial value (`0.70`).
 
 ## Requirements & notes
 
 - **Hermes-specific**: this plugin imports Hermes runtime modules
-  (`agent.memory_provider`, `agent.model_metadata`, `agent.models_dev`) and
-  reads `~/.hermes/config.yaml` for the model context window. It does **not**
-  work as a standalone package — it is the Hermes integration side of
-  MemoryCore.
-- Every recall keeps a 5s (sync) / 8s (background) timeout; failures degrade
-  silently to an empty injection and never block the conversation.
+  (`agent.memory_provider`). It does **not** work as a standalone package —
+  it is the Hermes integration side of MemoryCore.
+- Every recall keeps a 5s timeout; failures degrade silently to an empty
+  injection and never block the conversation.
 - `baseline.json` is written only after 50 new samples (roughly 50 turns);
   until then the in-memory initial value is used.
+- The reranker call uses a 3s timeout; timeouts or failures trigger the
+  same fallback as an unconfigured URL.

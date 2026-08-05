@@ -18,6 +18,12 @@ Two failure modes:
 
 ## Design
 
+> **2026-08-05 update**: the water-level band system (low/mid/high + coefficient
+> 0.90/0.90/1.00) has been removed. The plugin now uses a **fixed coefficient
+> 0.90** regardless of context fullness. The compression-point correction and
+> `_get_context_window` lookup have also been retired. The section below
+> documents the original design for historical reference.
+
 ```
 threshold = max(ABS_FLOOR 0.45, rolling_baseline × coefficient)
 coefficient = low water 0.90 / mid water 0.90 / high water 1.00

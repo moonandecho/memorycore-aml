@@ -136,29 +136,38 @@ Exposed tools:
 
 ## Hermes integration — per-turn prefetch (EXPERIMENTAL)
 
-> ⚠️ **Experimental.** The per-turn prefetch plugin is provided for
-> experimentation and small-scale use.  **Known limitation**: the adaptive
-> threshold's fixed absolute floor (0.45) was calibrated on ~37 memories;
-> at 1000–3000 entries the noise ceiling rises to 0.73 and the floor
-> admits 87–89% of noise — which is why per-turn prefetch is **off by
-> default**.  For details see
-> [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
+> ⚠️ **Experimental — off by default.** The per-turn prefetch plugin is
+> provided for experimentation and small-scale use. It is **disabled by
+> default** — set `MEMORYCORE_PREFETCH_ENABLED=1` to enable it. When
+> disabled, the plugin injects only a static cold-store index block
+> (zero per-turn overhead); the agent retrieves cold-tier context
+> on-demand via the `memorycore_recall` tool.
 >
-> **For production use** MemoryCore exposes `memorycore_recall` as the
-> primary read path — call it on-demand when you need cold-tier context;
-> it requires no extra service, no plugin, and no threshold tuning.
+> When enabled, every turn recalls the cold tier (top-10), optionally
+> re-ranks via a cross-encoder (if `MEMORYCORE_RERANK_URL` is configured),
+> and injects the top-3 into context. Without a reranker, the plugin
+> falls back to injecting only the single best dense-score match subject
+> to a dynamic threshold: `max(0.45, rolling_baseline × 0.90)`.
+>
+> For details on the adaptive threshold, its measurements, and the
+> reranker two-stage pipeline, see
+> [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
 
 The MCP server is client-agnostic. For **Hermes Agent** there is an
-optional companion plugin that makes the cold tier participate in every
-conversation turn:
+optional companion plugin that provides dual-channel cold-tier access:
 
-- Every turn it recalls the cold tier (top-3) and injects matches into
-  context — but only those clearing an **adaptive semantic threshold**:
-  `max(0.45, rolling_baseline × coefficient)`, where the coefficient
-  tightens with context water level (low 0.90 / mid 0.90 / high 1.00).
-- Baseline self-evolves: rolling median of your real recall scores,
-  persisted to `baseline.json`; delete it to reset to `0.70`.
-- Design & statistics: [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
+- **Static index** — a system prompt block listing available topics
+  (configurable via `MEMORYCORE_INDEX_TOPICS`) with guidance to use
+  `memorycore_recall(query)`. Always active, zero per-turn overhead.
+- **Per-turn prefetch** (opt-in) — recalls cold tier (top-10), optionally
+  re-ranks via cross-encoder, injects top-3. Enabled with
+  `MEMORYCORE_PREFETCH_ENABLED=1`. Reranker endpoint configured via
+  `MEMORYCORE_RERANK_URL` (full URL, e.g. `http://your-reranker-host:8899/rerank`).
+
+The threshold uses a **fixed coefficient 0.90** against a rolling baseline
+(median of your real recall scores, persisted to `baseline.json`). Delete
+`baseline.json` to reset to `0.70`.
+
 - Install/activate/requirements: [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md).
 
 ```bash

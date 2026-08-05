@@ -27,6 +27,28 @@ _RECALL_SCORE_SAME = 0.80     # recall dense_score >= 此值视为高度匹配
 _RECALL_SCORE_SIMILAR = 0.48  # recall dense_score >= 此值视为同主题
 _RECALL_TOP_K = 3             # 查重时的召回数
 _MIN_TEXT_RATIO = 0.15        # 最低字面相似度门禁 (防向量误匹配)
+
+# ---- 反转检测 (2026-08-05: 写入侧反转覆盖) -------------------------------
+
+_REVERSAL_NEG_WORDS = ["不", "没", "无", "非", "否", "别", "不再",
+                       "停止", "取消", "不要", "拒绝", "禁", "讨厌",
+                       "反对", "不喜", "不爱", "不感兴趣"]
+_REVERSAL_WEAK_NEG = ["不太", "不大", "不怎么", "未必", "难免"]
+
+
+def _topic_overlap(a: str, b: str) -> bool:
+    """判定两条是否同主题 (与 maintenance _is_reversal_pair 判定一致)。"""
+    if not a or not b:
+        return False
+    na = _norm_sentence(a)
+    nb = _norm_sentence(b)
+    ratio = difflib.SequenceMatcher(None, na, nb).ratio()
+    if ratio >= 0.40:
+        return True
+    bg_b = {nb[i:i + 2] for i in range(len(nb) - 1)}
+    if _bigram_coverage(na, bg_b) >= 0.55:
+        return True
+    return False
 # ---- 用户偏好摘要锚点 (P4) --------------------------------------------------
 
 _ANCHOR_PREFIX = "[用户偏好摘要]"   # 内容前缀: 识别/查重/召回锚点
@@ -278,7 +300,29 @@ def _handle_cold_migration(store, client, target: str, entry: str,
                 stat["overflowed"] += 1  # 算溢流 (已在冷层)
                 return
             elif matched["level"] == "similar":
-                # 冷层有相似 → update 合并
+                # 反转检测: 本地条(新)否定冷层旧条 -> 直接覆盖, 不合并
+                has_neg = False
+                for w in _REVERSAL_NEG_WORDS:
+                    if w in entry:
+                        is_weak = False
+                        for wn in _REVERSAL_WEAK_NEG:
+                            if wn in entry and w in wn:
+                                is_weak = True
+                                break
+                        if not is_weak:
+                            has_neg = True
+                            break
+                if has_neg and _topic_overlap(entry, matched["content"]):
+                    try:
+                        r = client.update(matched["id"], entry)
+                        if r.get("status") == "updated":
+                            _safe_remove_local(store, target, entry, stat)
+                            stat["updated"] += 1
+                            return
+                    except Exception:
+                        stat["errors"] += 1
+                        return
+                # 原合并逻辑
                 merged = _merge_two_entries(entry, matched["content"])
                 try:
                     r = client.update(matched["id"], merged)

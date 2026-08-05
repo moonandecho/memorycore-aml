@@ -28,6 +28,15 @@ _COVERAGE_TARGET = 0.95     # 枚举覆盖率目标
 _VEC_NEIGHBOR_K = 10        # 向量预筛: 每条查 top_k 邻居
 _VEC_SCORE_THRESHOLD = 0.5  # 向量预筛: dense_score 下限 (低于此值不配对)
 
+# ---- 反转检测 (2026-08-05: 反转冲突以最新为准) --------------------------
+
+_REVERSAL_NEG_WORDS = ["不", "没", "无", "非", "否", "别", "不再",
+                       "停止", "取消", "不要", "拒绝", "禁", "讨厌",
+                       "反对", "不喜", "不爱", "不感兴趣"]
+_REVERSAL_WEAK_NEG = ["不太", "不大", "不怎么", "未必", "难免"]
+_REVERSAL_OVERLAP = 0.55   # 字面重叠阈值 (bigram 覆盖率)
+_REVERSAL_MIN_RATIO = 0.40 # 最小字面相似度 (同主题门槛)
+
 _RECALL_QUERIES = [         # 多路召回种子查询 (覆盖常见主题空间)
     "偏好 习惯 准则",
     "服务器 网络 IP 配置",
@@ -42,13 +51,87 @@ _RECALL_QUERIES = [         # 多路召回种子查询 (覆盖常见主题空间
 ]
 
 
+# ---- 反转判定 --------------------------------------------------------------
+
+def _is_reversal_pair(older, newer):
+    """判定两条是否构成反转: 新条否定旧条且同主题。
+
+    三条件 AND:
+      1. 新条含否定词 (_REVERSAL_NEG_WORDS 白名单)
+      2. 排除弱化否定 (不太/不大/不怎么/未必/难免)
+      3. 同主题: 字面重叠 (bigram 覆盖率 >= 0.55 或 ratio >= 0.40)
+      4. 时间先后: newer.timestamp > older.timestamp (缺失时视为不可判 -> False)
+    保守: 任一条件不满足 -> False (宁留不误删)。
+    """
+    n_ts = newer.get("timestamp") or ""
+    o_ts = older.get("timestamp") or ""
+    if not n_ts or not o_ts or n_ts <= o_ts:
+        return False
+    c_new = newer.get("content") or ""
+    c_old = older.get("content") or ""
+    if not c_new or not c_old:
+        return False
+
+    has_neg = False
+    for w in _REVERSAL_NEG_WORDS:
+        if w in c_new:
+            is_weak = False
+            for wn in _REVERSAL_WEAK_NEG:
+                if wn in c_new and w in wn:
+                    is_weak = True
+                    break
+            if not is_weak:
+                has_neg = True
+                break
+    if not has_neg:
+        return False
+
+    nn = _norm_sentence(c_new)
+    no = _norm_sentence(c_old)
+    ratio = difflib.SequenceMatcher(None, nn, no).ratio()
+    if ratio >= _REVERSAL_MIN_RATIO:
+        return True
+    bg_new = set()
+    for i in range(len(nn) - 1):
+        bg_new.add(nn[i:i + 2])
+    if _bigram_coverage(no, bg_new) >= _REVERSAL_OVERLAP:
+        return True
+    return False
+
+
+def _topic_overlap_with_ts(entry_a, entry_b) -> bool:
+    """判定两条是否同主题 + 时间可判 (用于收集 LLM 模糊反转候选)。"""
+    ts_a = entry_a.get("timestamp") or ""
+    ts_b = entry_b.get("timestamp") or ""
+    if not ts_a or not ts_b:
+        return False
+    c_a = entry_a.get("content") or ""
+    c_b = entry_b.get("content") or ""
+    if not c_a or not c_b:
+        return False
+    na = _norm_sentence(c_a)
+    nb = _norm_sentence(c_b)
+    ratio = difflib.SequenceMatcher(None, na, nb).ratio()
+    if ratio >= _REVERSAL_MIN_RATIO:
+        return True
+    bg_b = set()
+    for i in range(len(nb) - 1):
+        bg_b.add(nb[i:i + 2])
+    if _bigram_coverage(na, bg_b) >= _REVERSAL_OVERLAP:
+        return True
+    return False
+
+
+
+
 # ---- 主入口 ----------------------------------------------------------------
 
 def run_maintenance(client) -> dict:
-    """冷层全量治理 v3 (向量预筛 + 回收站)。
+    """冷层全量治理 v3 (向量预筛 + 回收站 + 反转消解)。
 
     Returns:
         dict: {scanned, merged, cleaned, conflicts_resolved,
+               reversals_resolved, reversals_llm,
                vector_ok, total, embeddings, errors,
                pending_stale, trash_cleared, trash_revived}
     """
@@ -57,6 +140,8 @@ def run_maintenance(client) -> dict:
         "merged": 0,
         "cleaned": 0,
         "conflicts_resolved": 0,
+        "reversals_resolved": 0,  # 反转冲突消解数 (规则 + LLM)
+        "reversals_llm": 0,       # LLM 语义反转消解数
         "vector_ok": None,
         "total": 0,
         "embeddings": 0,
@@ -95,8 +180,11 @@ def run_maintenance(client) -> dict:
         stat["note"] = "no entries enumerated (cold layer may be empty or list_all unavailable)"
         return stat
 
-    # ---- Step 2: 向量预筛去重 (B2 重写) -------------------------------
-    stat["merged"], fuzzy_groups = _merge_duplicates(client, all_entries)
+    # ---- Step 2: 向量预筛去重 (B2 重写 + 反转消解) ---------------
+    fuzzy_reversal_candidates: list = []
+    stat["merged"], fuzzy_groups, rev_count, fuzzy_dedup = _merge_duplicates(client, all_entries)
+    fuzzy_reversal_candidates.extend(fuzzy_dedup)
+    stat["reversals_resolved"] += rev_count
 
     # ---- Step 2b: 模糊组 LLM 确认 (B4) ----------------------------------
     if fuzzy_groups:
@@ -108,7 +196,42 @@ def run_maintenance(client) -> dict:
     stat["pending_stale"] = trash.count()  # 更新回收站计数
 
     # ---- Step 4: 冲突事实取舍 --------------------------------------------
-    stat["conflicts_resolved"] = _resolve_conflicts(client, all_entries)
+    stat["conflicts_resolved"], conf_rev = _resolve_conflicts(client, all_entries, fuzzy_reversal_candidates)
+    stat["reversals_resolved"] += conf_rev
+
+    # ---- Step 4b: LLM 语义反转兜底 (模糊候选) ------------------------
+    if fuzzy_reversal_candidates:
+        from .llm_judge import judge_reversal
+        from ..trash_store import TrashStore
+
+        batch_size = 5
+        llm_reversals = 0
+        for i in range(0, len(fuzzy_reversal_candidates), batch_size):
+            batch = fuzzy_reversal_candidates[i:i + batch_size]
+            for pair in batch:
+                if len(pair) != 2:
+                    continue
+                older, newer = pair[0], pair[1]
+                result = judge_reversal([older, newer])
+                if result is None:
+                    continue
+                if result.get("decision") != "reversal":
+                    continue
+                older_id = result.get("older_id") or older.get("id", "")
+                if not older_id:
+                    continue
+                try:
+                    client.forget(older_id)
+                    TrashStore().add(
+                        older_id, older.get("content", ""),
+                        reason="reversal_llm",
+                        source_decision="llm_reversal")
+                    llm_reversals += 1
+                except Exception:
+                    continue
+
+        stat["reversals_llm"] = llm_reversals
+        stat["reversals_resolved"] += llm_reversals
 
     # ---- Step 5: 向量完整性校验 ------------------------------------------
     try:
@@ -223,7 +346,7 @@ def _enumerate_all(client, total_hint: int = 0) -> List[Dict[str, Any]]:
 
 # ---- Step 2: 向量预筛去重 (B2 重写) -----------------------------------------
 
-def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list]:
+def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list, int, list]:
     """B2 向量预筛去重: sqlite-vec 邻居替代 bigram 倒排。
 
     1. 对每条条目 recall top_k=_VEC_NEIGHBOR_K 找向量邻居
@@ -232,11 +355,11 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list]
     4. 候选对做精确文本判定: SequenceMatcher + bigram 覆盖率
     5. ≥_SIM_THRESHOLD 合并; _FUZZY_LOW-_SIM_THRESHOLD → LLM
 
-    返回 (merged_count, fuzzy_groups)。
+    返回 (merged_count, fuzzy_groups, reversal_count, fuzzy_reversal_candidates)。
     """
     n = len(entries)
     if n <= 1:
-        return 0, []
+        return 0, [], 0, []
 
     # ---- 0. 建立索引 ----
     id_to_entry: Dict[str, Dict[str, Any]] = {}
@@ -257,6 +380,8 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list]
         norm_to_ids.setdefault(norm, []).append(eid)
 
     merged = 0
+    reversal_count = 0
+    fuzzy_reversal_candidates: List[List[Dict]] = []
     fuzzy_groups: List[List[Dict]] = []
     to_forget: Set[str] = set()
     processed_pairs: Set[Tuple[str, str]] = set()
@@ -332,6 +457,36 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list]
             combined = max(ratio, bg_cov_a, bg_cov_b)
 
             if combined >= _SIM_THRESHOLD:
+                # ---- 反转检测: 新条否定旧条 -> 删旧留新, 不焊句子 ----
+                if _is_reversal_pair(entry_a, entry_b):
+                    older, newer = (
+                        (entry_a, entry_b)
+                        if (entry_a.get("timestamp") or "") <= (entry_b.get("timestamp") or "")
+                        else (entry_b, entry_a)
+                    )
+                    if older["id"] not in to_forget:
+                        try:
+                            client.forget(older["id"])
+                            from ..trash_store import TrashStore
+                            TrashStore().add(
+                                older["id"], older.get("content", ""),
+                                reason="reversal_obsolete",
+                                source_decision="rule_reversal")
+                            to_forget.add(older["id"])
+                            reversal_count += 1
+                        except Exception:
+                            pass
+                    continue
+
+                # 规则反转未命中 + 同主题 + 有时间 -> LLM 模糊候选
+                if _topic_overlap_with_ts(entry_a, entry_b):
+                    ts_a = entry_a.get("timestamp") or ""
+                    ts_b = entry_b.get("timestamp") or ""
+                    if ts_a <= ts_b:
+                        fuzzy_reversal_candidates.append([entry_a, entry_b])
+                    else:
+                        fuzzy_reversal_candidates.append([entry_b, entry_a])
+
                 # 直接合并 (保留较长)
                 if len(c2) > len(c1):
                     keeper, victim = entry_b, entry_a
@@ -355,7 +510,7 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list]
                 # 模糊组 → 收集待 LLM
                 fuzzy_groups.append([entry_a, entry_b])
 
-    return merged, fuzzy_groups
+    return merged, fuzzy_groups, reversal_count, fuzzy_reversal_candidates
 
 
 def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]]) -> int:
@@ -530,17 +685,22 @@ def _merge_for_dedup(base: str, other: str) -> str:
 
 # ---- Step 4: 冲突取舍 -----------------------------------------------------
 
-def _resolve_conflicts(client, entries: List[Dict[str, Any]]) -> int:
+def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_candidates: list = None):
     """解决同主题冲突: 保留最新的条目, 旧版 forget。
 
     冲突判定: 两条内容同主题 (相似度 > CONFLICT_THRESHOLD)
     但差异不够大到视为完全重复 (相似度 < SIM_THRESHOLD)。
     """
+    if fuzzy_reversal_candidates is None:
+        fuzzy_reversal_candidates = []
     if len(entries) <= 1:
-        return 0
+        return 0, 0
 
     n = len(entries)
+    from ..trash_store import TrashStore
+
     resolved = 0
+    reversal_count = 0
     to_forget: Set[str] = set()
 
     for i in range(n):
@@ -554,16 +714,61 @@ def _resolve_conflicts(client, entries: List[Dict[str, Any]]) -> int:
             ratio = difflib.SequenceMatcher(None, c1, c2).ratio()
 
             if _CONFLICT_THRESHOLD <= ratio < _SIM_THRESHOLD:
-                if len(c2) >= len(c1):
+                # ---- 反转检测: 新条否定旧条 -> 按时间取舍 ----
+                if _is_reversal_pair(entries[i], entries[j]):
+                    older, newer = (
+                        (entries[i], entries[j])
+                        if (entries[i].get("timestamp") or "") <= (entries[j].get("timestamp") or "")
+                        else (entries[j], entries[i])
+                    )
+                    victim_id = older.get("id", "")
+                    if victim_id and victim_id not in to_forget:
+                        try:
+                            client.forget(victim_id)
+                            TrashStore().add(
+                                victim_id, older.get("content", ""),
+                                reason="reversal_obsolete",
+                                source_decision="rule_reversal")
+                            to_forget.add(victim_id)
+                            reversal_count += 1
+                            resolved += 1
+                        except Exception:
+                            continue
+                    continue
+
+                # 规则反转未命中 + 同主题 + 有时间 -> LLM 模糊候选
+                if _topic_overlap_with_ts(entries[i], entries[j]):
+                    ts_i = entries[i].get("timestamp") or ""
+                    ts_j = entries[j].get("timestamp") or ""
+                    if ts_i <= ts_j:
+                        fuzzy_reversal_candidates.append([entries[i], entries[j]])
+                    else:
+                        fuzzy_reversal_candidates.append([entries[j], entries[i]])
+
+                # 非反转冲突: 按时间取舍 (有 timestamp 用时间, 否则按长度)
+                ts_i = entries[i].get("timestamp") or ""
+                ts_j = entries[j].get("timestamp") or ""
+                if ts_i and ts_j:
+                    if ts_j >= ts_i:
+                        keeper, victim = entries[j], entries[i]
+                    else:
+                        keeper, victim = entries[i], entries[j]
+                elif len(c2) >= len(c1):
                     keeper, victim = entries[j], entries[i]
                 else:
                     keeper, victim = entries[i], entries[j]
 
-                try:
-                    client.forget(victim["id"])
-                    to_forget.add(victim["id"])
-                    resolved += 1
-                except Exception:
-                    continue
+                victim_id = victim.get("id", "")
+                if victim_id and victim_id not in to_forget:
+                    try:
+                        client.forget(victim_id)
+                        TrashStore().add(
+                            victim_id, victim.get("content", ""),
+                            reason="conflict_obsolete",
+                            source_decision="rule_conflict")
+                        to_forget.add(victim_id)
+                        resolved += 1
+                    except Exception:
+                        continue
 
-    return resolved
+    return resolved, reversal_count

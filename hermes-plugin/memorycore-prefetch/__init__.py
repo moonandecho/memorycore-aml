@@ -51,6 +51,7 @@ try:
         CHAR_LIMIT_USER,
     )
     from memorycore.core.overflow import run_overflow  # noqa: E402
+    from memorycore.core.decay import _apply_decay  # noqa: E402
 except ImportError:
     _REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     sys.path.insert(0, _REPO_ROOT)
@@ -63,6 +64,7 @@ except ImportError:
         CHAR_LIMIT_USER,
     )
     from memorycore.core.overflow import run_overflow  # noqa: E402
+    from memorycore.core.decay import _apply_decay  # noqa: E402
 
 _RECALL_CANDIDATES = 20    # first-stage recall candidates (before reranker)
 _INJECT_TOP_N = 5          # max injected after reranker ranking
@@ -288,6 +290,7 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             client = ColdStoreClient(timeout=_PREFETCH_TIMEOUT)
             results = client.recall_results(q, top_k=_RECALL_CANDIDATES)
             self._record_baseline(results)
+            results = _apply_decay(results)  # unified decay (same as memorycore_recall)
             results, rerank_ok = self._apply_rerank_filter(q, results)
             if not rerank_ok:
                 results = self._filter_by_threshold(results)

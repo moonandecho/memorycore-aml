@@ -33,7 +33,7 @@ _MIN_TEXT_RATIO = 0.15        # 最低字面相似度门禁 (防向量误匹配)
 _REVERSAL_NEG_WORDS = ["不", "没", "无", "非", "否", "别", "不再",
                        "停止", "取消", "不要", "拒绝", "禁", "讨厌",
                        "反对", "不喜", "不爱", "不感兴趣"]
-_REVERSAL_WEAK_NEG = ["不太", "不大", "不怎么", "未必", "难免"]
+_REVERSAL_WEAK_NEG = ["不太", "不大", "不怎么", "未必", "难免", "不常", "不同", "不仅", "不过", "不可", "不必", "不止", "不再"]
 
 
 def _topic_overlap(a: str, b: str) -> bool:
@@ -54,7 +54,7 @@ def _topic_overlap(a: str, b: str) -> bool:
 _ANCHOR_PREFIX = "[用户偏好摘要]"   # 内容前缀: 识别/查重/召回锚点
 _ANCHOR_IMPORTANCE = 0.8        # 高 importance → prefetch 分层注入高档
 _ANCHOR_MAX_CHARS = 800         # 锚点长度上限 (超限截断保留头部)
-_ANCHOR_QUERY = "[用户偏好摘要]"  # recall 查已有锚点 (前缀强关键词)
+_ANCHOR_QUERY = _ANCHOR_PREFIX  # 从 _ANCHOR_PREFIX 派生 (原硬编码 "[用户偏好摘要]")
 
 
 
@@ -144,7 +144,7 @@ def run_overflow(store, client, target: str) -> dict:
                             pass
                 if not cold_ok:
                     try:
-                        r = client.remember(s, importance=0.5, scope="global")
+                        r = client.remember(s, importance=0.6, scope="global")
                         if r.get("status") == "stored":
                             cold_ok = True
                     except Exception:
@@ -300,9 +300,12 @@ def _handle_cold_migration(store, client, target: str, entry: str,
                 stat["overflowed"] += 1  # 算溢流 (已在冷层)
                 return
             elif matched["level"] == "similar":
-                # 反转检测: 本地条(新)否定冷层旧条 -> 直接覆盖, 不合并
+                # 反转检测 (双向化): 本地条或冷层旧条任一侧含否定词 + 同主题 → 覆盖
+                # 场景: 旧"不喜欢A" → 新"喜欢A" (新条无否定词, 旧条有) 同样是反转
                 has_neg = False
+                cold_content = matched["content"]
                 for w in _REVERSAL_NEG_WORDS:
+                    # 检查本地新条
                     if w in entry:
                         is_weak = False
                         for wn in _REVERSAL_WEAK_NEG:
@@ -312,8 +315,24 @@ def _handle_cold_migration(store, client, target: str, entry: str,
                         if not is_weak:
                             has_neg = True
                             break
-                if has_neg and _topic_overlap(entry, matched["content"]):
+                    # 检查冷层旧条: 旧条否定+新条正向 → 正向替代
+                    if w in cold_content:
+                        is_weak = False
+                        for wn in _REVERSAL_WEAK_NEG:
+                            if wn in cold_content and w in wn:
+                                is_weak = True
+                                break
+                        if not is_weak:
+                            has_neg = True
+                            break
+                if has_neg and _topic_overlap(entry, cold_content):
                     try:
+                        # 写入侧反转覆盖前, 旧条进回收站
+                        from ..trash_store import TrashStore
+                        TrashStore().add(
+                            matched["id"], cold_content,
+                            reason="reversal_obsolete",
+                            source_decision="write_side_reversal")
                         r = client.update(matched["id"], entry)
                         if r.get("status") == "updated":
                             _safe_remove_local(store, target, entry, stat)
@@ -598,7 +617,11 @@ def _llm_merge(base: str, new_sentences: List[str]) -> Optional[str]:
 
 def _recall_safe(client, entry: str) -> List[Dict[str, Any]]:
     """安全调用 recall_results, 截前 200 字作查询。"""
-    query = entry[:200]
+    # 长条目 (>250字) 用首尾拼接 (前150+后100), 保留首部语义 + 尾部关键信息
+    if len(entry) > 250:
+        query = entry[:150] + " " + entry[-100:]
+    else:
+        query = entry[:200]
     return client.recall_results(query, top_k=_RECALL_TOP_K)
 
 

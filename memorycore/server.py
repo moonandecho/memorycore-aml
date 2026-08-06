@@ -18,6 +18,7 @@ from .core.config import SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOFT
 from .core.classifier import classify, classify_user_pref, COLD, STALE  # noqa: E402
 from .core.overflow import run_overflow, _recall_safe, _find_best_match, _merge_two_entries  # noqa: E402
 from .core.maintenance import run_maintenance  # noqa: E402
+from .core.decay import _apply_decay  # noqa: E402  # shared by recall + prefetch
 
 mcp = FastMCP("memorycore")
 
@@ -268,6 +269,7 @@ def memorycore_recall(query: str, top_k: int = 3) -> str:
     try:
         k = max(1, min(int(top_k), 10))
         results = _client.recall_results(query, top_k=k)
+        results = _apply_decay(results)
         return json.dumps({"results": results}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)

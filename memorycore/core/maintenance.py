@@ -28,12 +28,12 @@ _COVERAGE_TARGET = 0.95     # 枚举覆盖率目标
 _VEC_NEIGHBOR_K = 10        # 向量预筛: 每条查 top_k 邻居
 _VEC_SCORE_THRESHOLD = 0.5  # 向量预筛: dense_score 下限 (低于此值不配对)
 
-# ---- 反转检测 (2026-08-05: 反转冲突以最新为准) --------------------------
+# ---- 反转检测 (2026-08-05 用户拍板: 反转冲突以最新为准) --------------------
 
 _REVERSAL_NEG_WORDS = ["不", "没", "无", "非", "否", "别", "不再",
                        "停止", "取消", "不要", "拒绝", "禁", "讨厌",
                        "反对", "不喜", "不爱", "不感兴趣"]
-_REVERSAL_WEAK_NEG = ["不太", "不大", "不怎么", "未必", "难免"]
+_REVERSAL_WEAK_NEG = ["不太", "不大", "不怎么", "未必", "难免", "不常", "不同", "不仅", "不过", "不可", "不必", "不止", "不再"]
 _REVERSAL_OVERLAP = 0.55   # 字面重叠阈值 (bigram 覆盖率)
 _REVERSAL_MIN_RATIO = 0.40 # 最小字面相似度 (同主题门槛)
 
@@ -72,8 +72,11 @@ def _is_reversal_pair(older, newer):
     if not c_new or not c_old:
         return False
 
+    # 检查否定词: 任一侧 (newer 或 older) 命中白名单否定词即可 (P1-3 双向化)
+    # 场景: 旧"不喜欢A" → 新"喜欢A" (新条无否定词, 旧条有) 同样是反转
     has_neg = False
     for w in _REVERSAL_NEG_WORDS:
+        # 检查新条
         if w in c_new:
             is_weak = False
             for wn in _REVERSAL_WEAK_NEG:
@@ -83,9 +86,20 @@ def _is_reversal_pair(older, newer):
             if not is_weak:
                 has_neg = True
                 break
+        # 检查旧条 (P1-3: 旧条有否定词 + 新条同主题 → 正向替代也是反转)
+        if w in c_old:
+            is_weak = False
+            for wn in _REVERSAL_WEAK_NEG:
+                if wn in c_old and w in wn:
+                    is_weak = True
+                    break
+            if not is_weak:
+                has_neg = True
+                break
     if not has_neg:
         return False
 
+    # 同主题判定: 复用 bigram 覆盖率 + SequenceMatcher (与去重一致)
     nn = _norm_sentence(c_new)
     no = _norm_sentence(c_old)
     ratio = difflib.SequenceMatcher(None, nn, no).ratio()
@@ -99,8 +113,13 @@ def _is_reversal_pair(older, newer):
     return False
 
 
+
+
 def _topic_overlap_with_ts(entry_a, entry_b) -> bool:
-    """判定两条是否同主题 + 时间可判 (用于收集 LLM 模糊反转候选)。"""
+    """判定两条是否同主题 + 时间可判 (用于收集 LLM 模糊反转候选)。
+    
+    不检查否定词 — 仅检查话题重叠 + 时间序。
+    """
     ts_a = entry_a.get("timestamp") or ""
     ts_b = entry_b.get("timestamp") or ""
     if not ts_a or not ts_b:
@@ -114,9 +133,7 @@ def _topic_overlap_with_ts(entry_a, entry_b) -> bool:
     ratio = difflib.SequenceMatcher(None, na, nb).ratio()
     if ratio >= _REVERSAL_MIN_RATIO:
         return True
-    bg_b = set()
-    for i in range(len(nb) - 1):
-        bg_b.add(nb[i:i + 2])
+    bg_b = {nb[i:i + 2] for i in range(len(nb) - 1)}
     if _bigram_coverage(na, bg_b) >= _REVERSAL_OVERLAP:
         return True
     return False
@@ -127,12 +144,11 @@ def _topic_overlap_with_ts(entry_a, entry_b) -> bool:
 # ---- 主入口 ----------------------------------------------------------------
 
 def run_maintenance(client) -> dict:
-    """冷层全量治理 v3 (向量预筛 + 回收站 + 反转消解)。
+    """冷层全量治理 v3 (向量预筛 + 回收站)。
 
     Returns:
         dict: {scanned, merged, cleaned, conflicts_resolved,
-               reversals_resolved, reversals_llm,
-               vector_ok, total, embeddings, errors,
+               reversals_resolved, vector_ok, total, embeddings, errors,
                pending_stale, trash_cleared, trash_revived}
     """
     stat: Dict[str, Any] = {
@@ -140,8 +156,8 @@ def run_maintenance(client) -> dict:
         "merged": 0,
         "cleaned": 0,
         "conflicts_resolved": 0,
-        "reversals_resolved": 0,  # 反转冲突消解数 (规则 + LLM)
-        "reversals_llm": 0,       # LLM 语义反转消解数
+        "reversals_resolved": 0,  # 反转冲突消解数 (去重 + 冲突 + LLM)
+        "candidates_processed": 0,  # Fix2: LLM 反转候选对处理数 (reversal 命中 + fallback 合并)
         "vector_ok": None,
         "total": 0,
         "embeddings": 0,
@@ -149,6 +165,7 @@ def run_maintenance(client) -> dict:
         "pending_stale": 0,    # 回收站当前条目
         "trash_cleared": 0,    # 本次到期清空
         "trash_revived": 0,    # 本次恢复 (被召回命中)
+        "forgotten": 0,        # 冷层降权遗忘数
     }
 
     # ---- Step 0: 回收站巡检 (召回恢复 + 到期清空) ----------------------
@@ -182,7 +199,7 @@ def run_maintenance(client) -> dict:
 
     # ---- Step 2: 向量预筛去重 (B2 重写 + 反转消解) ---------------
     fuzzy_reversal_candidates: list = []
-    stat["merged"], fuzzy_groups, rev_count, fuzzy_dedup = _merge_duplicates(client, all_entries)
+    stat["merged"], fuzzy_groups, rev_count, fuzzy_dedup, step2_forgotten = _merge_duplicates(client, all_entries)
     fuzzy_reversal_candidates.extend(fuzzy_dedup)
     stat["reversals_resolved"] += rev_count
 
@@ -196,27 +213,73 @@ def run_maintenance(client) -> dict:
     stat["pending_stale"] = trash.count()  # 更新回收站计数
 
     # ---- Step 4: 冲突事实取舍 --------------------------------------------
-    stat["conflicts_resolved"], conf_rev = _resolve_conflicts(client, all_entries, fuzzy_reversal_candidates)
+    stat["conflicts_resolved"], conf_rev, step4_forgotten = _resolve_conflicts(client, all_entries, fuzzy_reversal_candidates)
     stat["reversals_resolved"] += conf_rev
 
     # ---- Step 4b: LLM 语义反转兜底 (模糊候选) ------------------------
+    # R4: 全局去重 (Step 2 + Step 4 可能对同一对重复追加)
+    seen_pairs = set()
+    deduped_candidates = []
+    for pair in fuzzy_reversal_candidates:
+        if len(pair) != 2:
+            continue
+        key = (pair[0].get("id", ""), pair[1].get("id", ""))
+        if key not in seen_pairs:
+            seen_pairs.add(key)
+            deduped_candidates.append(pair)
+    fuzzy_reversal_candidates = deduped_candidates
+
+    # Fix1: 汇总已处理 id (Step 2 + Step 4 的 forget/merge victim), Step 4b 跳过
+    processed_ids = set(step2_forgotten)
+    processed_ids.update(step4_forgotten)
+
     if fuzzy_reversal_candidates:
         from .llm_judge import judge_reversal
         from ..trash_store import TrashStore
 
         batch_size = 5
-        llm_reversals = 0
+        llm_reversal_hits = 0       # Fix2: 真正 LLM 确认反转数
+        llm_candidates_processed = 0  # Fix2: 处理的候选对总数
         for i in range(0, len(fuzzy_reversal_candidates), batch_size):
             batch = fuzzy_reversal_candidates[i:i + batch_size]
             for pair in batch:
                 if len(pair) != 2:
                     continue
                 older, newer = pair[0], pair[1]
+                # Fix1: 跳过已被 Step 2/3/4 处理过的 pair (幽灵记录防护)
+                if older.get("id") in processed_ids or newer.get("id") in processed_ids:
+                    continue
                 result = judge_reversal([older, newer])
                 if result is None:
+                    # R2: LLM 不可用/失败 → 退回直接合并 (排除反转后就是同主题重复)
+                    _merged = _merge_for_dedup(newer.get("content", ""), older.get("content", ""))
+                    try:
+                        client.update(newer["id"], _merged)
+                        TrashStore().add(
+                            older["id"], older.get("content", ""),
+                            reason="merge_obsolete",
+                            source_decision="llm_fallback_merge")
+                        client.forget(older["id"])
+                        llm_candidates_processed += 1  # Fix2: fallback 合并也算处理
+                    except Exception:
+                        pass
                     continue
                 if result.get("decision") != "reversal":
+                    # R2: LLM 判非反转 → 退回直接合并
+                    _merged = _merge_for_dedup(newer.get("content", ""), older.get("content", ""))
+                    try:
+                        client.update(newer["id"], _merged)
+                        TrashStore().add(
+                            older["id"], older.get("content", ""),
+                            reason="merge_obsolete",
+                            source_decision="llm_not_reversal_fallback")
+                        client.forget(older["id"])
+                        llm_candidates_processed += 1  # Fix2: 非反转合并也算处理
+                    except Exception:
+                        pass
                     continue
+
+                # LLM 确认反转 → forget 旧条 + 回收站
                 older_id = result.get("older_id") or older.get("id", "")
                 if not older_id:
                     continue
@@ -226,12 +289,17 @@ def run_maintenance(client) -> dict:
                         older_id, older.get("content", ""),
                         reason="reversal_llm",
                         source_decision="llm_reversal")
-                    llm_reversals += 1
+                    llm_reversal_hits += 1
+                    llm_candidates_processed += 1  # Fix2
                 except Exception:
                     continue
 
-        stat["reversals_llm"] = llm_reversals
-        stat["reversals_resolved"] += llm_reversals
+        stat["candidates_processed"] = llm_candidates_processed
+        stat["reversals_resolved"] += llm_reversal_hits
+
+    # ---- Step 4c: 冷层降权遗忘 (decay → trash) ---------------------------
+    stat["forgotten"] = _forget_decayed(client, all_entries, trash)
+    stat["pending_stale"] = trash.count()
 
     # ---- Step 5: 向量完整性校验 ------------------------------------------
     try:
@@ -251,6 +319,14 @@ def run_maintenance(client) -> dict:
 
 def _trash_cycle(client) -> Tuple[int, int]:
     """回收站巡检: 召回恢复 + 到期清空。
+
+    恢复机制 (P1-7 明确):
+    - 仅适用于"未 forget 的观察类"条目 (reason=stale_candidate):
+      此类条目仍在冷层, recall 命中 → trash.remove 恢复。
+    - 已 forget 的 victim 类 (reason 含 reversal/conflict/decayed/merge):
+      冷层已删除, recall 不可能命中; 30 天到期 → trash-empty 直接清空。
+      设计意图: 已 forget 条目恢复需重新 remember (含重新 embedding),
+      复杂度高于收益; 30 天窗口已足够长, 真重要的会被重新写入。
 
     返回 (revived, cleared)。
     """
@@ -283,10 +359,10 @@ def _trash_cycle(client) -> Tuple[int, int]:
             continue
         try:
             client.forget(mid)
-            trash.remove(mid)
-            cleared += 1
         except Exception:
-            continue
+            pass  # 可能已被遗忘, 不影响回收站清理
+        trash.remove(mid)
+        cleared += 1
 
     return revived, cleared
 
@@ -306,7 +382,9 @@ def _enumerate_all(client, total_hint: int = 0) -> List[Dict[str, Any]]:
     try:
         results = client.list_all()
         if results:
-            return results
+            # P2-4: 过滤已 superseded 条目 (服务器 sleep 时标记, 治理层不再重复处理)
+            active = [r for r in results if not r.get("superseded_by")]
+            return active
     except (AttributeError, Exception):
         pass
 
@@ -346,20 +424,21 @@ def _enumerate_all(client, total_hint: int = 0) -> List[Dict[str, Any]]:
 
 # ---- Step 2: 向量预筛去重 (B2 重写) -----------------------------------------
 
-def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list, int, list]:
+def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list, int, list, set]:
     """B2 向量预筛去重: sqlite-vec 邻居替代 bigram 倒排。
 
     1. 对每条条目 recall top_k=_VEC_NEIGHBOR_K 找向量邻居
     2. 邻居中 dense_score > _VEC_SCORE_THRESHOLD → 候选对
     3. 哈希兜底: _norm_sentence 相同 → 直接判重
     4. 候选对做精确文本判定: SequenceMatcher + bigram 覆盖率
-    5. ≥_SIM_THRESHOLD 合并; _FUZZY_LOW-_SIM_THRESHOLD → LLM
+    5. ≥_SIM_THRESHOLD: 先查反转 → 删旧留新; 否则合并
+    6. _FUZZY_LOW-_SIM_THRESHOLD → LLM
 
     返回 (merged_count, fuzzy_groups, reversal_count, fuzzy_reversal_candidates)。
     """
     n = len(entries)
     if n <= 1:
-        return 0, [], 0, []
+        return 0, [], 0, [], set()
 
     # ---- 0. 建立索引 ----
     id_to_entry: Dict[str, Dict[str, Any]] = {}
@@ -401,6 +480,11 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list,
             )
             try:
                 client.update(keeper_id, merged_content)
+                # P1-5: victim 进回收站再 forget
+                TrashStore().add(
+                    victim_id, victim.get("content", ""),
+                    reason="merge_obsolete",
+                    source_decision="rule_merge")
                 client.forget(victim_id)
                 to_forget.add(victim_id)
                 merged += 1
@@ -457,7 +541,7 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list,
             combined = max(ratio, bg_cov_a, bg_cov_b)
 
             if combined >= _SIM_THRESHOLD:
-                # ---- 反转检测: 新条否定旧条 -> 删旧留新, 不焊句子 ----
+                # ---- 反转检测: 新条否定旧条 -> 删旧留新, 不焊句子 (2026-08-05) ----
                 if _is_reversal_pair(entry_a, entry_b):
                     older, newer = (
                         (entry_a, entry_b)
@@ -478,14 +562,17 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list,
                             pass
                     continue
 
-                # 规则反转未命中 + 同主题 + 有时间 -> LLM 模糊候选
+                # 规则反转未命中 + 同主题 + 有时间 → LLM 模糊候选
+                # P1-4: 进入 LLM 候选的 pair 跳过直接合并，等 LLM 判定后再决定
                 if _topic_overlap_with_ts(entry_a, entry_b):
+                    # 保证时间序: older first, newer second
                     ts_a = entry_a.get("timestamp") or ""
                     ts_b = entry_b.get("timestamp") or ""
                     if ts_a <= ts_b:
                         fuzzy_reversal_candidates.append([entry_a, entry_b])
                     else:
                         fuzzy_reversal_candidates.append([entry_b, entry_a])
+                    continue  # P1-4: 跳过直接合并, 等 LLM 判定
 
                 # 直接合并 (保留较长)
                 if len(c2) > len(c1):
@@ -501,6 +588,11 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list,
                 )
                 try:
                     client.update(keeper["id"], merged_content)
+                    # P1-5: victim 进回收站再 forget
+                    TrashStore().add(
+                        victim["id"], victim.get("content", ""),
+                        reason="merge_obsolete",
+                        source_decision="rule_merge")
                     client.forget(victim["id"])
                     to_forget.add(victim["id"])
                     merged += 1
@@ -510,7 +602,7 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list,
                 # 模糊组 → 收集待 LLM
                 fuzzy_groups.append([entry_a, entry_b])
 
-    return merged, fuzzy_groups, reversal_count, fuzzy_reversal_candidates
+    return merged, fuzzy_groups, reversal_count, fuzzy_reversal_candidates, to_forget
 
 
 def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]]) -> int:
@@ -541,6 +633,12 @@ def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]]) -> int:
                     keeper.get("content", ""), victim.get("content", "")
                 )
                 client.update(keeper["id"], merged_content)
+                # Fix3: victim 进回收站 (P1-5 遗漏)
+                from ..trash_store import TrashStore
+                TrashStore().add(
+                    victim_id, victim.get("content", ""),
+                    reason="merge_obsolete",
+                    source_decision="llm_dedup")
                 client.forget(victim_id)
                 merged += 1
             except Exception:
@@ -551,7 +649,7 @@ def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]]) -> int:
 
 # ---- Step 3: 过时清理 (B3 + 回收站入站) ------------------------------------
 
-_LONG_STALE_MARKERS = ["落地中", "进行中"]
+_LONG_STALE_MARKERS = ["落地中", "进行中", "规划中", "待定", "未完成"]  # P2-2: 进行时词在此判定
 
 
 def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> int:
@@ -588,8 +686,13 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> int:
             continue
 
         if is_short:
-            # 短条目: 直接 forget (含落地中等进行时标记也直接清理)
+            # 短条目: 先进回收站再 forget (P2-2: 与长条目对称, 统一进回收站)
             try:
+                trash.add(
+                    entry["id"],
+                    entry.get("content", ""),
+                    reason="stale_short",
+                    source_decision="rule_stale")
                 client.forget(entry["id"])
                 cleaned += 1
             except Exception:
@@ -661,6 +764,93 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> int:
     return cleaned
 
 
+# ---- Step 3b: 冷层降权遗忘判定 --------------------------------------------
+
+def _forget_decayed(client, entries, trash=None):
+    """冷层降权遗忘: final_score = importance × 0.5^(days/90) < 0.05 且 importance < 0.8 → 移入回收站。
+
+    语义: 存储层留存决策, 回答"该条目是否值得保留"。
+    与 _apply_decay 分工: _apply_decay 管 recency-aware 排序 (base=dense_score),
+    此处管存储留存 (base=importance, 无 query 语义时更稳定)。
+
+    遗忘后从冷层删除该条目 (移入回收站即从 active 移除)。
+    高价值 (importance >= 0.8) 永不进入遗忘路径。
+
+    Returns:
+        int: 本次遗忘数
+    """
+    from datetime import datetime, timezone as _tz
+    from ..trash_store import TrashStore
+
+    if trash is None:
+        trash = TrashStore()
+
+    forgotten = 0
+    now = datetime.now(_tz.utc)
+
+    for entry in entries:
+        eid = entry.get("id", "")
+        if not eid:
+            continue
+        importance = entry.get("importance", 0.5)
+
+        # 高价值永不进遗忘路径
+        if importance >= 0.8:
+            continue
+
+        # 解析 last_recalled (P0-2: 缺失时降级用 timestamp)
+        last_str = entry.get("last_recalled")
+        days = 365  # 最终兜底
+        if last_str:
+            try:
+                normalized = last_str.replace("Z", "+00:00")
+                last_dt = datetime.fromisoformat(normalized)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=_tz.utc)
+                delta = now - last_dt
+                days = max(delta.days, 0)
+            except (ValueError, TypeError):
+                days = 365
+        else:
+            # last_recalled 缺失 → 降级用 timestamp（写入时间）
+            ts_str = entry.get("timestamp")
+            if ts_str:
+                try:
+                    normalized = ts_str.replace("Z", "+00:00")
+                    ts_dt = datetime.fromisoformat(normalized)
+                    if ts_dt.tzinfo is None:
+                        ts_dt = ts_dt.replace(tzinfo=_tz.utc)
+                    delta = now - ts_dt
+                    days = max(delta.days, 0)
+                except (ValueError, TypeError):
+                    days = 365
+
+        factor = 0.5 ** (days / 90)
+        final_score = importance * factor
+
+        if final_score < 0.05:
+            # 安全顺序: 先入回收站, 成功后再从冷层删除。
+            # trash.add 失败时跳过该条 (不 forget), 下轮巡检再试。
+            try:
+                trash.add(
+                    eid,
+                    entry.get("content", ""),
+                    reason="decayed",
+                    source_decision="decay_forget",
+                )
+            except Exception:
+                continue  # 回收站写入失败 → 保守, 不删冷层数据
+            try:
+                client.forget(eid)
+                forgotten += 1
+            except Exception:
+                # forget 失败但回收站已写入 → 仍计为成功
+                # (冷层可能已不可达, 回收站有备份, 下次巡检会处理)
+                forgotten += 1
+
+    return forgotten
+
+
 # ---- 合并辅助 --------------------------------------------------------------
 
 def _merge_for_dedup(base: str, other: str) -> str:
@@ -685,20 +875,22 @@ def _merge_for_dedup(base: str, other: str) -> str:
 
 # ---- Step 4: 冲突取舍 -----------------------------------------------------
 
-def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_candidates: list = None):
-    """解决同主题冲突: 保留最新的条目, 旧版 forget。
+def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_candidates: list = None) -> Tuple[int, int, set]:
+    """解决同主题冲突: 反转冲突按时间取舍, 普通冲突保留最新, victim 进回收站。
 
     冲突判定: 两条内容同主题 (相似度 > CONFLICT_THRESHOLD)
     但差异不够大到视为完全重复 (相似度 < SIM_THRESHOLD)。
+
+    返回 (resolved_count, reversal_count)。
     """
     if fuzzy_reversal_candidates is None:
         fuzzy_reversal_candidates = []
     if len(entries) <= 1:
-        return 0, 0
+        return 0, 0, set()
 
-    n = len(entries)
     from ..trash_store import TrashStore
 
+    n = len(entries)
     resolved = 0
     reversal_count = 0
     to_forget: Set[str] = set()
@@ -714,7 +906,7 @@ def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_can
             ratio = difflib.SequenceMatcher(None, c1, c2).ratio()
 
             if _CONFLICT_THRESHOLD <= ratio < _SIM_THRESHOLD:
-                # ---- 反转检测: 新条否定旧条 -> 按时间取舍 ----
+                # ---- 反转检测: 新条否定旧条 -> 按时间取舍 (2026-08-05) ----
                 if _is_reversal_pair(entries[i], entries[j]):
                     older, newer = (
                         (entries[i], entries[j])
@@ -736,7 +928,7 @@ def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_can
                             continue
                     continue
 
-                # 规则反转未命中 + 同主题 + 有时间 -> LLM 模糊候选
+                # 规则反转未命中 + 同主题 + 有时间 → LLM 模糊候选
                 if _topic_overlap_with_ts(entries[i], entries[j]):
                     ts_i = entries[i].get("timestamp") or ""
                     ts_j = entries[j].get("timestamp") or ""
@@ -744,6 +936,7 @@ def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_can
                         fuzzy_reversal_candidates.append([entries[i], entries[j]])
                     else:
                         fuzzy_reversal_candidates.append([entries[j], entries[i]])
+                    continue  # R3: 跳过普通冲突取舍, 等 Step 4b 统一处理
 
                 # 非反转冲突: 按时间取舍 (有 timestamp 用时间, 否则按长度)
                 ts_i = entries[i].get("timestamp") or ""
@@ -771,4 +964,4 @@ def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_can
                     except Exception:
                         continue
 
-    return resolved, reversal_count
+    return resolved, reversal_count, to_forget

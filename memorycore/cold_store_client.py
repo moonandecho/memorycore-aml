@@ -150,6 +150,9 @@ class LocalBackend:
                 "keyword_score": round(it.get("keyword_score", 0.0), 4),
                 "fts_score": round(it.get("fts_score", 0.0), 4),
                 "importance": it.get("importance", 0.5),
+                # 透传治理字段 (decay/遗忘依赖; 缺失时上层降级用 timestamp)
+                "timestamp": it.get("timestamp"),
+                "last_recalled": it.get("last_recalled"),
             })
         return {"status": "ok", "results": results}
 
@@ -414,23 +417,39 @@ class RemoteBackend:
         return self._call_tool("stats", {})
 
     def list_all(self) -> List[Dict[str, Any]]:
-        """Try list_all / get_all; raise AttributeError if unavailable."""
+        """Try list_all / get_all; raise AttributeError if unavailable.
+
+        Paginated loop (limit=500, offset++) with seen_ids dedup — mirrors
+        production client. If the server returns total and we have consumed
+        it, stop; if a page returns fewer than limit, it is the last page.
+        """
         try:
-            resp = self._call_tool("list_all", {})
-            if isinstance(resp, list):
-                return resp
-            if isinstance(resp, dict) and resp.get("results"):
-                return resp["results"]
-            if isinstance(resp, dict) and resp.get("items"):
-                return resp["items"]
-            raw = resp.get("raw", "")
-            if raw:
-                import json as _json
-                try:
-                    return _json.loads(raw)
-                except Exception:
-                    pass
-            return []
+            all_results = []
+            seen_ids = set()
+            offset = 0
+            limit = 500
+            while True:
+                resp = self._call_tool("list_all", {"limit": limit, "offset": offset})
+                items = []
+                total = 0
+                if isinstance(resp, list):
+                    items = resp
+                elif isinstance(resp, dict):
+                    items = resp.get("results", resp.get("items", []))
+                    total = resp.get("total", 0)
+                if not items:
+                    break
+                for item in items:
+                    iid = item.get("id", "")
+                    if iid and iid not in seen_ids:
+                        seen_ids.add(iid)
+                        all_results.append(item)
+                offset += len(items)
+                if total > 0 and offset >= total:
+                    break
+                if len(items) < limit:
+                    break
+            return all_results
         except Exception:
             try:
                 resp = self._call_tool("get_all", {})

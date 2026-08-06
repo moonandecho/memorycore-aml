@@ -1,5 +1,7 @@
 # origin-memorycore
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 **MemoryCore is a memory governance layer for LLM agents.**
 
 Agents accumulate memory fast — preferences, facts, decisions — and memory that isn't maintained quietly degrades: duplicates accumulate, stale facts linger, the hot tier fills up and starts rejecting writes. MemoryCore keeps that from happening.
@@ -139,44 +141,146 @@ Exposed tools:
 
 ## Hermes integration — per-turn prefetch (EXPERIMENTAL)
 
-> ⚠️ **Experimental — off by default.** The per-turn prefetch plugin is
-> provided for experimentation and small-scale use. It is **disabled by
-> default** — set `MEMORYCORE_PREFETCH_ENABLED=1` to enable it. When
-> disabled, the plugin injects only a static cold-store index block
-> (zero per-turn overhead); the agent retrieves cold-tier context
-> on-demand via the `memorycore_recall` tool.
->
-> When enabled, every turn recalls the cold tier (top-10), optionally
-> re-ranks via a cross-encoder (if `MEMORYCORE_RERANK_URL` is configured),
-> and injects the top-3 into context. Without a reranker, the plugin
-> falls back to injecting only the single best dense-score match subject
-> to a dynamic threshold: `max(0.45, rolling_baseline × 0.90)`.
->
-> For details on the adaptive threshold, its measurements, and the
-> reranker two-stage pipeline, see
-> [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
+> ⚠️ **Experimental — off by default.** Per-turn prefetch is provided for
+> experimentation and small-scale use. **The primary retrieval path is
+> on-demand recall** — the agent queries the cold tier via the
+> `memorycore_recall` tool with intent, which avoids the noise problem
+> entirely. Per-turn prefetch is **disabled by default**; it only activates
+> when `MEMORYCORE_PREFETCH_ENABLED=1` is explicitly set.
 
 The MCP server is client-agnostic. For **Hermes Agent** there is an
 optional companion plugin that provides dual-channel cold-tier access:
 
-- **Static index** — a system prompt block listing available topics
-  (configurable via `MEMORYCORE_INDEX_TOPICS`) with guidance to use
-  `memorycore_recall(query)`. Always active, zero per-turn overhead.
-- **Per-turn prefetch** (opt-in) — recalls cold tier (top-10), optionally
-  re-ranks via cross-encoder, injects top-3. Enabled with
-  `MEMORYCORE_PREFETCH_ENABLED=1`. Reranker endpoint configured via
-  `MEMORYCORE_RERANK_URL` (full URL, e.g. `http://your-reranker-host:8899/rerank`).
+### Dual-channel design
 
-The threshold uses a **fixed coefficient 0.90** against a rolling baseline
-(median of your real recall scores, persisted to `baseline.json`). Delete
-`baseline.json` to reset to `0.70`.
+- **Static index channel (always active, zero overhead)** — a system
+  prompt block listing available topics (configurable via
+  `MEMORYCORE_INDEX_TOPICS`, comma-separated), with guidance to use
+  `memorycore_recall(query)` for on-demand recall. **This is the default
+  posture** — zero per-turn overhead, no noise problem.
+- **Per-turn prefetch channel (experimental, opt-in)** — recalls the cold
+  tier every turn, filters, and injects into context, so the agent
+  "remembers" relevant content before it speaks.
 
-- Install/activate/requirements: [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md).
+### Prefetch pipeline (when enabled)
+
+```
+query → preprocess → cold-tier recall (10 candidates)
+  → reranker refinement (if MEMORYCORE_RERANK_URL configured)
+     or dense-score top-1 fallback (if no reranker)
+  → session dedup → hot-tier dedup → inject top-3
+```
+
+- **Reranker (optional)**: `MEMORYCORE_RERANK_URL` points to a
+  cross-encoder endpoint (full URL, e.g. `http://your-reranker-host:8899/rerank`).
+  The plugin sends a POST with `{"query": q, "documents": docs}`, filters
+  by an absolute threshold (-2.0), then injects the top-3 by rerank score.
+- **Fallback (default)**: when no reranker is configured, the plugin
+  injects only the single best dense-score match if it clears the dynamic
+  threshold `max(0.45, baseline × 0.90)`. Conservative by design —
+  silence over noise.
+
+### Deployment (Hermes Agent)
 
 ```bash
+# 1. install origin-memorycore (provides the cold tier + ColdStoreClient)
+pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
+
+# 2. put the plugin in Hermes' user plugin dir
+mkdir -p ~/.hermes/plugins
 cp -r hermes-plugin/memorycore-prefetch ~/.hermes/plugins/
-hermes config set memory.provider memorycore-prefetch   # next session
+
+# 3. activate (takes effect next session)
+hermes config set memory.provider memorycore-prefetch
 ```
+
+Three postures after deployment, pick per need:
+
+| Posture | Configuration | Behaviour |
+|---|---|---|
+| Default (recommended) | no extra config | static index only, on-demand recall — zero overhead, no noise |
+| Experimental: prefetch (no reranker) | `MEMORYCORE_PREFETCH_ENABLED=1` | per-turn recall, inject only the top-1 that clears the dynamic threshold |
+| Experimental: prefetch + reranker | `MEMORYCORE_PREFETCH_ENABLED=1` + `MEMORYCORE_RERANK_URL` | full pipeline: candidates → cross-encoder re-rank → inject top-3 |
+
+### Dynamic baseline threshold
+
+```
+threshold = max(0.45, rolling_baseline × 0.90)
+```
+
+- **Fixed coefficient 0.90** — no water-level bands.
+- **Baseline self-evolves**: every recall records the batch-max
+  `dense_score` into a 200-sample rolling window; the median is recomputed
+  every 50 samples and atomically persisted to `baseline.json` next to the
+  plugin. Delete that file to reset to the initial value (`0.70`).
+- **Absolute floor 0.45** acts as a lower guardrail; at scale (1000+
+  entries) it is not a noise barrier — with a reranker configured, the
+  reranker handles noise separation, and the fallback path tightens to top-1.
+
+For the measurement data and the rationale behind the threshold and the
+reranker two-stage pipeline, see
+[docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
+
+### Plugin configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEMORYCORE_PREFETCH_ENABLED` | *(unset)* | Set to `1` to enable per-turn prefetch (EXPERIMENTAL) |
+| `MEMORYCORE_RERANK_URL` | *(unset)* | Full cross-encoder endpoint URL (e.g. `http://your-reranker-host:8899/rerank`). When unset, falls back to dense-score top-1 |
+| `MEMORYCORE_INDEX_TOPICS` | *(unset)* | Comma-separated topics for the system prompt index block |
+
+Requirements & notes:
+
+- **Hermes-specific**: the plugin imports Hermes runtime modules
+  (`agent.memory_provider`) and does **not** work as a standalone package —
+  it is the Hermes integration side of MemoryCore. Full details:
+  [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md).
+- Every recall keeps a 5s timeout; failures degrade silently to an empty
+  injection and never block the conversation.
+- The reranker call uses a 3s timeout; timeouts or failures trigger the
+  same fallback as an unconfigured URL.
+
+## Scale test & optimisation results
+
+MemoryCore was stress-tested and recall-optimised at ten-thousand-entry
+cold-tier scale (isolated test environment, zero contact with production
+data, reproducible results).
+
+**Write & capacity**
+
+| Metric | Result |
+|---|---|
+| Write throughput | 10k entries in 467s, ≈21.4 entries/s (embedding-bound) |
+| Database size | 300MB / 10k entries |
+| Memory footprint | process RSS +19MB only, flat throughout — no leak signature |
+
+**Query latency** — median 48ms at top_k=5; ten-thousand-entry scale
+matches hundred-entry scale, no latency regression.
+
+**Recall quality** — three probes:
+
+1. **Exact match (self-recall)**: 20/20 hit top-1 — exact matching is intact.
+2. **Noise rejection (unrelated queries)**: mean top-1 dense score 0.056,
+   most return 0.0 — unrelated content almost never leaks into results.
+3. **Short-query recall (before → after)** — the key optimisation outcome:
+
+| Stage | Short-query hit rate |
+|---|---|
+| Before | 0/8 |
+| After | 5/8 (62.5%) |
+
+**What was optimised**: at high topic density, the fixed candidate
+truncation `k=max(top_k, 20)` pushed detailed memories out of the candidate
+pool, so short queries failed to recall them. The fix enlarges the
+candidate truncation to `k=max(top_k*4, 300)` and expands candidates
+internally at the recall entry point before truncating the return — every
+recall channel (per-turn prefetch + on-demand recall) benefits from a
+single fix. The fix is confined to the recall stage; ranking logic is
+untouched, behaviour is predictable and reversible.
+
+> Note: tests ran on a synthetic 10k-entry database (80 "golden" memories +
+> 9920 filler memories in daily-log tone, same config as production);
+> production data was untouched.
 
 ## Notes for sqlite-vec users
 

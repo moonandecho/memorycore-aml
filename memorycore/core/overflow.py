@@ -77,6 +77,7 @@ def run_overflow(store, client, target: str) -> dict:
         "updated": 0,
         "deleted": 0,
         "merged": 0,
+        "compressed": 0,  # B: LLM 压缩条数 (2026-08-07)
         "kept": 0,
         "errors": 0,
     }
@@ -181,6 +182,26 @@ def run_overflow(store, client, target: str) -> dict:
     # ---- Step 2+3+5: 逐条处理 --------------------------------------------
     for entry in entries:
         if should_keep_local(entry):
+            # B: 长条目压缩优先 (2026-08-07) — keep 但 >200 字:
+            # 先尝试 LLM 压缩成精简版留本地, 原始细节沉冷层; 失败保留原样。
+            if len(entry) > _COMPRESS_MIN_CHARS:
+                compressed = _llm_compress(client, entry)
+                if compressed is not None and compressed != entry:
+                    # 校验 2: 压缩确实更短 (省字目标)
+                    if len(compressed) < len(entry) * 0.8:
+                        # 先沉原始细节到冷层 (原子性: 失败则保留本地原样)
+                        try:
+                            r = client.remember(entry, importance=0.6, scope="global")
+                            if r.get("status") == "stored":
+                                store.replace(target, entry, compressed)
+                                stat["compressed"] += 1
+                                anchor_parts.append(entry)
+                                continue
+                        except Exception:
+                            pass
+                        stat["errors"] += 1
+                        stat["kept"] += 1
+                        continue
             stat["kept"] += 1
             continue
 
@@ -614,6 +635,89 @@ def _llm_merge(base: str, new_sentences: List[str]) -> Optional[str]:
 
 
 # ---- 辅助函数 ------------------------------------------------------------
+
+# B: 长条目压缩阈值 (2026-08-07) — keep 且超过此长度的条目, 溢流时尝试 LLM 压缩
+_COMPRESS_MIN_CHARS = 200
+
+
+def _llm_compress(client, entry: str) -> Optional[str]:
+    """LLM 压缩长记忆条目为精简版 (保留全部关键信息, 细节已沉冷层)。
+
+    边界 (与 _llm_merge 同款):
+    - 只做\"压缩\", 不自由发挥 (prompt 硬约束: 保留路径/数字/日期/专有名词,
+      不添加/不推断/不修改事实);
+    - 失败路径 (无 key / 网络错误 / 超时 / 解析失败 / 信息保留校验不过 /
+      压缩不省字) 一律返回 None, 由调用方保留原条目, 溢流永不阻塞。
+    """
+    from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT
+
+    if not LLM_API_KEY:
+        return None
+
+    prompt = (
+        "你是记忆整理助手。下面是一条过长的记忆条目, 请压缩成精简版:\n"
+        f"<entry>{entry}</entry>\n"
+        "要求:\n"
+        "1. 只保留核心结论和必须长期记住的关键点: 日期/时间、数字、"
+        "路径、端口、专有名词、命令名、人名\n"
+        "2. 次要细节可以省略: 背景解释、过程描述、中间步骤、"
+        "过时的注记、参考文档路径\n"
+        "3. 目标长度: 原条目的 40%-55% (必须明显变短)\n"
+        "4. 不添加任何新事实, 不推断, 不修改事实, 不改变语义\n"
+        "5. 保持中文, 一句话或多句皆可, 但必须自包含可读\n"
+        '6. 只输出 JSON: {"compressed": "压缩后的单条文本"}'
+    )
+
+    try:
+        import json
+        import urllib.request
+
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 3000,
+            # 压缩是纯提取任务, 禁用推理链 (v4-flash 推理会吃光 token 导致空输出)
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
+        }
+        req = urllib.request.Request(
+            LLM_BASE_URL.rstrip("/") + "/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {LLM_API_KEY}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode())
+        content = data["choices"][0]["message"]["content"].strip()
+        content = re.sub(r"^```(json)?|```$", "", content, flags=re.M).strip()
+        text = json.loads(content).get("compressed", "").strip()
+    except Exception:
+        return None
+
+    # 校验 1: 长度合理 (不能过短丢语义, 不能反而变长)
+    if not text or len(text) < 30:
+        return None
+    if len(text) >= len(entry):
+        return None
+
+    # 校验 2: 信息保留 — 原条目关键 bigram 须出现在压缩输出中
+    orig_norm = _norm_sentence(entry)
+    comp_norm = _norm_sentence(text)
+    if len(orig_norm) <= 6:
+        return None
+    coverage = _bigram_coverage(orig_norm, {
+        comp_norm[i:i + 2]
+        for i in range(len(comp_norm) - 1)
+    })
+    if coverage < 0.45:
+        return None  # 信息保留不足, 回退保留原条目
+
+    return text
+
 
 def _recall_safe(client, entry: str) -> List[Dict[str, Any]]:
     """安全调用 recall_results, 截前 200 字作查询。"""

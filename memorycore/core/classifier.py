@@ -51,37 +51,102 @@ def classify(content: str, importance: float = 0.8, scope: str = "global") -> Di
 def should_keep_local(content: str) -> bool:
     """溢流场景的热保留判定 (比 classify 更严格, 只保留真正每轮要用的)。
 
-    v2 分流判断: 行为准则 / 交互偏好 / 用户纠正 / 环境常量 → 留本地;
-    状态记录 / 历史决策 / 低频配置细节 → 可下沉。
-    用户偏好表达多样 (不一定带关键词), 所以这里同时检查:
-    - 明确的准则/偏好/纠正/常量关键词
-    - 内容以"用户""我"开头的偏好陈述 (启发式)
+    v3 (2026-08-09): 分级 keep — 强 keep (偏好/准则/红线/环境常量) 命中即留;
+    弱 keep (必须/要求等通用指令词) 可被技术 sink 信号覆盖。
+    判定顺序: 用户偏好前缀 → 强 keep 信号 → sink 组合 → 弱 keep → 默认。
+
+    修复热层超载: 原版 keep_markers 含"必须/唯一/要求"等通用词,
+    技术/环境记录 (GPU 方案/VS Code 栈/服务器内存等) 常含这些词被误留热层。
+    新版分强/弱 keep 两级:
+    - 强 keep (行为准则/红线/偏好/决策词): 命中即留, 无可覆盖
+    - 弱 keep (通用指令词): 被强 sink 组合覆盖
+    - 强 sink ≥2, 或 1 强 sink + 2 弱 sink, 或 ≥3 弱 sink → 下沉
     """
-    # 准则/偏好/纠正/常量关键词 (比 HOT_KEYWORDS 更聚焦)
-    keep_markers = [
-        "偏好", "准则", "原则", "禁止", "必须", "习惯", "要求",
-        "纠正", "拍板", "明确要求", "零容忍", "不允许",
-        "行为准则", "交互习惯", "写作风格", "回答风格", "环境常量",
-        # 用户红线/强规范词 (2026-08-03 补漏)
-        "强制", "绝不", "不能", "红线", "硬约束", "唯一", "必须用",
-    ]
-    for kw in keep_markers:
-        if kw in content:
-            return True
-    # 用户偏好陈述启发式: "用户喜欢/偏好/希望/要求/不喜欢" 开头
+    # ---- 1. 用户偏好陈述启发式 (绝对留) ----
     user_pref_prefixes = [
         "用户喜欢", "用户偏好", "用户希望", "用户要求", "用户不喜欢",
         "用户习惯", "用户希望我", "用户要求我", "用户纠正", "用户明确",
-        "用户对",  # 2026-08-03 补漏: "用户对自托管项目兴趣..."
+        "用户对",
     ]
     for p in user_pref_prefixes:
         if content.startswith(p) or p in content[:25]:
             return True
-    # 用户偏好/兴趣陈述启发式: 内容首 30 字含 "用户对...兴趣" 组合
+
     head30 = content[:30]
     if "用户对" in head30 and ("兴趣" in head30 or "偏好" in head30):
         return True
-    return False
+
+    # ---- 3a. sink 词表定义 (步骤 2 的技术语境判定需要) ----
+    # 强 sink: 明确的技术/环境/项目信号 (组合 ≥2 才沉, 防单个词误伤)
+    # 已泛化: 移除生产版用户特化词 (具体硬件参数/脚本名/commit hash/个人服务),
+    # 保留通用技术词
+    sink_strong = [
+        # 硬件/环境
+        "GPU", "VS Code", "VSIX", "vscode", "SSD", "smartmontools",
+        "LPDDR3", "BGA", "压测", "内核", "defconfig", "zram",
+        "swap", "systemd", "sudoers",
+        # 服务/推理
+        "Ollama", "bge-m3", "llama-rerank", "sqlite3", "WAL", "rsync",
+        # 端口/硬件资源
+        "端口", "显存", "RSS",
+        # 召回/向量/测试技术语境
+        "SQLite", "持久化语义缓存", "语义缓存", "normalized query",
+        "embedding", "向量", "召回", "rerank", "top-1", "单测", "e2e",
+        "dense_score", "sentence_level", "importance",
+        # MemoryCore 内部
+        "overflow.py", "classifier", "maintenance", "QueryCache",
+        "maintenance.py", "mem0", "Mem0",
+    ]
+    # 弱 sink: 单独命中不沉, 参与计数 (已泛化: MemoryCore→memorycore, Mnemosyne→cold tier,
+    # 移除个人服务/用户特定路径等生产特化词)
+    sink_weak = [
+        "memorycore", "cold tier", "冷层", "热层", "锚点", "溢流",
+        "服务器", "开源", "commit", "落地", "已完成", "已退役", "已停用",
+        "SMB", "Tailscale", "ssh", "维护", "pip", "README",
+        "cron 任务", "site-packages",
+    ]
+
+    # ---- 2. 强 keep 信号: 行为准则/红线/偏好/决策 (命中即留) ----
+    # 特判 a: "偏好"若紧跟技术语境词 (偏好查询/偏好召回/偏好摘要/偏好锚点)
+    #   → 不是用户偏好, 不视为强 keep
+    # 特判 b: "绝不"若条目命中 ≥2 个强 sink (技术语境主导)
+    #   → 可能只是被引用, 不视为强 keep
+    strong_keep_markers = [
+        "偏好", "准则", "红线", "零容忍", "绝不", "禁止", "原则",
+        "习惯", "纠正", "行为准则", "交互习惯", "写作风格", "回答风格",
+        "明确要求", "强制", "规范", "PM准则", "拍板", "决策",
+        "环境常量",  # 开源版通用定位: 服务器环境常量需留本地
+    ]
+    _pref_tech_context = ("偏好查询" in content or "偏好召回" in content
+                          or "偏好摘要" in content or "偏好锚点" in content)
+    _s_strong_hits_for_keep = [kw for kw in sink_strong if kw in content]
+    _tech_dominant = len(_s_strong_hits_for_keep) >= 2
+    for kw in strong_keep_markers:
+        if kw in content:
+            if kw == "偏好" and _pref_tech_context:
+                continue
+            if kw == "绝不" and _tech_dominant:
+                continue
+            return True
+
+    # ---- 3. sink 组合判定 ----
+    s_strong_hits = [kw for kw in sink_strong if kw in content]
+    s_weak_hits = [kw for kw in sink_weak if kw in content]
+    if (len(s_strong_hits) >= 2
+            or (len(s_strong_hits) >= 1 and len(s_weak_hits) >= 2)
+            or len(s_weak_hits) >= 3):
+        return False
+
+    # ---- 4. 弱 keep 信号: 通用指令词 (无 sink 覆盖时留) ----
+    weak_keep_markers = ["必须", "要求", "不能", "唯一", "不允许", "必须用"]
+    for kw in weak_keep_markers:
+        if kw in content:
+            return True
+
+    # ---- 5. 默认: 有 sink 信号 → 沉, 否则留 ----
+    if s_strong_hits or s_weak_hits:
+        return False
+    return True
 
 
 def classify_user_pref(content: str, importance: float = 0.5,
@@ -124,7 +189,7 @@ def classify_user_pref(content: str, importance: float = 0.5,
     # 交互准则词
     interact_words = ["大白话", "分层类比", "先确认", "汇报", "沟通",
                       "验证", "准确", "严谨", "覆盖"]
-    # 身份信任词
+    # 通用信任信号词 (已泛化: 移除生产版用户私密词)
     trust_words = ["信任", "尊重"]
 
     all_core = cmd_words + sent_words + interact_words + trust_words

@@ -208,6 +208,13 @@ def run_overflow(store, client, target: str) -> dict:
         decision = classify(entry, importance=0.6)
         d = decision["decision"]
 
+        # 2026-08-09 修复: should_keep_local 已精确判定为下沉候选的条目,
+        # 不再让 classify 的宽泛 HOT_KEYWORDS ("必须/要求"等) 拦回热层 —
+        # 否则技术记录 (GPU 方案等含"必须独占") 会永远 kept。
+        # 此时 classify 仅用于区分 STALE (过时) vs COLD (下沉)。
+        if d == HOT:
+            d = COLD
+
         if d == STALE:
             _handle_stale(store, client, target, entry, stat)
         elif d == COLD:
@@ -660,12 +667,14 @@ def _llm_compress(client, entry: str) -> Optional[str]:
         "要求:\n"
         "1. 只保留核心结论和必须长期记住的关键点: 日期/时间、数字、"
         "路径、端口、专有名词、命令名、人名\n"
-        "2. 次要细节可以省略: 背景解释、过程描述、中间步骤、"
-        "过时的注记、参考文档路径\n"
-        "3. 目标长度: 原条目的 40%-55% (必须明显变短)\n"
-        "4. 不添加任何新事实, 不推断, 不修改事实, 不改变语义\n"
-        "5. 保持中文, 一句话或多句皆可, 但必须自包含可读\n"
-        '6. 只输出 JSON: {"compressed": "压缩后的单条文本"}'
+        "2. 主要删除对象: 背景解释、过程描述、中间步骤、过时的注记、"
+        "参考文档路径、括号解释、例子细节、教训的具体经过、重复表述\n"
+        "3. 若条目是行为准则/教训: 删掉举例和事故经过, 只留规则本体\n"
+        "4. 目标长度: 压缩到 60-110 字 (原条目约 " + str(len(entry)) + " 字, 必须删掉 60% 以上)\n"
+        "5. 压缩是删除修饰语, 不是改写事实: 所有专有名词、数字、日期、"
+        "命令必须原样保留, 不添加任何新事实, 不推断, 不改变语义\n"
+        "6. 保持中文, 必须自包含可读\n"
+        '7. 只输出 JSON: {"compressed": "压缩后的单条文本"}'
     )
 
     try:

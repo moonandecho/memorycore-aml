@@ -33,6 +33,23 @@ class LocalBackend:
 
     These feed MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL
     which the mnemosyne library reads natively."""
+
+    def __init__(self):
+        from mnemosyne import Mnemosyne  # noqa: E402
+        try:
+            self._engine = Mnemosyne(session_id="memorycore")
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to initialize local cold-store backend.\n"
+                "MemoryCore now requires ollama with a qwen3 embedding model.\n"
+                "Install:  curl -fsSL https://ollama.com/install.sh | sh\n"
+                "Pull:     ollama pull qwen3-embedding:0.6b\n"
+                "Start:    ollama serve\n"
+                "Or set MEMORYCORE_EMBED_URL / MEMORYCORE_EMBED_MODEL for a compatible API.\n"
+                f"Embedding URL: {os.environ.get('MNEMOSYNE_EMBEDDING_API_URL', 'not set')}\n"
+                f"Original error: {e}"
+            )
+
     # -- remember -------------------------------------------------------
 
     def remember(self, content: str, importance: float = 0.8,

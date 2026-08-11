@@ -56,7 +56,33 @@ class LocalBackend:
         # would return "stored" while generating no actual vector, corrupting
         # the cold tier silently.
         try:
-            probe_vec = self._engine.embed("MemoryCore embedding probe")
+            from mnemosyne.core import embeddings as _emb  # noqa: E402
+        except ImportError:
+            raise RuntimeError(
+                "mnemosyne embedding module not available — MemoryCore cannot "
+                "store or recall memories without vector embeddings.\n"
+                "Make sure mnemosyne-memory is installed:\n"
+                "  pip install mnemosyne-memory"
+            )
+
+        if not _emb.available():
+            embed_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "not set")
+            embed_model = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "not set")
+            raise RuntimeError(
+                "No embedding backend available — MemoryCore cannot store or "
+                "recall memories without vector embeddings.\n"
+                f"  API URL:   {embed_url}\n"
+                f"  Model:     {embed_model}\n\n"
+                "Make sure ollama is running and the model is pulled:\n"
+                "  ollama serve\n"
+                "  ollama pull qwen3-embedding:0.6b\n\n"
+                "Or configure a compatible embedding API:\n"
+                "  export MEMORYCORE_EMBED_URL=https://your-api/v1\n"
+                "  export MEMORYCORE_EMBED_MODEL=your-model"
+            )
+
+        try:
+            probe_vec = _emb.embed_query("MemoryCore embedding probe")
         except Exception as e:
             embed_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "not set")
             embed_model = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "not set")
@@ -74,20 +100,21 @@ class LocalBackend:
                 f"Original error: {e}"
             ) from e
 
-        # Double-check: a reachable API that returns zero vectors (e.g. wrong
-        # model name) is also a misconfiguration — catch it early.
-        if probe_vec is None or (
-            hasattr(probe_vec, '__len__') and len(probe_vec) == 0
-        ):
+        # Double-check: a reachable API that returns zero/empty vectors
+        # (e.g. wrong model name) is also a misconfiguration.
+        if probe_vec is None or (hasattr(probe_vec, '__len__') and len(probe_vec) == 0):
+            embed_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "not set")
             embed_model = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "not set")
             raise RuntimeError(
                 "Embedding API returned an empty vector for the probe.\n"
-                f"  Model: {embed_model}\n"
+                f"  API URL:   {embed_url}\n"
+                f"  Model:     {embed_model}\n"
                 "The model may not be pulled in ollama, or the API returned "
                 "a zero vector.\n"
                 "Check:  ollama list | grep qwen3-embedding\n"
                 "Pull:   ollama pull qwen3-embedding:0.6b"
             )
+
 
 
     # -- remember -------------------------------------------------------

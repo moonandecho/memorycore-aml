@@ -15,8 +15,10 @@ Usage:
 """
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def green(s):
@@ -179,49 +181,93 @@ def main():
     if _orig_embed_model:
         os.environ["MEMORYCORE_EMBED_MODEL"] = _orig_embed_model
 
-    # -- Test 4: Normal path (requires ollama) ----------------------
+    # ── Test 4: Normal path (requires ollama) ──────────────────────
+    MNEMOSYNE_VENV = "/opt/mcp-servers/mnemosyne-venv"
+    VENV_PYTHON = os.path.join(MNEMOSYNE_VENV, "bin", "python")
+
     if offline:
-        print(bold("\n[4] Normal path -- SKIPPED (--offline mode)"))
+        print(bold("\n[4] Normal path — SKIPPED (--offline mode)"))
+    elif not os.path.isfile(VENV_PYTHON):
+        print(bold(f"\n[4] Normal path — SKIPPED (venv not found at {MNEMOSYNE_VENV})"))
     else:
-        print(bold("\n[4] Normal path: remember -> recall"))
+        print(bold("\n[4] Normal path: remember → recall (requires ollama + qwen3)"))
+        test_dir = tempfile.mkdtemp(prefix="mc_smoke_")
         try:
-            from memorycore.cold_store_client import LocalBackend
-            lb = LocalBackend()
-            check("LocalBackend init with ollama running", True)
+            env = os.environ.copy()
+            env["PYTHONPATH"] = repo_root
+            env["MNEMOSYNE_DATA_DIR"] = test_dir
+            env["MNEMOSYNE_EMBEDDING_API_URL"] = "http://localhost:11434/v1"
+            env["MNEMOSYNE_EMBEDDING_MODEL"] = "qwen3-embedding:0.6b"
+            env["MNEMOSYNE_EMBEDDING_DIM"] = "1024"
+            # Don't inherit MEMORYCORE_EMBED_URL override from test env
+            env.pop("MEMORYCORE_EMBED_URL", None)
+            env.pop("MEMORYCORE_EMBED_MODEL", None)
 
-            # Remember a test fact
-            result = lb.remember("MemoryCore smoke test: the sky is blue",
-                                 importance=0.9)
-            check("remember returns status=stored",
-                  result.get("status") == "stored",
-                  str(result))
-            mem_id = result.get("memory_id", "")
-            check("remember returns a memory_id", bool(mem_id), mem_id)
+            script = """
+import sys
+sys.path.insert(0, "{repo_root}")
+from memorycore.cold_store_client import LocalBackend
 
-            # Recall it
-            recalled = lb.recall("sky color", top_k=5)
-            check("recall returns status=ok",
-                  recalled.get("status") == "ok",
-                  str(recalled)[:200])
-            results = recalled.get("results", [])
-            check("recall returns at least 1 result", len(results) >= 1,
-                  f"got {len(results)} results")
-            if results:
-                top_dense = results[0].get("dense_score", 0)
-                check("top result has non-zero dense_score",
-                      top_dense > 0.0,
-                      f"dense_score={top_dense}")
+lb = LocalBackend()
+print("INIT_OK")
 
-            # Clean up the test entry
-            if mem_id:
-                lb.forget(mem_id)
+result = lb.remember("MemoryCore smoke test: the sky is blue", importance=0.9)
+print("REMEMBER", result.get("status"), result.get("memory_id", ""))
 
-            print(f"\n  (test entry {mem_id} cleaned up)")
-        except RuntimeError as e:
-            print(f"  {red('SKIP')}  ollama not running -- {e}")
-            print("  Start ollama and pull qwen3-embedding:0.6b to run this test.")
+mem_id = result.get("memory_id", "")
+recalled = lb.recall("sky color", top_k=5)
+results = recalled.get("results", [])
+print("RECALL_COUNT", len(results))
+if results:
+    print("DENSE_SCORE", results[0].get("dense_score", 0))
+
+if mem_id:
+    lb.forget(mem_id)
+    print("FORGET_OK")
+""".format(repo_root=repo_root)
+
+            proc = subprocess.run(
+                [VENV_PYTHON, "-c", script],
+                capture_output=True, text=True, timeout=30,
+                env=env,
+            )
+            output = proc.stderr + proc.stdout
+
+            init_ok = "INIT_OK" in output
+            check("LocalBackend init with ollama running", init_ok, output[:200])
+
+            if init_ok:
+                stored = "REMEMBER stored" in output
+                check("remember returns status=stored", stored, output)
+
+                if "RECALL_COUNT" in output:
+                    for line in output.splitlines():
+                        if line.startswith("RECALL_COUNT"):
+                            count = int(line.split()[-1])
+                            check("recall returns at least 1 result", count >= 1,
+                                  f"got {count}")
+                        if line.startswith("DENSE_SCORE"):
+                            score = float(line.split()[-1])
+                            check("top result has non-zero dense_score",
+                                  score > 0.0, f"dense_score={score}")
+                else:
+                    check("recall returned results", False, output[:300])
+
+                forget_ok = "FORGET_OK" in output
+                check("forget cleans up test entry", forget_ok, output[:200])
+            else:
+                # Init failed — likely ollama not running or model not pulled
+                if "ollama" in output.lower() or "embedding" in output.lower():
+                    print(f"  {green('INFO')}  ollama may not be running or model not pulled")
+                else:
+                    print(f"  Output: {output[:300]}")
+
+        except subprocess.TimeoutExpired:
+            check("Normal path completes within 30s", False, "timeout")
         except Exception as e:
             check("Normal path completes without unexpected error", False, str(e))
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
 
     # -- Summary ----------------------------------------------------
     print(bold(f"\n{'='*50}"))

@@ -57,54 +57,65 @@ Agent 积累记忆的速度很快——偏好、事实、决策——而不维�
 
 可选 (仅 Hermes Agent): hermes-plugin/memorycore-prefetch
   ┌───────────────────────────────────────────────────────────────────────┐
-  │ MemoryProvider 插件 (双通道召回, EXPERIMENTAL, 默认关闭)                │
+  │ MemoryProvider 插件 (单模型 qwen3, 默认开启)                           │
   │   system_prompt_block → 静态索引 (常驻激活)                            │
-  │   prefetch → ColdStoreClient.recall_results(top_k=10)                 │
-  │            → 可选 reranker (MEMORYCORE_RERANK_URL)                    │
-  │            → 会话 + 热层去重 → 注入 top-3                             │
-  │   开启: MEMORYCORE_PREFETCH_ENABLED=1                                │
+  │   prefetch → ColdStoreClient.recall_results(top_k=20)                 │
+  │            → dense 排序 → 会话 + 热层去重 → top-5 注入                │
+  │   关闭: MEMORYCORE_PREFETCH_ENABLED=0                                 │
   └───────────────────────────────────────────────────────────────────────┘
 ```
 
-## 快速开始(单机 —— 零外部服务)
+## 快速开始
+
+### 前置依赖
+
+- **ollama** — embedding API (安装: https://ollama.com)
+- **qwen3-embedding:0.6b** — 推荐 embedding 模型 (1024 维)
+
+```bash
+# 安装 ollama (macOS/Linux)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# 拉取 embedding 模型
+ollama pull qwen3-embedding:0.6b
+```
+
+### 安装与运行
 
 ```bash
 pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
 
-# 就这样! MemoryCore 完全本地运行:
+# 就这样! MemoryCore 使用 ollama 提供 embedding:
 #   - 热层:  MEMORY.md / USER.md (默认 ~/.hermes/memories)
 #   - 冷层:  SQLite (通过 mnemosyne-memory, 默认 ~/.memorycore/data/)
-#   - Embedding: BAAI/bge-small-zh-v1.5 (中文) 随包内置 —— 无需下载
+#   - Embedding: qwen3-embedding:0.6b (通过 ollama, http://localhost:11434/v1)
 python -m memorycore.server          # stdio 传输 (默认)
 ```
-
-**两个 embedding 模型已内置在包内**(中文 + 英文)。
-首次运行时 MemoryCore 自动将它们从包内部署到 `~/.memorycore/fastembed/`(一次性复制,共约 155 MB)。无需网络、无需 huggingface.co、无需 GCS 镜像 —— 永远零下载。
 
 **数据目录布局**(全部位于 `~/.memorycore/` 下):
 
 ```
 ~/.memorycore/
 ├── data/          # SQLite 数据库 (MNEMOSYNE_DATA_DIR)
-└── fastembed/     # ONNX embedding 模型 (首次使用自动部署)
+└── ...
 ```
 
-可用 `MNEMOSYNE_DATA_DIR` 或 `MNEMOSYNE_FASTEMBED_CACHE_DIR` 覆盖。
+可用 `MNEMOSYNE_DATA_DIR` 覆盖。
 
-### 语言切换
+### 模型切换
 
-默认为中文(`BAAI/bge-small-zh-v1.5`,512 维)。切换英文(384 维)只需一个环境变量——模型已在磁盘上:
+默认 embedding 模型为 `qwen3-embedding:0.6b`(1024 维)。可通过环境变量使用任意 ollama 模型:
 
 ```bash
-export MNEMOSYNE_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"
-python -m memorycore.server
+export MEMORYCORE_EMBED_URL="http://localhost:11434/v1"
+export MEMORYCORE_EMBED_MODEL="nomic-embed-text"   # 或你偏好的模型
 ```
 
-其他语言或更强的多语言召回,可指向任何 OpenAI 兼容的 embedding API:
+也可指向任何 OpenAI 兼容的 embedding API:
 
 ```bash
-export MNEMOSYNE_EMBEDDING_API_URL="http://localhost:11434/v1"
-export MNEMOSYNE_EMBEDDING_MODEL="bge-m3"
+export MEMORYCORE_EMBED_URL="https://api.openai.com/v1"
+export MEMORYCORE_EMBED_MODEL="text-embedding-3-small"
 ```
 
 在 MCP 客户端注册(以 Hermes Agent `config.yaml` 为例):
@@ -136,28 +147,28 @@ python -m memorycore.server
 | `memorycore_run_cold_storage_maintenance()` | 冷层治理流程 |
 | `memorycore_get_memory_usage()` | 热层用量 + 冷层统计 + 阈值 |
 
-## Hermes 集成 —— 每轮主动召回 prefetch(EXPERIMENTAL)
-
-> ⚠️ **实验性 —— 默认关闭。** 每轮主动召回(prefetch)是实验性功能,仅供试验与小规模使用。**主检索路径是按需召回**——Agent 通过 `memorycore_recall` 工具带意图查询,完全避免噪声问题。每轮 prefetch 默认禁用,只有显式设置 `MEMORYCORE_PREFETCH_ENABLED=1` 才开启。
+## Hermes 集成 —— 每轮主动召回 prefetch
 
 MCP server 与客户端无关。对于 **Hermes Agent**,有一个可选伴侣插件提供双通道冷层访问:
 
 ### 双通道设计
 
-- **静态索引通道(常驻,零开销)** —— 系统提示块列出可用主题(通过 `MEMORYCORE_INDEX_TOPICS` 配置,逗号分隔),并引导 Agent 使用 `memorycore_recall(query)` 按需召回。**默认即此形态**,每轮零开销、无噪声问题。
-- **主动召回通道(实验性,opt-in)** —— 每轮对话自动召回冷层,过滤后注入上下文,让 Agent 开口前就"想起"相关内容。
+- **静态索引通道(常驻,零开销)** —— 系统提示块列出可用主题(通过 `MEMORYCORE_INDEX_TOPICS` 配置,逗号分隔),并引导 Agent 使用 `memorycore_recall(query)` 按需召回。
+- **每轮主动召回通道(默认开启)** —— 每轮对话自动召回冷层,按 dense 分数排序,注入 top-5 到上下文,让 Agent 开口前就"想起"相关内容。设置 `MEMORYCORE_PREFETCH_ENABLED=0` 可关闭,仅保留按需召回。
 
-### Prefetch 管道(开启后)
+### Prefetch 管道
 
 ```
-query → 预处理 → 冷层召回(10 候选)
-  → reranker 精排(若配置了 MEMORYCORE_RERANK_URL)
-     或 dense 分数 top-1 降级(无 reranker 时)
-  → 会话去重 → 热层去重 → 注入 top-3
+query → 预处理 → 冷层召回(20 候选)
+  → dense 排序 (qwen3) → top-5
+  → 会话去重 → 热层去重 → 注入上下文
 ```
 
-- **Reranker(可选)**:`MEMORYCORE_RERANK_URL` 指向一个 cross-encoder 端点(完整 URL,如 `http://your-reranker-host:8899/rerank`)。插件发送 `{"query": q, "documents": docs}` POST,按绝对阈值(-2.0)过滤,再按 rerank 分数注入 top-3。
-- **降级路径(默认)**:未配置 reranker 时,只注入最佳 dense 分数匹配的单条结果,且必须通过动态阈值 `max(0.45, baseline × 0.90)`。保守优先——宁可沉默,不可噪声。
+MemoryCore 采用**单模型 qwen3 架构(无 reranker)**。qwen3 的 dense 分数用于批次内相对排序;没有绝对阈值——dense 分数最高的 5 条候选在去重后始终注入。
+
+### 优雅降级
+
+当 ollama 不可达(未安装、未运行或模型未拉取)时,prefetch 静默返回空字符串——对话继续,没有注入的记忆,用户不会看到任何错误。DEBUG 级别日志会记录探测失败。
 
 ### 部署方案(Hermes Agent)
 
@@ -173,39 +184,27 @@ cp -r hermes-plugin/memorycore-prefetch ~/.hermes/plugins/
 hermes config set memory.provider memorycore-prefetch
 ```
 
-部署后三种形态,按需选择:
+部署后三种形态:
 
 | 形态 | 配置 | 行为 |
 |---|---|---|
-| 默认(推荐) | 无需额外配置 | 只启用静态索引,按需召回——零开销、无噪声 |
-| 实验性:主动召回(无 reranker) | `MEMORYCORE_PREFETCH_ENABLED=1` | 每轮召回冷层,只注入通过动态阈值的 top-1 |
-| 实验性:主动召回 + reranker | `MEMORYCORE_PREFETCH_ENABLED=1` + `MEMORYCORE_RERANK_URL` | 完整管道:候选 → cross-encoder 精排 → 注入 top-3 |
+| 默认(推荐) | 无需额外配置 | 静态索引 + 每轮 prefetch,注入 top-5 |
+| 仅按需召回 | `MEMORYCORE_PREFETCH_ENABLED=0` | 只启用静态索引,Agent 通过 `memorycore_recall` 按需查询 |
+| 自定义 embedding | `MEMORYCORE_EMBED_URL` + `MEMORYCORE_EMBED_MODEL` | 指向不同 ollama 实例或 OpenAI 兼容 API |
 
-### 动态基线阈值
-
-```
-threshold = max(0.45, rolling_baseline × 0.90)
-```
-
-- **固定系数 0.90** —— 无水位分档。
-- **基线自演化**:每次召回记录 batch-max `dense_score` 进 200 样本滚动窗口,每 50 样本重算中位数,原子持久化到 `baseline.json`(插件同目录)。删除该文件可重置为初值 `0.70`。
-- **绝对底线 0.45** 只作下限护栏;千条以上规模它不再是噪声屏障——配置 reranker 时由 reranker 负责噪声分离,降级路径自动收紧为 top-1。
-
-阈值背后的测量数据与 reranker 两阶段流水线的设计依据,见 [docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md)。
-
-### 插件配置表
+### 插件配置
 
 | 环境变量 | 默认值 | 含义 |
 |---|---|---|
-| `MEMORYCORE_PREFETCH_ENABLED` | *(未设置)* | 设为 `1` 开启每轮主动召回(实验性) |
-| `MEMORYCORE_RERANK_URL` | *(未设置)* | 完整 cross-encoder 端点 URL(如 `http://your-reranker-host:8899/rerank`);未设置时降级为 dense top-1 |
+| `MEMORYCORE_PREFETCH_ENABLED` | *(未设置)* | 设为 `0` 关闭每轮主动召回 |
+| `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | Ollama 或 OpenAI 兼容 embedding API 基地址 |
+| `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding 模型名称(推荐 1024 维) |
 | `MEMORYCORE_INDEX_TOPICS` | *(未设置)* | 系统提示索引块的主题列表(逗号分隔) |
 
 要求与注意:
 
 - **Hermes 专用**:插件导入 Hermes 运行时模块(`agent.memory_provider`),不能作为独立包运行——它是 MemoryCore 的 Hermes 集成侧。完整说明见 [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md)。
 - 每次召回保持 5s 超时;失败静默降级为空注入,绝不阻塞对话。
-- reranker 调用 3s 超时;超时或失败与未配置 URL 走同一降级路径。
 
 ## 规模化测试与优化结果
 
@@ -263,9 +262,8 @@ MemoryCore 在万条级冷层规模下做了完整压力测试与召回优化(�
 | `MEMORYCORE_COLD_BACKEND` | `local` | 冷层后端:`local`(进程内)或 `remote`(MCP) |
 | `MNEMOSYNE_URL` | *(空)* | 冷层 MCP 端点(`remote` 模式必需) |
 | `MNEMOSYNE_DATA_DIR` | `~/.memorycore/data` | 本地 SQLite 数据目录 |
-| `MNEMOSYNE_FASTEMBED_CACHE_DIR` | `~/.memorycore/fastembed` | 本地 ONNX embedding 模型缓存 |
-| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-zh-v1.5` | 本地 embedding 模型(512 维,中文,MIT) |
-| `MNEMOSYNE_EMBEDDING_API_URL` | *(空)* | 外部 embedding API(未设置 = 内置模型,零网络) |
+| `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | Ollama 或 OpenAI 兼容 embedding API 基地址 |
+| `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding 模型名称(1024 维) |
 | `MEMORY_DIR` | `~/.hermes/memories` | 热层目录(`MEMORY.md` / `USER.md`) |
 | `MNEMOSYNE_TIMEOUT` | `10.0` | 冷层请求超时(远程模式,秒) |
 
@@ -287,9 +285,6 @@ MemoryCore 在万条级冷层规模下做了完整压力测试与召回优化(�
 ### 第三方许可
 
 - [mnemosyne-memory](https://github.com/mnemosyne-oss/mnemosyne) — MIT,by AxDSan。`LocalBackend` 使用的进程内记忆引擎。
-- [fastembed](https://github.com/qdrant/fastembed) — Apache-2.0,by Qdrant。加载内置模型的 ONNX embedding 运行时。
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — MIT。
-- [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5) — MIT,by Beijing Academy of Artificial Intelligence。默认中文 embedding 模型。
-- [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) — MIT,by Beijing Academy of Artificial Intelligence。内置英文 embedding 模型。
-
-内置 ONNX 模型文件自带各自许可声明;见 [memorycore/assets/fastembed-cache/THIRD_PARTY_MODELS.md](memorycore/assets/fastembed-cache/THIRD_PARTY_MODELS.md)。
+- [ollama](https://ollama.com) — MIT。本地 embedding API 服务。
+- [qwen3-embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) — Apache-2.0,by Alibaba Cloud。默认 embedding 模型(非内置,通过 ollama 拉取)。

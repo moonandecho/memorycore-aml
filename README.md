@@ -55,58 +55,66 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 
 Optional (Hermes Agent only): hermes-plugin/memorycore-prefetch
   ┌───────────────────────────────────────────────────────────────────────┐
-  │ MemoryProvider plugin (dual-channel recall, EXPERIMENTAL, off by default) │
+  │ MemoryProvider plugin (single-model qwen3, enabled by default)        │
   │   system_prompt_block → static index (always active)                  │
-  │   prefetch → ColdStoreClient.recall_results(top_k=10)                 │
-  │            → optional reranker (MEMORYCORE_RERANK_URL)                │
-  │            → session + hot-tier dedup → top-3 injection               │
-  │   Enable: MEMORYCORE_PREFETCH_ENABLED=1                               │
+  │   prefetch → ColdStoreClient.recall_results(top_k=20)                 │
+  │            → dense ranking → session + hot-tier dedup → top-5         │
+  │   Disable: MEMORYCORE_PREFETCH_ENABLED=0                              │
   └───────────────────────────────────────────────────────────────────────┘
 ```
 
-## Quick Start (single machine — zero external services)
+## Quick Start
+
+### Prerequisites
+
+- **ollama** — embedding API (install: https://ollama.com)
+- **qwen3-embedding:0.6b** — recommended embedding model (1024-dim)
+
+```bash
+# Install ollama (macOS/Linux)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull the embedding model
+ollama pull qwen3-embedding:0.6b
+```
+
+### Install & run
 
 ```bash
 pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
 
-# That's it! MemoryCore runs entirely locally:
+# That's it! MemoryCore runs with ollama for embeddings:
 #   - Hot tier:  MEMORY.md / USER.md (default ~/.hermes/memories)
 #   - Cold tier: SQLite via mnemosyne-memory (default ~/.memorycore/data/)
-#   - Embedding: BAAI/bge-small-zh-v1.5 (Chinese) bundled — no download
+#   - Embedding: qwen3-embedding:0.6b via ollama (http://localhost:11434/v1)
 python -m memorycore.server          # stdio transport (default)
 ```
-
-Two embedding models are **shipped inside the package** (Chinese + English).
-On first run MemoryCore auto-deploys them from the package into
-`~/.memorycore/fastembed/` (one-time copy, ~155 MB total).  No network access,
-no huggingface.co, no GCS mirror — zero download, ever.
 
 **Data directory layout** (all under `~/.memorycore/`):
 
 ```
 ~/.memorycore/
 ├── data/          # SQLite database (MNEMOSYNE_DATA_DIR)
-└── fastembed/     # ONNX embedding models (auto-deployed on first use)
+└── ...
 ```
 
-Override with `MNEMOSYNE_DATA_DIR` or `MNEMOSYNE_FASTEMBED_CACHE_DIR`.
+Override with `MNEMOSYNE_DATA_DIR`.
 
-### Language switching
+### Model switching
 
-Default is Chinese (`BAAI/bge-small-zh-v1.5`, 512-dim).  Switch to
-English (384-dim) with an env var — the model is already on disk:
+Default embedding model is `qwen3-embedding:0.6b` (1024-dim). Use any
+ollama model by setting environment variables:
 
 ```bash
-export MNEMOSYNE_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"
-python -m memorycore.server
+export MEMORYCORE_EMBED_URL="http://localhost:11434/v1"
+export MEMORYCORE_EMBED_MODEL="nomic-embed-text"   # or your preferred model
 ```
 
-For other languages or stronger multilingual recall, point at any
-OpenAI-compatible embedding API:
+Or point at any OpenAI-compatible embedding API:
 
 ```bash
-export MNEMOSYNE_EMBEDDING_API_URL="http://localhost:11434/v1"
-export MNEMOSYNE_EMBEDDING_MODEL="bge-m3"
+export MEMORYCORE_EMBED_URL="https://api.openai.com/v1"
+export MEMORYCORE_EMBED_MODEL="text-embedding-3-small"
 ```
 
 Register it in your MCP client (example for Hermes Agent `config.yaml`):
@@ -139,14 +147,7 @@ Exposed tools:
 | `memorycore_run_cold_storage_maintenance()` | Cold-tier governance pass |
 | `memorycore_get_memory_usage()` | Hot-tier usage + cold-tier stats + thresholds |
 
-## Hermes integration — per-turn prefetch (EXPERIMENTAL)
-
-> ⚠️ **Experimental — off by default.** Per-turn prefetch is provided for
-> experimentation and small-scale use. **The primary retrieval path is
-> on-demand recall** — the agent queries the cold tier via the
-> `memorycore_recall` tool with intent, which avoids the noise problem
-> entirely. Per-turn prefetch is **disabled by default**; it only activates
-> when `MEMORYCORE_PREFETCH_ENABLED=1` is explicitly set.
+## Hermes integration — per-turn prefetch
 
 The MCP server is client-agnostic. For **Hermes Agent** there is an
 optional companion plugin that provides dual-channel cold-tier access:
@@ -156,29 +157,32 @@ optional companion plugin that provides dual-channel cold-tier access:
 - **Static index channel (always active, zero overhead)** — a system
   prompt block listing available topics (configurable via
   `MEMORYCORE_INDEX_TOPICS`, comma-separated), with guidance to use
-  `memorycore_recall(query)` for on-demand recall. **This is the default
-  posture** — zero per-turn overhead, no noise problem.
-- **Per-turn prefetch channel (experimental, opt-in)** — recalls the cold
-  tier every turn, filters, and injects into context, so the agent
-  "remembers" relevant content before it speaks.
+  `memorycore_recall(query)` for on-demand recall.
+- **Per-turn prefetch channel (enabled by default)** — recalls the cold
+  tier every turn, ranks by dense score, and injects the top-5 into
+  context, so the agent "remembers" relevant content before it speaks.
+  Set `MEMORYCORE_PREFETCH_ENABLED=0` to disable and use on-demand recall
+  only.
 
-### Prefetch pipeline (when enabled)
+### Prefetch pipeline
 
 ```
-query → preprocess → cold-tier recall (10 candidates)
-  → reranker refinement (if MEMORYCORE_RERANK_URL configured)
-     or dense-score top-1 fallback (if no reranker)
-  → session dedup → hot-tier dedup → inject top-3
+query → preprocess → cold-tier recall (20 candidates)
+  → dense ranking (qwen3) → top-5
+  → session dedup → hot-tier dedup → inject into context
 ```
 
-- **Reranker (optional)**: `MEMORYCORE_RERANK_URL` points to a
-  cross-encoder endpoint (full URL, e.g. `http://your-reranker-host:8899/rerank`).
-  The plugin sends a POST with `{"query": q, "documents": docs}`, filters
-  by an absolute threshold (-2.0), then injects the top-3 by rerank score.
-- **Fallback (default)**: when no reranker is configured, the plugin
-  injects only the single best dense-score match if it clears the dynamic
-  threshold `max(0.45, baseline × 0.90)`. Conservative by design —
-  silence over noise.
+MemoryCore uses a **single-model qwen3 architecture** (no reranker).
+Dense scores from qwen3 are used for relative ranking within a batch;
+there is no absolute threshold — the top-5 candidates by dense score
+are always injected after dedup.
+
+### Graceful degradation
+
+When ollama is unreachable (not installed, not running, or model not
+pulled), prefetch silently returns an empty string — the conversation
+proceeds without injected memories, and no error is surfaced to the
+user. A DEBUG-level log records the probe failure.
 
 ### Deployment (Hermes Agent)
 
@@ -194,39 +198,21 @@ cp -r hermes-plugin/memorycore-prefetch ~/.hermes/plugins/
 hermes config set memory.provider memorycore-prefetch
 ```
 
-Three postures after deployment, pick per need:
+Three postures after deployment:
 
 | Posture | Configuration | Behaviour |
 |---|---|---|
-| Default (recommended) | no extra config | static index only, on-demand recall — zero overhead, no noise |
-| Experimental: prefetch (no reranker) | `MEMORYCORE_PREFETCH_ENABLED=1` | per-turn recall, inject only the top-1 that clears the dynamic threshold |
-| Experimental: prefetch + reranker | `MEMORYCORE_PREFETCH_ENABLED=1` + `MEMORYCORE_RERANK_URL` | full pipeline: candidates → cross-encoder re-rank → inject top-3 |
-
-### Dynamic baseline threshold
-
-```
-threshold = max(0.45, rolling_baseline × 0.90)
-```
-
-- **Fixed coefficient 0.90** — no water-level bands.
-- **Baseline self-evolves**: every recall records the batch-max
-  `dense_score` into a 200-sample rolling window; the median is recomputed
-  every 50 samples and atomically persisted to `baseline.json` next to the
-  plugin. Delete that file to reset to the initial value (`0.70`).
-- **Absolute floor 0.45** acts as a lower guardrail; at scale (1000+
-  entries) it is not a noise barrier — with a reranker configured, the
-  reranker handles noise separation, and the fallback path tightens to top-1.
-
-For the measurement data and the rationale behind the threshold and the
-reranker two-stage pipeline, see
-[docs/ADAPTIVE_THRESHOLD.md](docs/ADAPTIVE_THRESHOLD.md).
+| Default (recommended) | no extra config | static index + per-turn prefetch with top-5 injection |
+| On-demand only | `MEMORYCORE_PREFETCH_ENABLED=0` | static index only, agent queries cold tier via `memorycore_recall` |
+| Custom embedding | `MEMORYCORE_EMBED_URL` + `MEMORYCORE_EMBED_MODEL` | point at a different ollama instance or OpenAI-compatible API |
 
 ### Plugin configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORYCORE_PREFETCH_ENABLED` | *(unset)* | Set to `1` to enable per-turn prefetch (EXPERIMENTAL) |
-| `MEMORYCORE_RERANK_URL` | *(unset)* | Full cross-encoder endpoint URL (e.g. `http://your-reranker-host:8899/rerank`). When unset, falls back to dense-score top-1 |
+| `MEMORYCORE_PREFETCH_ENABLED` | *(unset)* | Set to `0` to disable per-turn prefetch |
+| `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | Ollama or OpenAI-compatible embedding API base URL |
+| `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding model name (1024-dim recommended) |
 | `MEMORYCORE_INDEX_TOPICS` | *(unset)* | Comma-separated topics for the system prompt index block |
 
 Requirements & notes:
@@ -237,8 +223,6 @@ Requirements & notes:
   [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md).
 - Every recall keeps a 5s timeout; failures degrade silently to an empty
   injection and never block the conversation.
-- The reranker call uses a 3s timeout; timeouts or failures trigger the
-  same fallback as an unconfigured URL.
 
 ## Scale test & optimisation results
 
@@ -314,9 +298,8 @@ See [examples/cold-store-contract.md](examples/cold-store-contract.md) for the f
 | `MEMORYCORE_COLD_BACKEND` | `local` | Cold-tier backend: `local` (in-process) or `remote` (MCP) |
 | `MNEMOSYNE_URL` | *(empty)* | Cold-tier MCP endpoint (required for `remote` mode) |
 | `MNEMOSYNE_DATA_DIR` | `~/.memorycore/data` | Local SQLite data directory |
-| `MNEMOSYNE_FASTEMBED_CACHE_DIR` | `~/.memorycore/fastembed` | Local ONNX embedding model cache |
-| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-zh-v1.5` | Local embedding model (512-dim, Chinese, MIT) |
-| `MNEMOSYNE_EMBEDDING_API_URL` | *(empty)* | External embedding API (unset = bundled model, zero network) |
+| `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | Ollama or OpenAI-compatible embedding API base URL |
+| `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding model name (1024-dim) |
 | `MEMORY_DIR` | `~/.hermes/memories` | Hot-tier directory (`MEMORY.md` / `USER.md`) |
 | `MNEMOSYNE_TIMEOUT` | `10.0` | Cold-tier request timeout (remote mode, seconds) |
 
@@ -339,13 +322,7 @@ Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_TH
 
 - [mnemosyne-memory](https://github.com/mnemosyne-oss/mnemosyne) — MIT,
   by AxDSan. The in-process memory engine used by `LocalBackend`.
-- [fastembed](https://github.com/qdrant/fastembed) — Apache-2.0,
-  by Qdrant. ONNX embedding runtime that loads the bundled models.
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — MIT.
-- [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5) — MIT,
-  by Beijing Academy of Artificial Intelligence. Default Chinese embedding model.
-- [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) — MIT,
-  by Beijing Academy of Artificial Intelligence. Bundled English embedding model.
-
-The bundled ONNX model files carry their own license notice; see
-[memorycore/assets/fastembed-cache/THIRD_PARTY_MODELS.md](memorycore/assets/fastembed-cache/THIRD_PARTY_MODELS.md).
+- [ollama](https://ollama.com) — MIT. Local embedding API server.
+- [qwen3-embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) — Apache-2.0,
+  by Alibaba Cloud. Default embedding model (not bundled; pulled via ollama).

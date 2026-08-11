@@ -9,9 +9,7 @@ Selection: env MEMORYCORE_COLD_BACKEND, default "local".
 """
 import json
 import os
-import shutil
 import urllib.error
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .core.config import COLD_BACKEND, MNEMOSYNE_URL  # noqa: E402
@@ -26,97 +24,15 @@ TIMEOUT = 10.0
 class LocalBackend:
     """Cold-tier backend backed by the mnemosyne-memory in-process library.
 
-    Maps the ColdStoreClient 5-method interface (remember/recall/update/
-    forget/stats) to the mnemosyne.Mnemosyne API, normalising return
-    shapes to match the remote backend's dict contracts.
+    Requires ollama with a qwen3 embedding model (or any OpenAI-compatible
+    embedding API).  The embedding API is configured via environment
+    variables set by core/config.py:
 
-    Data lands in the directory specified by MNEMOSYNE_DATA_DIR
-    (default ~/.memorycore/data).  The embedding model is shipped inside
-    the package (memorycore/assets/fastembed-cache/) and auto-deployed
-    into the fastembed cache directory on first use — no network download.
-    """
+      MEMORYCORE_EMBED_URL   — default http://localhost:11434/v1
+      MEMORYCORE_EMBED_MODEL — default qwen3-embedding:0.6b (1024-dim)
 
-    def __init__(self):
-        self._ensure_model_cache()
-        from mnemosyne import Mnemosyne  # noqa: E402
-        self._engine = Mnemosyne(session_id="memorycore")
-
-    # -- model cache deployment ----------------------------------------
-
-    @staticmethod
-    def _ensure_model_cache() -> None:
-        """Ensure all bundled embedding models are present in the cache dir.
-
-        On first use each model is copied from the package's bundled assets
-        into the user's fastembed cache directory.  This is a one-time
-        operation per model; subsequent runs skip models already deployed.
-
-        The cache uses real files only — no symlinks, no blobs directory.
-        Compatible with macOS, Linux, and Windows (huggingface_hub's
-        local_files_only path only checks ``os.path.isfile()``).
-
-        Windows edge case: git on Windows may convert symlinks to tiny
-        text stubs.  If any deployed .onnx file is < 1 KB the model
-        directory is removed and redeployed from the bundled assets.
-
-        If MNEMOSYNE_EMBEDDING_API_URL is set the user has opted into an
-        external embedding API — skip cache deployment entirely.
-        """
-        if os.environ.get("MNEMOSYNE_EMBEDDING_API_URL"):
-            return  # user opted for external API, no local model needed
-
-        cache_dir = Path(os.environ.get(
-            "MNEMOSYNE_FASTEMBED_CACHE_DIR",
-            os.path.expanduser("~/.memorycore/fastembed"),
-        ))
-
-        asset_root = Path(__file__).resolve().parent / "assets" / "fastembed-cache"
-        if not asset_root.is_dir():
-            raise RuntimeError(
-                "Bundled embedding model assets not found at "
-                f"{asset_root}. "
-                "Reinstall the package or set "
-                "MNEMOSYNE_EMBEDDING_API_URL to use an external API."
-            )
-
-        # Discover all bundled model directories
-        asset_models = sorted(
-            p for p in asset_root.iterdir()
-            if p.is_dir() and p.name.startswith("models--")
-        )
-        if not asset_models:
-            raise RuntimeError(
-                f"No models--* directories found in {asset_root}"
-            )
-
-        for asset_model in asset_models:
-            cache_model = cache_dir / asset_model.name
-            if cache_model.is_dir():
-                # Validate: any .onnx file that exists but is a tiny
-                # text stub (< 1 KB) means the cache is corrupt
-                # (Windows git symlink→text conversion).
-                corrupt = False
-                for onnx in cache_model.rglob("*.onnx"):
-                    if onnx.is_file() and onnx.stat().st_size < 1024:
-                        corrupt = True
-                        break
-                if corrupt:
-                    shutil.rmtree(str(cache_model))
-                else:
-                    continue  # model already healthy, skip copy
-
-            # Deploy this model from assets to cache
-            try:
-                shutil.copytree(
-                    str(asset_model), str(cache_model),
-                    dirs_exist_ok=True,
-                )
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Failed to deploy embedding model {asset_model.name} "
-                    f"to {cache_model}: {exc}"
-                ) from exc
-
+    These feed MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL
+    which the mnemosyne library reads natively."""
     # -- remember -------------------------------------------------------
 
     def remember(self, content: str, importance: float = 0.8,

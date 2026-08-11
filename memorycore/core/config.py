@@ -45,30 +45,24 @@ MNEMOSYNE_DATA_DIR = os.environ.get(
 if "MNEMOSYNE_DATA_DIR" not in os.environ:
     os.environ["MNEMOSYNE_DATA_DIR"] = MNEMOSYNE_DATA_DIR
 
-# Fastembed cache directory — where the ONNX embedding model lives.
-# The model is bundled with the package (memorycore/assets/fastembed-cache/)
-# and auto-deployed into this directory on first use (never downloads).
-# Default ~/.memorycore/fastembed; override with MNEMOSYNE_FASTEMBED_CACHE_DIR.
-MNEMOSYNE_FASTEMBED_CACHE_DIR = os.environ.get(
-    "MNEMOSYNE_FASTEMBED_CACHE_DIR",
-    os.path.normpath(os.path.join(MNEMOSYNE_DATA_DIR, "..", "fastembed")),
-)
-if "MNEMOSYNE_FASTEMBED_CACHE_DIR" not in os.environ:
-    os.environ["MNEMOSYNE_FASTEMBED_CACHE_DIR"] = MNEMOSYNE_FASTEMBED_CACHE_DIR
+# ---- cold tier — local mode: embedding API (ollama / qwen3) ----
+# MEMORYCORE_EMBED_URL: ollama (or compatible) embedding API base URL.
+# Default http://localhost:11434/v1 — ollama's OpenAI-compatible endpoint.
+# Set to "" to use a different provider or the legacy fastembed path.
+MEMORYCORE_EMBED_URL = os.environ.get("MEMORYCORE_EMBED_URL", "http://localhost:11434/v1")
 
-# Local embedding model — fastembed built-in (no API key needed).
-# Two models are bundled in the package:
-#   BAAI/bge-small-zh-v1.5  (default) — Chinese-optimised, 512-dim, MIT
-#   BAAI/bge-small-en-v1.5            — English-optimised, 384-dim, MIT
-# Switch languages by setting this env var; the model is already on disk
-# (zero download).  For other languages or custom models, set
-# MNEMOSYNE_EMBEDDING_API_URL to use an external embedding API instead
-# (e.g. Ollama, OpenAI, local llama.cpp).
+# MEMORYCORE_EMBED_MODEL: embedding model name to use via the API.
+# Default qwen3-embedding:0.6b (1024-dim). Must match a model pulled in ollama.
+MEMORYCORE_EMBED_MODEL = os.environ.get("MEMORYCORE_EMBED_MODEL", "qwen3-embedding:0.6b")
+
+# Feed these into the mnemosyne library so LocalBackend uses ollama.
+if "MNEMOSYNE_EMBEDDING_API_URL" not in os.environ:
+    os.environ["MNEMOSYNE_EMBEDDING_API_URL"] = MEMORYCORE_EMBED_URL
 if "MNEMOSYNE_EMBEDDING_MODEL" not in os.environ:
-    os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = "BAAI/bge-small-zh-v1.5"
-# Deliberately do NOT set MNEMOSYNE_EMBEDDING_API_URL — the library uses
-# local fastembed by default.  No HF_ENDPOINT / NO_EMBEDDINGS flags are set;
-# the model is available locally so zero network is required.
+    os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = MEMORYCORE_EMBED_MODEL
+# qwen3-embedding:0.6b outputs 1024-dim vectors.
+if "MNEMOSYNE_EMBEDDING_DIM" not in os.environ:
+    os.environ["MNEMOSYNE_EMBEDDING_DIM"] = "1024"
 
 # ---- LLM (optional, merge enhancement for ambiguous groups) ----
 # Used by overflow merge when rule-based dedup cannot resolve an ambiguous

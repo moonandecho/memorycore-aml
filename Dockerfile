@@ -15,8 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 从构建机 COPY ollama (绕开 ollama.com/github 下载, 国内服务器直连不可靠):
-#   主二进制 + CPU 推理库 (libggml-cpu*.so / libllama / libmtmd), 不含 cuda
-COPY ollama-bin/ /usr/local/
+#   主二进制 → /usr/local/bin (PATH 内) + CPU 推理库 → /usr/local/lib/ollama
+COPY ollama-bin/ollama /usr/local/bin/ollama
 COPY ollama-lib/ /usr/local/lib/ollama/
 
 WORKDIR /app

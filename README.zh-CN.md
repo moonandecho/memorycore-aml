@@ -24,6 +24,23 @@ Agent 积累记忆的速度很快——偏好、事实、决策——而不维�
 
 ---
 
+
+## AML 2026 参赛条目（Agent 记忆挑战赛，第二期）
+
+MemoryCore 以**差异化路线：记忆治理在线化**参加
+[Agent Memory Leaderboard](https://agentmemories.ai) 开源方法榜——不做
+query 改写 / 迭代检索。Add 路径执行事实切分、过时过滤、语义去重/合并
+（"方案 A" + "方案 A 改为 B" 最终是一条记忆）；Search 路径返回按
+user_id 隔离的召回，按"相似度 × 时间衰减"排序（半衰期 90 天，
+importance ≥ 0.8 永不衰减）。
+
+- 参赛文档：[docs/AML-COMPETITION.md](docs/AML-COMPETITION.md)
+- Docker 入口：`aml-entrypoint.sh`（容器内 ollama + qwen3-embedding）
+- Add / Search / Health 端点位于 `0.0.0.0:8000`（`python -m memorycore.aml_server`）
+- 样本隔离是硬约束：`user_id` 一对一映射存储层 `author_id`；
+  跨 user_id 检索不到任何记忆（测试覆盖）。
+
+
 ## 特性
 
 - **记忆治理(核心)** —— 冷层数据完整性的三层保护:

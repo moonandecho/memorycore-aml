@@ -22,7 +22,8 @@ COPY ollama-lib/ /usr/local/lib/ollama/
 WORKDIR /app
 COPY . /app
 
-RUN pip install --no-cache-dir .
+# 阿里云 pip 镜像 (国内服务器 pypi.org 直连慢/卡; 清华 403 失效)
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ .
 
 # AML 运行环境 (全部可被 -e 覆盖)
 ENV MNEMOSYNE_DATA_DIR=/data \

@@ -26,9 +26,13 @@ COPY . /app
 RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ .
 
 # AML 运行环境 (全部可被 -e 覆盖)
+# 注意: mnemosyne 模块级变量在 import 时读取, 必须直接设 MNEMOSYNE_* 变量,
+#       不能依赖 config.py 的 MEMORYCORE_* 转发 (转发只对显式 import 生效)
 ENV MNEMOSYNE_DATA_DIR=/data \
     MEMORYCORE_EMBED_URL=http://localhost:11434/v1 \
     MEMORYCORE_EMBED_MODEL=qwen3-embedding:0.6b \
+    MNEMOSYNE_EMBEDDING_API_URL=http://localhost:11434/v1 \
+    MNEMOSYNE_EMBEDDING_MODEL=qwen3-embedding:0.6b \
     AML_HOST=0.0.0.0 \
     AML_PORT=8000
 

@@ -9,12 +9,15 @@ FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 系统依赖 + ollama (官方安装脚本, 容器内以 `ollama serve` 手动启动)
-# zstd 必须装: ollama 安装脚本用 zstd 解压发行包
+# 系统依赖 (zstd 不再需要 — ollama 二进制直接 COPY, 不跑安装脚本)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates zstd \
-    && curl -fsSL https://ollama.com/install.sh | sh \
+        curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# 从构建机 COPY ollama (绕开 ollama.com/github 下载, 国内服务器直连不可靠):
+#   主二进制 + CPU 推理库 (libggml-cpu*.so / libllama / libmtmd), 不含 cuda
+COPY ollama-bin/ /usr/local/
+COPY ollama-lib/ /usr/local/lib/ollama/
 
 WORKDIR /app
 COPY . /app

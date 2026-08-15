@@ -6,9 +6,20 @@ Two backends, same interface (remember/recall/update/forget/stats):
   - RemoteBackend: MCP streamable-http client (original behaviour)
 
 Selection: env MEMORYCORE_COLD_BACKEND, default "local".
+
+AML (Agent Memory Leaderboard) multi-tenant isolation:
+  remember/recall/update/forget accept optional identity filters
+  (author_id / author_type / channel_id / source / from_date / to_date).
+  - LocalBackend maps author_id to a per-user mnemosyne engine
+    (session_id = "aml:<author_id>") so writes are session-scoped per user
+    and recall filters author_id in SQL (vector + FTS + fallback paths).
+  - RemoteBackend passes the same kwargs through to the remote MCP tools.
+  All parameters default to None → existing single-tenant behaviour
+  is unchanged.
 """
 import json
 import os
+import threading
 import urllib.error
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +43,19 @@ class LocalBackend:
       MEMORYCORE_EMBED_MODEL — default qwen3-embedding:0.6b (1024-dim)
 
     These feed MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL
-    which the mnemosyne library reads natively."""
+    which the mnemosyne library reads natively.
+
+    AML identity isolation (author_id):
+      The shared engine (session "memorycore") stays the default for
+      single-tenant usage.  When author_id is given, writes go through a
+      lazily-created per-user engine whose session_id is "aml:<author_id>"
+      — mnemosyne dedups exact content per (session_id, content), so a
+      per-user session keeps the dedup scope per user.  Recall runs on the
+      shared engine with the author_id SQL filter, which mnemosyne applies
+      across sessions (vector + FTS + fallback paths).
+    """
+
+    _AML_SESSION_PREFIX = "aml:"
 
     def __init__(self):
         from mnemosyne import Mnemosyne  # noqa: E402
@@ -115,17 +138,62 @@ class LocalBackend:
                 "Pull:   ollama pull qwen3-embedding:0.6b"
             )
 
+        # AML per-user engines: key = (author_id, author_type, channel_id)
+        self._aml_engines: Dict[tuple, Any] = {}
+        self._aml_lock = threading.Lock()
 
+    def _engine_for(self, author_id: str, author_type: Optional[str] = None,
+                    channel_id: Optional[str] = None):
+        """Return the per-user mnemosyne engine for an AML user_id.
+
+        The engine's session_id is "aml:<author_id>" so exact-content
+        dedup (mnemosyne scopes dedup by session_id + content) never
+        crosses users.  The engine's author_id is stamped onto every
+        row it writes, and recall's author_id filter finds those rows
+        regardless of session.
+        """
+        key = (author_id or "", author_type or "", channel_id or "")
+        with self._aml_lock:
+            eng = self._aml_engines.get(key)
+            if eng is None:
+                from mnemosyne import Mnemosyne  # noqa: E402
+                eng = Mnemosyne(
+                    session_id=f"{self._AML_SESSION_PREFIX}{author_id}",
+                    author_id=author_id,
+                    author_type=author_type or "agent",
+                    channel_id=channel_id or "aml",
+                )
+                self._aml_engines[key] = eng
+            return eng
 
     # -- remember -------------------------------------------------------
 
     def remember(self, content: str, importance: float = 0.8,
-                 scope: str = "global") -> Dict[str, Any]:
-        """Store a memory. Returns {status, memory_id} matching remote."""
-        memory_id = self._engine.remember(
+                 scope: str = "global",
+                 author_id: Optional[str] = None,
+                 author_type: Optional[str] = None,
+                 channel_id: Optional[str] = None,
+                 source: Optional[str] = None,
+                 from_date: Optional[str] = None,
+                 to_date: Optional[str] = None) -> Dict[str, Any]:
+        """Store a memory. Returns {status, memory_id} matching remote.
+
+        author_id (AML user_id isolation): when set, the write goes through
+        a per-user engine (session "aml:<author_id>", author_id stamped).
+        source tags the origin (e.g. message role in AML ingestion).
+        """
+        if author_id:
+            engine = self._engine_for(author_id, author_type, channel_id)
+        else:
+            engine = self._engine
+        kwargs: Dict[str, Any] = {}
+        if source is not None:
+            kwargs["source"] = source
+        memory_id = engine.remember(
             content,
             importance=importance,
             scope=scope,
+            **kwargs,
         )
         if memory_id is None:
             return {"status": "filtered",
@@ -134,13 +202,36 @@ class LocalBackend:
 
     # -- recall ---------------------------------------------------------
 
-    def recall(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+    def recall(self, query: str, top_k: int = 5,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None,
+               source: Optional[str] = None,
+               from_date: Optional[str] = None,
+               to_date: Optional[str] = None) -> Dict[str, Any]:
         """Semantic recall. Returns {status, results: [...]} matching remote.
 
         Each result dict carries the same keys the remote backend returns:
         id, content, dense_score, keyword_score, fts_score, importance.
+
+        Identity filters (author_id / author_type / channel_id / source /
+        from_date / to_date) are passed to the shared engine's SQL layer —
+        author-only recall spans sessions but never crosses authors.
         """
-        items = self._engine.recall(query, top_k=top_k)
+        kwargs: Dict[str, Any] = {}
+        if author_id is not None:
+            kwargs["author_id"] = author_id
+        if author_type is not None:
+            kwargs["author_type"] = author_type
+        if channel_id is not None:
+            kwargs["channel_id"] = channel_id
+        if source is not None:
+            kwargs["source"] = source
+        if from_date is not None:
+            kwargs["from_date"] = from_date
+        if to_date is not None:
+            kwargs["to_date"] = to_date
+        items = self._engine.recall(query, top_k=top_k, **kwargs)
         results = []
         for it in items:
             results.append({
@@ -156,17 +247,37 @@ class LocalBackend:
             })
         return {"status": "ok", "results": results}
 
-    def recall_results(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def recall_results(self, query: str, top_k: int = 5,
+                       author_id: Optional[str] = None,
+                       author_type: Optional[str] = None,
+                       channel_id: Optional[str] = None,
+                       source: Optional[str] = None,
+                       from_date: Optional[str] = None,
+                       to_date: Optional[str] = None) -> List[Dict[str, Any]]:
         """Convenience: return just the results list (parsed, same shape
         as ColdStoreClient.recall_results for remote)."""
-        raw = self.recall(query, top_k=top_k)
+        raw = self.recall(query, top_k=top_k,
+                          author_id=author_id, author_type=author_type,
+                          channel_id=channel_id, source=source,
+                          from_date=from_date, to_date=to_date)
         return raw.get("results", [])
 
     # -- update ---------------------------------------------------------
 
-    def update(self, memory_id: str, content: str) -> Dict[str, Any]:
-        """Update by ID. Returns {status, memory_id} matching remote."""
-        ok = self._engine.update(memory_id, content=content)
+    def update(self, memory_id: str, content: str,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None) -> Dict[str, Any]:
+        """Update by ID. Returns {status, memory_id} matching remote.
+
+        With author_id: routes to the per-user engine so the update hits
+        the row's session scope ("aml:<author_id>").
+        """
+        if author_id:
+            engine = self._engine_for(author_id, author_type, channel_id)
+        else:
+            engine = self._engine
+        ok = engine.update(memory_id, content=content)
         if ok:
             return {"status": "updated", "memory_id": memory_id}
         return {"status": "error",
@@ -174,9 +285,16 @@ class LocalBackend:
 
     # -- forget ---------------------------------------------------------
 
-    def forget(self, memory_id: str) -> Dict[str, Any]:
+    def forget(self, memory_id: str,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None) -> Dict[str, Any]:
         """Delete by ID. Returns {status, memory_id} matching remote."""
-        ok = self._engine.forget(memory_id)
+        if author_id:
+            engine = self._engine_for(author_id, author_type, channel_id)
+        else:
+            engine = self._engine
+        ok = engine.forget(memory_id)
         if ok:
             return {"status": "deleted", "memory_id": memory_id}
         return {"status": "error",
@@ -184,23 +302,32 @@ class LocalBackend:
 
     # -- stats ----------------------------------------------------------
 
-    def stats(self) -> Dict[str, Any]:
+    def stats(self, all_sessions: bool = False) -> Dict[str, Any]:
         """Cold-tier statistics. Returns {total, embeddings, ...} matching remote.
 
         Queries SQLite directly for accurate counts:
-          - total       = COUNT(*) FROM working_memory (session-scoped)
+          - total       = COUNT(*) FROM working_memory
           - embeddings  = COUNT(*) FROM vec_working_rowids (shadow table,
                            readable without the sqlite-vec extension)
+
+        all_sessions=True counts across every session (AML multi-tenant
+        capacity gate); the default counts the shared "memorycore" session
+        only, matching the original single-tenant behaviour.
 
         Avoids the library's get_stats() which double-counts
         (legacy memories + BEAM working) and misses vec_working.
         """
         conn = self._engine.conn  # has sqlite-vec loaded
-        total = conn.execute(
-            "SELECT COUNT(*) FROM working_memory"
-            " WHERE session_id = ?",
-            ("memorycore",),
-        ).fetchone()[0]
+        if all_sessions:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM working_memory"
+            ).fetchone()[0]
+        else:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM working_memory"
+                " WHERE session_id = ?",
+                ("memorycore",),
+            ).fetchone()[0]
 
         embeddings = 0
         try:
@@ -210,11 +337,17 @@ class LocalBackend:
         except Exception:
             pass  # shadow table may not exist yet
 
-        ep_total = conn.execute(
-            "SELECT COUNT(*) FROM episodic_memory"
-            " WHERE session_id = ?",
-            ("memorycore",),
-        ).fetchone()[0]
+        ep_total = 0
+        if all_sessions:
+            ep_total = conn.execute(
+                "SELECT COUNT(*) FROM episodic_memory"
+            ).fetchone()[0]
+        else:
+            ep_total = conn.execute(
+                "SELECT COUNT(*) FROM episodic_memory"
+                " WHERE session_id = ?",
+                ("memorycore",),
+            ).fetchone()[0]
 
         return {
             "total": total,
@@ -256,6 +389,11 @@ def _parse_sse(body: str) -> Dict[str, Any]:
             return json.loads(line[5:].strip())
     # Fallback: plain JSON
     return json.loads(body)
+
+
+def _drop_none(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop None values so remote tool calls only carry set filters."""
+    return {k: v for k, v in d.items() if v is not None}
 
 
 class RemoteBackend:
@@ -362,25 +500,60 @@ class RemoteBackend:
     # -- 5-method interface --------------------------------------------
 
     def remember(self, content: str, importance: float = 0.8,
-                 scope: str = "global") -> Dict[str, Any]:
-        return self._call_tool("remember", {
+                 scope: str = "global",
+                 author_id: Optional[str] = None,
+                 author_type: Optional[str] = None,
+                 channel_id: Optional[str] = None,
+                 source: Optional[str] = None,
+                 from_date: Optional[str] = None,
+                 to_date: Optional[str] = None) -> Dict[str, Any]:
+        args = _drop_none({
             "content": content,
             "importance": importance,
             "scope": scope,
+            "author_id": author_id,
+            "author_type": author_type,
+            "channel_id": channel_id,
+            "source": source,
+            "from_date": from_date,
+            "to_date": to_date,
         })
+        return self._call_tool("remember", args)
 
-    def recall(self, query: str, top_k: int = 5) -> Dict[str, Any]:
-        return self._call_tool("recall", {
+    def recall(self, query: str, top_k: int = 5,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None,
+               source: Optional[str] = None,
+               from_date: Optional[str] = None,
+               to_date: Optional[str] = None) -> Dict[str, Any]:
+        args = _drop_none({
             "query": query, "top_k": top_k,
+            "author_id": author_id,
+            "author_type": author_type,
+            "channel_id": channel_id,
+            "source": source,
+            "from_date": from_date,
+            "to_date": to_date,
         })
+        return self._call_tool("recall", args)
 
-    def recall_results(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def recall_results(self, query: str, top_k: int = 5,
+                       author_id: Optional[str] = None,
+                       author_type: Optional[str] = None,
+                       channel_id: Optional[str] = None,
+                       source: Optional[str] = None,
+                       from_date: Optional[str] = None,
+                       to_date: Optional[str] = None) -> List[Dict[str, Any]]:
         """Parse recall response into structured list.
 
         Returns [{id, content, dense_score, keyword_score, fts_score,
                   importance}, ...]
         """
-        raw = self._call_tool("recall", {"query": query, "top_k": top_k})
+        raw = self.recall(query, top_k=top_k,
+                          author_id=author_id, author_type=author_type,
+                          channel_id=channel_id, source=source,
+                          from_date=from_date, to_date=to_date)
 
         # _call_tool already tried json.loads + ast.literal_eval
         if "raw" in raw and len(raw) == 1:
@@ -405,16 +578,32 @@ class RemoteBackend:
             return [dict(r) for r in results]
         return []
 
-    def update(self, memory_id: str, content: str) -> Dict[str, Any]:
-        return self._call_tool("update", {
+    def update(self, memory_id: str, content: str,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None) -> Dict[str, Any]:
+        return self._call_tool("update", _drop_none({
             "memory_id": memory_id, "content": content,
-        })
+            "author_id": author_id,
+            "author_type": author_type,
+            "channel_id": channel_id,
+        }))
 
-    def forget(self, memory_id: str) -> Dict[str, Any]:
-        return self._call_tool("forget", {"memory_id": memory_id})
+    def forget(self, memory_id: str,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None) -> Dict[str, Any]:
+        return self._call_tool("forget", _drop_none({
+            "memory_id": memory_id,
+            "author_id": author_id,
+            "author_type": author_type,
+            "channel_id": channel_id,
+        }))
 
-    def stats(self) -> Dict[str, Any]:
-        return self._call_tool("stats", {})
+    def stats(self, all_sessions: bool = False) -> Dict[str, Any]:
+        return self._call_tool("stats", _drop_none({
+            "all_sessions": all_sessions,
+        }))
 
     def list_all(self) -> List[Dict[str, Any]]:
         """Try list_all / get_all; raise AttributeError if unavailable.
@@ -479,6 +668,10 @@ class ColdStoreClient:
     Backend selection via env MEMORYCORE_COLD_BACKEND:
       - "local"  (default) → LocalBackend  (mnemosyne-memory in-process)
       - "remote"            → RemoteBackend (MCP streamable-http)
+
+    AML identity filters (author_id / author_type / channel_id / source /
+    from_date / to_date) are accepted by every data method and default to
+    None → single-tenant behaviour unchanged.
     """
 
     def __init__(self, url: str = None, timeout: float = TIMEOUT):
@@ -492,24 +685,68 @@ class ColdStoreClient:
     # Delegate all 5 methods -------------------------------------------
 
     def remember(self, content: str, importance: float = 0.8,
-                 scope: str = "global") -> Dict[str, Any]:
-        return self._backend.remember(content, importance=importance,
-                                      scope=scope)
+                 scope: str = "global",
+                 author_id: Optional[str] = None,
+                 author_type: Optional[str] = None,
+                 channel_id: Optional[str] = None,
+                 source: Optional[str] = None,
+                 from_date: Optional[str] = None,
+                 to_date: Optional[str] = None) -> Dict[str, Any]:
+        return self._backend.remember(
+            content, importance=importance, scope=scope,
+            author_id=author_id, author_type=author_type,
+            channel_id=channel_id, source=source,
+            from_date=from_date, to_date=to_date,
+        )
 
-    def recall(self, query: str, top_k: int = 5) -> Dict[str, Any]:
-        return self._backend.recall(query, top_k=top_k)
+    def recall(self, query: str, top_k: int = 5,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None,
+               source: Optional[str] = None,
+               from_date: Optional[str] = None,
+               to_date: Optional[str] = None) -> Dict[str, Any]:
+        return self._backend.recall(
+            query, top_k=top_k,
+            author_id=author_id, author_type=author_type,
+            channel_id=channel_id, source=source,
+            from_date=from_date, to_date=to_date,
+        )
 
-    def recall_results(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        return self._backend.recall_results(query, top_k=top_k)
+    def recall_results(self, query: str, top_k: int = 5,
+                       author_id: Optional[str] = None,
+                       author_type: Optional[str] = None,
+                       channel_id: Optional[str] = None,
+                       source: Optional[str] = None,
+                       from_date: Optional[str] = None,
+                       to_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self._backend.recall_results(
+            query, top_k=top_k,
+            author_id=author_id, author_type=author_type,
+            channel_id=channel_id, source=source,
+            from_date=from_date, to_date=to_date,
+        )
 
-    def update(self, memory_id: str, content: str) -> Dict[str, Any]:
-        return self._backend.update(memory_id, content=content)
+    def update(self, memory_id: str, content: str,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None) -> Dict[str, Any]:
+        return self._backend.update(memory_id, content,
+                                    author_id=author_id,
+                                    author_type=author_type,
+                                    channel_id=channel_id)
 
-    def forget(self, memory_id: str) -> Dict[str, Any]:
-        return self._backend.forget(memory_id)
+    def forget(self, memory_id: str,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None) -> Dict[str, Any]:
+        return self._backend.forget(memory_id,
+                                    author_id=author_id,
+                                    author_type=author_type,
+                                    channel_id=channel_id)
 
-    def stats(self) -> Dict[str, Any]:
-        return self._backend.stats()
+    def stats(self, all_sessions: bool = False) -> Dict[str, Any]:
+        return self._backend.stats(all_sessions=all_sessions)
 
     def list_all(self) -> List[Dict[str, Any]]:
         return self._backend.list_all()

@@ -223,6 +223,42 @@ hermes config set memory.provider memorycore-prefetch
 - **Hermes 专用**:插件导入 Hermes 运行时模块(`agent.memory_provider`),不能作为独立包运行——它是 MemoryCore 的 Hermes 集成侧。完整说明见 [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md)。
 - 每次召回保持 5s 超时;失败静默降级为空注入,绝不阻塞对话。
 
+## 热层治理机制
+
+热层(MEMORY.md / USER.md)每轮全量注入上下文,必须保持精简与时效。MemoryCore
+在六步溢流之上叠加三层机制,让历史记录确定性退役,而不是无限堆积:
+
+### 热层元数据老化
+
+- sidecar 元数据:`MEMORY.meta.json` / `USER.meta.json` 与 .md 文件同目录,
+  以条目内容的 SHA-256 为键;原子写 + 文件锁保证跨进程安全;§ 分隔的 .md
+  格式零改动,宿主 memory 工具不受影响。
+- 每条条目被判定为 `state`(历史决策/状态记录)或 `rule`(准则/偏好):
+  - `state`:写入 7 天后退役至冷层(可配置 `STATE_TTL_DAYS`)
+  - `rule`:永不因年龄退役;30 天未更新的长条目(>200 字)成为 LLM 压缩
+    候选(可配置 `RULE_COMPRESS_DAYS`)
+- 条目内容变化 → 键变化 → 下次 reconcile 对内容重新判型并回收孤儿键。
+
+### 双写入口治理
+
+- `store_fact` 写入口:内容呈完成态(含日期 + 拍板/已配置等完成态词,且
+  无行为指令词)→ 直接写冷层,污染不进热层。
+- 插件 `on_memory_write` 直写通道:内置 memory 工具每次 add/replace 提交后
+  立即判型;`state` 直写后台迁移冷层(查重 → 冷层写成功 → 删热层;冷层失败
+  则保留热层并盖章 state 作为 7 天到期兜底),与占用水位无关。单工作线程
+  消费有界队列(容量 128),队列满则跳过,由下次溢流 reconcile 兜底补盖。
+
+### 元数据优先溢流
+
+每次溢流先 reconcile 元数据(补盖无元数据的存量条目、回收孤儿键),再按
+元数据退役;关键词表降级为无元数据条目的兜底。sidecar 故障自动降级到
+关键词路径,不阻塞溢流。
+
+### 体检工具: memorycore_memory_audit
+
+只读工具,列出热层每条条目的类型、年龄、退役计划与 keep/sink 判定 ——
+排查"溢流空转"(热层满了却无条目可沉)的观测锚点。
+
 ## 规模化测试与优化结果
 
 MemoryCore 在万条级冷层规模下做了完整压力测试与召回优化(隔离测试环境,生产数据零接触,结果可复现)。

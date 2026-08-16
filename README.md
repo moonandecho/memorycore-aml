@@ -241,6 +241,57 @@ Requirements & notes:
 - Every recall keeps a 5s timeout; failures degrade silently to an empty
   injection and never block the conversation.
 
+## Hot-Tier Governance
+
+The hot tier (MEMORY.md / USER.md) is injected into the context every turn,
+so it must stay small and current. MemoryCore layers three mechanisms on top
+of the six-step overflow so historical records retire deterministically
+instead of piling up:
+
+### Hot-tier metadata aging
+
+- Sidecar metadata: `MEMORY.meta.json` / `USER.meta.json` sit next to the
+  .md files, keyed by the SHA-256 of the entry content. Atomic writes plus
+  file locks keep them safe across processes; the §-delimited .md format is
+  untouched, so host memory tools keep working unchanged.
+- Every entry is typed `state` (historical decisions / status records) or
+  `rule` (precepts / preferences):
+  - `state`: retires to the cold tier 7 days after being written
+    (configurable: `STATE_TTL_DAYS`)
+  - `rule`: never retires by age; after 30 days without an update, long
+    entries (>200 chars) become LLM-compression candidates
+    (configurable: `RULE_COMPRESS_DAYS`)
+- When an entry's content changes, its key changes — the next reconcile
+  re-types the new content and garbage-collects orphaned keys.
+
+### Dual write-entry governance
+
+- `store_fact` write entry: content that looks like a completed
+  decision/status record (a date plus completion markers such as
+  拍板/已配置, with no behavior instructions) is routed straight to the
+  cold tier — it never enters the hot tier.
+- Plugin `on_memory_write` direct-write channel: after every built-in
+  memory tool add/replace, the entry is typed immediately. `state` entries
+  migrate to the cold tier in the background (dedup → cold write confirmed
+  → removed from hot; on cold failure the entry stays with a state stamp
+  as a 7-day backstop). This runs independent of usage thresholds. A single
+  worker thread drains a bounded queue (size 128); when the queue is full
+  the write is skipped and the next overflow reconcile stamps it as a
+  backstop.
+
+### Metadata-first overflow
+
+Each overflow run first reconciles metadata (stamps untyped legacy entries,
+garbage-collects orphans), then retires entries by metadata — keywords only
+remain as the fallback for untyped entries. A sidecar failure degrades to
+the keyword path and never blocks the overflow.
+
+### Health check: memorycore_memory_audit
+
+A read-only tool listing every hot-tier entry with its type, age,
+retirement plan and keep/sink classification — the observability anchor for
+diagnosing an overflow that finds nothing to sink.
+
 ## Scale test & optimisation results
 
 MemoryCore was stress-tested and recall-optimised at ten-thousand-entry

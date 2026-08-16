@@ -8,6 +8,13 @@ Dual-role plugin:
    write (add/replace), checks hot-tier usage in real time; triggers
    overflow at >=80% (hard) or >=60% (soft, with 5% hysteresis).
    Overflow runs in a background thread so it never blocks the tool return.
+3. on_memory_write direct-write governance (Phase 2, 2026-08-16): right
+   after add/replace commits, types the entry (classify_entry_type):
+   state-typed content is migrated to the cold tier in the background
+   (dedup -> cold write confirmed -> remove from hot; on cold failure the
+   entry stays with a state stamp as a 7-day backstop), rule-typed content
+   is stamped. Governance core lives in core.metadata.direct_write_govern
+   (no duplicated logic) and is independent of the usage thresholds.
 
 2026-08-11: Single-model qwen3-embedding-ctx256 architecture (no reranker).
 All reranker/bge-m3 code has been removed.
@@ -35,6 +42,7 @@ Prerequisites:
 import json
 import logging
 import os
+import queue
 import statistics
 import sys
 import tempfile
@@ -59,6 +67,7 @@ try:
     )
     from memorycore.core.overflow import run_overflow  # noqa: E402
     from memorycore.core.decay import _apply_decay  # noqa: E402
+    from memorycore.core.metadata import direct_write_govern  # noqa: E402
 except ImportError:
     _REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     sys.path.insert(0, _REPO_ROOT)
@@ -72,6 +81,7 @@ except ImportError:
     )
     from memorycore.core.overflow import run_overflow  # noqa: E402
     from memorycore.core.decay import _apply_decay  # noqa: E402
+    from memorycore.core.metadata import direct_write_govern  # noqa: E402
 
 _RECALL_CANDIDATES = 20    # first-stage recall candidates (dense-only, 2026-08-11)
 _INJECT_TOP_N = 5          # max injected after dense ranking
@@ -142,6 +152,13 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         self._overflow_lock = threading.Lock()
         self._overflow_thread: Optional[threading.Thread] = None
         self._last_overflow_pct: Dict[str, int] = {}
+        # Phase 2 (2026-08-16): direct-write governance state — single-flight:
+        # one worker thread draining a bounded queue (no thread fan-out on
+        # write bursts); when the queue is full the write is skipped and the
+        # next overflow reconcile stamps it as a backstop.
+        self._govern_lock = threading.Lock()
+        self._govern_worker: Optional[threading.Thread] = None
+        self._govern_queue: "queue.Queue" = queue.Queue(maxsize=128)
 
     def is_available(self) -> bool:
         return True
@@ -186,10 +203,16 @@ class MemoryCorePrefetchProvider(MemoryProvider):
     ) -> None:
         """Called after every built-in memory tool write: check usage, auto-overflow."""
         if action == "remove":
-            return
+            return  # removal only lowers usage; orphan sidecar keys are GC'd by reconcile
         if target not in ("memory", "user"):
             return
         try:
+            # Phase 2 (2026-08-16): direct-write governance — type the entry
+            # right after add/replace commits: state-typed content is
+            # migrated to the cold tier in the background (independent of the
+            # usage thresholds); rule-typed content is stamped.
+            if action in ("add", "replace"):
+                self._govern_direct_write(target, content, action)
             limit = CHAR_LIMIT_MEMORY if target == "memory" else CHAR_LIMIT_USER
             store = LocalStore()
             pct = store.usage_pct(target, limit)
@@ -211,6 +234,51 @@ class MemoryCorePrefetchProvider(MemoryProvider):
                     self._spawn_overflow(target)
         except Exception as e:
             logger.debug("on_memory_write check failed: %s", e)
+
+    def _govern_direct_write(self, target: str, content: str, action: str) -> None:
+        """Direct-write governance (Phase 2, 2026-08-16): enqueue for the
+        background worker; never blocks the memory tool return.
+
+        The entry has already been written to the hot tier by Hermes; the
+        governance only types it and migrates/stamps accordingly:
+          state -> recall dedup -> cold write confirmed -> remove from hot
+                   (cold failure keeps the entry + stamps a 7-day backstop)
+          rule  -> sidecar stamp {rule, written_at=now, origin=hermes}
+        """
+        if not content or not content.strip():
+            return
+        with self._govern_lock:
+            if self._govern_worker is None or not self._govern_worker.is_alive():
+                self._govern_worker = threading.Thread(
+                    target=self._govern_worker_loop,
+                    daemon=True,
+                )
+                self._govern_worker.start()
+        try:
+            self._govern_queue.put_nowait((target, content, action))
+        except queue.Full:
+            logger.debug("govern queue full, skip (reconcile backstop)")
+
+    def _govern_worker_loop(self) -> None:
+        """Governance worker (single-flight): drains the queue serially so at
+        most one cold-tier RPC is in flight at any time."""
+        while True:
+            item = self._govern_queue.get()
+            try:
+                self._run_govern_bg(*item)
+            finally:
+                self._govern_queue.task_done()
+
+    def _run_govern_bg(self, target: str, content: str, action: str) -> None:
+        """Run the governance via core.metadata.direct_write_govern."""
+        try:
+            store = LocalStore()
+            client = ColdStoreClient()
+            result = direct_write_govern(store, client, target, content, action)
+            logger.info("direct-write govern target=%s action=%s result=%s",
+                        target, action, result)
+        except Exception as e:
+            logger.debug("direct-write govern failed: %s", e)
 
     def _spawn_overflow(self, target: str) -> None:
         """Launch overflow in a background thread (at most one at a time)."""

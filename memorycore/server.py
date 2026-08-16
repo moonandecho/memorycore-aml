@@ -14,8 +14,11 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from .local_store import LocalStore  # noqa: E402
 from .cold_store_client import ColdStoreClient  # noqa: E402
-from .core.config import SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOFT_LIMIT, COLD_HARD_LIMIT  # noqa: E402
-from .core.classifier import classify, classify_user_pref, COLD, STALE  # noqa: E402
+from .core.config import (SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOFT_LIMIT, COLD_HARD_LIMIT,  # noqa: E402
+                         STATE_TTL_DAYS, RULE_COMPRESS_DAYS)
+from .core.classifier import (classify, classify_user_pref, should_keep_local,  # noqa: E402
+                             classify_entry_type, COLD, STALE)
+from .core.metadata import MetaStore, entry_age_days  # noqa: E402
 from .core.overflow import run_overflow, _recall_safe, _find_best_match, _merge_two_entries  # noqa: E402
 from .core.maintenance import run_maintenance  # noqa: E402
 from .core.decay import _apply_decay  # noqa: E402  # shared by recall + prefetch
@@ -31,6 +34,12 @@ def _targets(target: str):
     if target == "both":
         return ["memory", "user"]
     return ["memory"]
+
+
+def _metastore_for(target: str) -> MetaStore:
+    """Build a sidecar MetaStore following _store paths (tests can inject)."""
+    return MetaStore(target, memory_path=_store.memory_path,
+                     user_path=_store.user_path)
 
 
 def _force_overflow_to_target(t: str) -> None:
@@ -115,6 +124,14 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
                                "note": "过时状态记录, 不迁移不写入"}, ensure_ascii=False)
 
         go_cold = (is_user and d == "sink") or (not is_user and d == COLD)
+        if not go_cold and classify_entry_type(content) == "state":
+            # Phase 2 (2026-08-16): write-entry linkage — content judged
+            # hot/core but typed as a historical decision/status record
+            # (date + completion marker, no behavior instructions) is forced
+            # to the cold path so pollution never enters the hot tier.
+            # This overrides the default importance=0.8 hot shortcut without
+            # touching classify itself.
+            go_cold = True
         if go_cold:
             # Task C: capacity hard gate — check cold-tier size before writing
             _check_cold_capacity()
@@ -171,6 +188,11 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
             run_overflow(_store, _client, t)
         r = _store.add(t, content)
         if r.get("success"):
+            # Phase 2: stamp sidecar metadata after a successful hot write
+            try:
+                _metastore_for(t).stamp(content, "rule", origin="store_fact")
+            except Exception:
+                pass  # metadata failure never blocks the write (reconcile re-stamps)
             return json.dumps({"status": "stored", "target": t,
                                "usage_after": f"{_store.usage_pct(t)}%",
                                "detail": "热数据已写本地"}, ensure_ascii=False)
@@ -251,7 +273,66 @@ def memorycore_get_memory_usage() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 5: memorycore_recall — active cold-tier recall (read-only)
+# Tool 5: memorycore_memory_audit — hot-tier health check (read-only)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memorycore_memory_audit(target: str = "both") -> str:
+    """Hot-tier health check (read-only, never modifies): list every entry
+    with its keep/sink classification, char count, and Phase 2 metadata
+    (type / written_at / age_days / retirement plan). Used to diagnose
+    overflow no-ops — when the hot tier is full of historical records,
+    sink_candidates > 0 means overflow has something to sink."""
+    result = {}
+    for t in _targets(target):
+        usage = _store.usage_pct(t)
+        entries = _store.entries(t)
+        meta = _metastore_for(t)
+        rows = []
+        sink_total = 0
+        sink_chars = 0
+        for e in entries:
+            keep = should_keep_local(e)  # keyword view (legacy fallback)
+            m = meta.get_entry(e)
+            row = {"keep": keep, "chars": len(e), "text": e[:40]}
+            # Phase 2: metadata columns (type / written_at / age / plan)
+            if m:
+                row["type"] = m.get("type")
+                row["written_at"] = m.get("written_at")
+                age = entry_age_days(m)
+                row["age_days"] = age
+                if m.get("type") == "state":
+                    if age is not None and age >= STATE_TTL_DAYS:
+                        row["plan"] = "sink_now"
+                        keep = False
+                    else:
+                        row["plan"] = f"sink_in_{STATE_TTL_DAYS - (age or 0)}d"
+                        keep = True  # not expired: still kept for now
+                else:
+                    row["plan"] = f"keep (compress after {RULE_COMPRESS_DAYS}d)"
+                    keep = True
+                # keep and plan stay consistent for typed entries (final review)
+                row["keep"] = keep
+            else:
+                row["type"] = "legacy"
+                row["plan"] = "stamp_on_next_overflow"
+            rows.append(row)
+            if not keep:
+                sink_total += 1
+                sink_chars += len(e)
+        result[t] = {
+            "usage_pct": f"{usage:.0f}%",
+            "entries": len(entries),
+            "keep": len(entries) - sink_total,
+            "sink_candidates": sink_total,
+            "sink_chars": sink_chars,
+            "rows": rows,
+        }
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Tool 6: memorycore_recall — active cold-tier recall (read-only)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()

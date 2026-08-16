@@ -9,3 +9,6 @@ venv/
 .pytest_cache/
 build/
 dist/
+
+# AML test log artifact (contains local paths, kept locally only)
+tests/aml-test-results.md

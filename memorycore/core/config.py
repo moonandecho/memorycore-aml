@@ -94,3 +94,12 @@ STALE_MARKERS = [
     "已修复", "已解决", "已切换", "已退役", "已停用",
     "已迁移", "已删除", "已完成", "不再使用", "已废弃",
 ]
+
+# ---- hot-tier metadata aging (Phase 2, 2026-08-16) ----
+# state-typed entries (historical decisions / status records) retire to the
+# cold tier N days after write; rule-typed entries (precepts/preferences)
+# never retire by age, only eligible for LLM compression.
+STATE_TTL_DAYS = 7
+RULE_COMPRESS_DAYS = 30
+# sidecar metadata filename suffix: MEMORY.md -> MEMORY.meta.json
+META_SUFFIX = ".meta.json"

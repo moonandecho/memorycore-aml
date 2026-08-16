@@ -18,6 +18,53 @@ STALE = "stale"
 MIXED = "mixed"
 
 
+def classify_entry_type(content: str) -> str:
+    """Entry type: "state" (historical decision / status record) | "rule" (precept).
+
+    Phase 2 (2026-08-16): extracted from the completion-state detection as a
+    single source of truth, shared by three call sites: store_fact write
+    routing / on_memory_write direct-write governance / overflow reconcile.
+
+    Conservative rule (all conditions must hold for "state"):
+      0. pending/negation exclusion: 未定稿/待拍板 etc. are in-progress
+         records, not completed ones -> rule
+      1. contains a date (20xx-xx-xx)
+      2. contains a completion marker (拍板/已配置/已停/已定稿 ...)
+      3. contains no behavior/instruction marker (偏好/准则/禁止 ...)
+
+    Both mis-type directions are data-safe:
+      - state misjudged as rule -> entry stays, only compressed after 30d
+      - rule misjudged as state -> sinks to cold tier after 7d, recallable
+    So no LLM typing is needed; pure rules suffice.
+    """
+    import re
+
+    if not content or not re.search(r"20\d\d-\d\d-\d\d", content):
+        return "rule"
+    # Pending/negation exclusion: "未定稿/待拍板" describe decisions still
+    # open, not completed ones (probe-verified: 未定稿/未拍板/待拍板 all used
+    # to be misjudged as state before this guard).
+    pending_markers = ["未定稿", "未拍板", "未定案", "待定稿", "待拍板",
+                       "待定案", "需用户拍板"]
+    if any(m in content for m in pending_markers):
+        return "rule"
+    done_markers = ["拍板", "已配置", "已停", "已切换", "已退役", "退役",
+                    "已装", "已加", "停用", "已删", "已完成",
+                    "已重开", "已停用", "已清除",
+                    # Phase 2 synonyms; bare "定稿" collides with 未定稿/
+                    # 定稿前, so only the 已-prefixed form is kept
+                    "已启用", "已禁用", "已定稿", "已定案"]
+    behavior_markers = ["用户要求我", "用户偏好", "红线", "禁止", "习惯",
+                        "行为准则", "用户纠正", "交互习惯", "写作风格",
+                        "回答风格", "零容忍", "PM准则",
+                        # preference/precept language always means rule
+                        "准则", "偏好"]
+    if (any(m in content for m in done_markers)
+            and not any(m in content for m in behavior_markers)):
+        return "state"
+    return "rule"
+
+
 def classify(content: str, importance: float = 0.8, scope: str = "global") -> Dict[str, str]:
     """判定一条内容的冷热。
 
@@ -75,6 +122,12 @@ def should_keep_local(content: str) -> bool:
     head30 = content[:30]
     if "用户对" in head30 and ("兴趣" in head30 or "偏好" in head30):
         return True
+
+    # ---- 1.5 completion-state detection (2026-08-16): historical
+    # decision/status records -> sink. Logic lives in classify_entry_type
+    # (single source of truth, see above).
+    if classify_entry_type(content) == "state":
+        return False
 
     # ---- 3a. sink 词表定义 (步骤 2 的技术语境判定需要) ----
     # 强 sink: 明确的技术/环境/项目信号 (组合 ≥2 才沉, 防单个词误伤)

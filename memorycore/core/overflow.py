@@ -18,6 +18,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .classifier import classify, classify_user_pref, should_keep_local, HOT, COLD, STALE
+from .config import STATE_TTL_DAYS, RULE_COMPRESS_DAYS
+from .metadata import MetaStore, entry_age_days
 
 # ---- 相似度阈值 ------------------------------------------------------------
 
@@ -80,6 +82,8 @@ def run_overflow(store, client, target: str) -> dict:
         "compressed": 0,  # B: LLM 压缩条数 (2026-08-07)
         "kept": 0,
         "errors": 0,
+        "aged_sunk": 0,          # Phase 2: state entries retired by age
+        "metadata_stamped": 0,   # Phase 2: legacy entries stamped by reconcile
     }
 
     # P4: 收集本次下沉的用户偏好内容, 溢流末统一更新冷层摘要锚点
@@ -179,8 +183,30 @@ def run_overflow(store, client, target: str) -> dict:
         stat["merged"] = merge_count
         entries = merged_entries
 
+    # ---- Step 0.5 (Phase 2): metadata reconcile — legacy stamping / GC ----
+    # Runs after split/merge so their products are covered too. Idempotent;
+    # writes only the sidecar, never the .md files.
+    metastore = MetaStore(target, memory_path=store.memory_path,
+                          user_path=store.user_path)
+    try:
+        meta_stat = metastore.reconcile(entries)
+        stat["metadata_stamped"] = meta_stat.get("stamped", 0)
+    except Exception:
+        # F1 (final review): a sidecar failure (disk full / lock error) must
+        # never block the overflow — degrade to the legacy keyword path.
+        stat["errors"] += 1
+        stat["metadata_stamped"] = 0
+
     # ---- Step 2+3+5: 逐条处理 --------------------------------------------
     for entry in entries:
+        # Phase 2 (2026-08-16): metadata-first — typed entries retire by
+        # age+type (keywords play no part); untyped entries fall back to the
+        # legacy keyword path.
+        meta = metastore.get_entry(entry)
+        if meta and _handle_typed_entry(store, client, target, entry, meta,
+                                        metastore, stat, anchor_parts):
+            continue
+
         if should_keep_local(entry):
             # B: 长条目压缩优先 (2026-08-07) — keep 但 >200 字:
             # 先尝试 LLM 压缩成精简版留本地, 原始细节沉冷层; 失败保留原样。
@@ -193,9 +219,14 @@ def run_overflow(store, client, target: str) -> dict:
                         try:
                             r = client.remember(entry, importance=0.6, scope="global")
                             if r.get("status") == "stored":
-                                store.replace(target, entry, compressed)
-                                stat["compressed"] += 1
-                                anchor_parts.append(entry)
+                                # F3 (final review): only count after a
+                                # successful local replace
+                                if store.replace(target, entry, compressed).get("success"):
+                                    stat["compressed"] += 1
+                                    anchor_parts.append(entry)
+                                    continue
+                                stat["errors"] += 1
+                                stat["kept"] += 1
                                 continue
                         except Exception:
                             pass
@@ -234,6 +265,71 @@ def run_overflow(store, client, target: str) -> dict:
     return stat
 
 
+
+
+# ---- Phase 2: typed-entry retirement decision (2026-08-16) -----------------
+
+def _handle_typed_entry(store, client, target: str, entry: str,
+                        meta: dict, metastore, stat: dict,
+                        anchor_parts: List[str]) -> bool:
+    """Retirement decision for entries that have sidecar metadata.
+
+    - state: age >= STATE_TTL_DAYS -> cold migration via the safe path
+      (cold write confirmed before local removal); not expired -> keep.
+    - rule: never sinks by age; >= RULE_COMPRESS_DAYS without update and
+      longer than _COMPRESS_MIN_CHARS -> LLM compression (compressed version
+      stays local, details sink to cold; any failure keeps the original).
+    - unknown type -> return False, caller falls back to legacy keywords.
+
+    Returns: True = handled (caller continues); False = fall back to legacy.
+    """
+    etype = meta.get("type")
+    age = entry_age_days(meta)
+
+    if etype == "state":
+        if age is not None and age >= STATE_TTL_DAYS:
+            before = len(store.entries(target))
+            if target == "user" and classify_user_pref(
+                    entry, sentence_level=True) == "sink":
+                anchor_parts.append(entry)
+            _handle_cold_migration(store, client, target, entry, stat)
+            if len(store.entries(target)) < before:
+                stat["aged_sunk"] += 1  # count only when it really left the hot tier
+            return True
+        stat["kept"] += 1  # not expired yet
+        return True
+
+    if etype == "rule":
+        if (age is not None and age >= RULE_COMPRESS_DAYS
+                and len(entry) > _COMPRESS_MIN_CHARS):
+            compressed = _llm_compress(client, entry)
+            if (compressed is not None and compressed != entry
+                    and len(compressed) < len(entry) * 0.8):
+                try:
+                    r = client.remember(entry, importance=0.6, scope="global")
+                    if r.get("status") == "stored":
+                        # F3 (final review): verify replace before counting
+                        if store.replace(target, entry, compressed).get("success"):
+                            try:
+                                metastore.stamp(compressed, "rule",
+                                                origin="overflow")
+                            except Exception:
+                                pass  # F1: stamp failure is non-fatal (reconcile re-stamps)
+                            stat["compressed"] += 1
+                            anchor_parts.append(entry)
+                            return True
+                        stat["errors"] += 1
+                        stat["kept"] += 1
+                        return True
+                except Exception:
+                    pass
+                stat["errors"] += 1
+                stat["kept"] += 1
+                return True
+        stat["kept"] += 1
+        return True
+
+    return False  # unknown type -> legacy fallback
 
 
 # ---- P4: 用户偏好摘要锚点 --------------------------------------------------

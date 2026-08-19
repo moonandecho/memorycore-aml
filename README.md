@@ -20,25 +20,6 @@ The result: the hot tier stays within budget, the cold tier stays findable, and 
 
 Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `streamable-http` / stdio standard. Works with any MCP client, tested with [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
----
-
-
-## AML 2026 Competition entry (Agent Memory Challenge, Cycle 2)
-
-MemoryCore is competing in the [Agent Memory Leaderboard](https://agentmemories.ai)
-open-methods track with a **differentiated route: online memory governance** —
-no query-rewriting or iterative retrieval. The Add path performs fragment
-splitting, stale filtering, and semantic dedup/merge ("plan A" + "plan A changed
-to B" stays one memory); the Search path returns author-scoped recall ranked by
-similarity × time decay (90-day half-life, importance ≥ 0.8 never decays).
-
-- Submission docs: [docs/AML-COMPETITION.md](docs/AML-COMPETITION.md)
-- Docker entrypoint: `aml-entrypoint.sh` (in-container ollama + qwen3-embedding)
-- Add / Search / Health endpoints on `0.0.0.0:8000` (`python -m memorycore.aml_server`)
-- Sample isolation is a hard constraint: `user_id` maps 1:1 to storage
-  `author_id`; cross-user recall returns nothing (covered by tests).
-
-
 ## Features
 
 - **Memory governance (the core)** — three layers of protection for cold-tier data integrity:

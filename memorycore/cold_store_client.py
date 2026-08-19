@@ -7,11 +7,11 @@ Two backends, same interface (remember/recall/update/forget/stats):
 
 Selection: env MEMORYCORE_COLD_BACKEND, default "local".
 
-AML (Agent Memory Leaderboard) multi-tenant isolation:
+Multi-tenant isolation (per-user engines):
   remember/recall/update/forget accept optional identity filters
   (author_id / author_type / channel_id / source / from_date / to_date).
   - LocalBackend maps author_id to a per-user mnemosyne engine
-    (session_id = "aml:<author_id>") so writes are session-scoped per user
+    (session_id = "user:<author_id>") so writes are session-scoped per user
     and recall filters author_id in SQL (vector + FTS + fallback paths).
   - RemoteBackend passes the same kwargs through to the remote MCP tools.
   All parameters default to None → existing single-tenant behaviour
@@ -45,17 +45,17 @@ class LocalBackend:
     These feed MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL
     which the mnemosyne library reads natively.
 
-    AML identity isolation (author_id):
+    Per-user identity isolation (author_id):
       The shared engine (session "memorycore") stays the default for
       single-tenant usage.  When author_id is given, writes go through a
-      lazily-created per-user engine whose session_id is "aml:<author_id>"
+      lazily-created per-user engine whose session_id is "user:<author_id>"
       — mnemosyne dedups exact content per (session_id, content), so a
       per-user session keeps the dedup scope per user.  Recall runs on the
       shared engine with the author_id SQL filter, which mnemosyne applies
       across sessions (vector + FTS + fallback paths).
     """
 
-    _AML_SESSION_PREFIX = "aml:"
+    _USER_SESSION_PREFIX = "user:"
 
     def __init__(self):
         from mnemosyne import Mnemosyne  # noqa: E402
@@ -138,32 +138,32 @@ class LocalBackend:
                 "Pull:   ollama pull qwen3-embedding:0.6b"
             )
 
-        # AML per-user engines: key = (author_id, author_type, channel_id)
-        self._aml_engines: Dict[tuple, Any] = {}
-        self._aml_lock = threading.Lock()
+        # per-user engines: key = (author_id, author_type, channel_id)
+        self._user_engines: Dict[tuple, Any] = {}
+        self._user_lock = threading.Lock()
 
     def _engine_for(self, author_id: str, author_type: Optional[str] = None,
                     channel_id: Optional[str] = None):
-        """Return the per-user mnemosyne engine for an AML user_id.
+        """Return the per-user mnemosyne engine for a user_id.
 
-        The engine's session_id is "aml:<author_id>" so exact-content
+        The engine's session_id is "user:<author_id>" so exact-content
         dedup (mnemosyne scopes dedup by session_id + content) never
         crosses users.  The engine's author_id is stamped onto every
         row it writes, and recall's author_id filter finds those rows
         regardless of session.
         """
         key = (author_id or "", author_type or "", channel_id or "")
-        with self._aml_lock:
-            eng = self._aml_engines.get(key)
+        with self._user_lock:
+            eng = self._user_engines.get(key)
             if eng is None:
                 from mnemosyne import Mnemosyne  # noqa: E402
                 eng = Mnemosyne(
-                    session_id=f"{self._AML_SESSION_PREFIX}{author_id}",
+                    session_id=f"{self._USER_SESSION_PREFIX}{author_id}",
                     author_id=author_id,
                     author_type=author_type or "agent",
-                    channel_id=channel_id or "aml",
+                    channel_id=channel_id or "user",
                 )
-                self._aml_engines[key] = eng
+                self._user_engines[key] = eng
             return eng
 
     # -- remember -------------------------------------------------------
@@ -178,9 +178,9 @@ class LocalBackend:
                  to_date: Optional[str] = None) -> Dict[str, Any]:
         """Store a memory. Returns {status, memory_id} matching remote.
 
-        author_id (AML user_id isolation): when set, the write goes through
-        a per-user engine (session "aml:<author_id>", author_id stamped).
-        source tags the origin (e.g. message role in AML ingestion).
+        author_id (per-user isolation): when set, the write goes through
+        a per-user engine (session "user:<author_id>", author_id stamped).
+        source tags the origin (e.g. message role in multi-user ingestion).
         """
         if author_id:
             engine = self._engine_for(author_id, author_type, channel_id)
@@ -271,7 +271,7 @@ class LocalBackend:
         """Update by ID. Returns {status, memory_id} matching remote.
 
         With author_id: routes to the per-user engine so the update hits
-        the row's session scope ("aml:<author_id>").
+        the row's session scope ("user:<author_id>").
         """
         if author_id:
             engine = self._engine_for(author_id, author_type, channel_id)
@@ -310,7 +310,7 @@ class LocalBackend:
           - embeddings  = COUNT(*) FROM vec_working_rowids (shadow table,
                            readable without the sqlite-vec extension)
 
-        all_sessions=True counts across every session (AML multi-tenant
+        all_sessions=True counts across every session (multi-tenant
         capacity gate); the default counts the shared "memorycore" session
         only, matching the original single-tenant behaviour.
 
@@ -669,7 +669,7 @@ class ColdStoreClient:
       - "local"  (default) → LocalBackend  (mnemosyne-memory in-process)
       - "remote"            → RemoteBackend (MCP streamable-http)
 
-    AML identity filters (author_id / author_type / channel_id / source /
+    Per-user identity filters (author_id / author_type / channel_id / source /
     from_date / to_date) are accepted by every data method and default to
     None → single-tenant behaviour unchanged.
     """

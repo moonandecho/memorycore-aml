@@ -14,12 +14,24 @@
 from __future__ import annotations
 
 import difflib
+import math
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .classifier import classify, classify_user_pref, should_keep_local, HOT, COLD, STALE
-from .config import STATE_TTL_DAYS, RULE_COMPRESS_DAYS
-from .metadata import MetaStore, entry_age_days
+from .config import (
+    STATE_TTL_DAYS, RULE_COMPRESS_DAYS,
+    SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO,
+    RULE_RETYPE_DAYS, RULE_RETYPE_MIN_DONE_MARKERS,
+    RULE_RETYPE_DONE_MARKERS, RULE_RETYPE_BEHAVIOR_MARKERS,
+    RULE_STUB_IDLE_DAYS, IMPORTANCE_PROTECT, MAX_STUB_PER_RUN,
+    STUB_MAX_CHARS, STUB_PREFIX, STUB_GC_MIN_AGE_DAYS,
+    ACTIVITY_LOG_ENABLED, CROSS_DEDUP_MIN_IDLE_DAYS,
+    CLUSTER_EMBED_THRESHOLD, MEMORYCORE_EMBED_URL, MEMORYCORE_EMBED_MODEL,
+)
+from .metadata import (MetaStore, entry_age_days, parse_embedded_date,
+                       _parse_iso, load_recent_queries)
 
 # ---- 相似度阈值 ------------------------------------------------------------
 
@@ -60,6 +72,339 @@ _ANCHOR_QUERY = _ANCHOR_PREFIX  # 从 _ANCHOR_PREFIX 派生 (原硬编码 "[用�
 
 
 
+# ---- Phase 3: rule invalidation signals (2026-08-20) ----------------------
+# Tiered protection: B-class rules may retire by layered evidence
+# (merge / compress / sink / dedup); A-class meta-rules, red-line rules and
+# high-importance entries are never touched (only merge/compress).
+
+# S6 protection line: A-class meta-rules (apply every turn; topic-activity
+# signals are meaningless for them) — same source as classifier
+# strong_keep_markers / interact_words (word list is tunable).
+_RULE_META_MARKERS = [
+    "行为准则", "交互习惯", "写作风格", "回答风格", "措辞", "汇报", "沟通",
+    "大白话", "结论先行", "验证", "准确", "严谨", "覆盖", "抑郁", "信任",
+    "尊重", "纠正", "红线", "零容忍",
+]
+# S6 red-line class (hard-veto words, A or B class alike) — absolute protection
+_RULE_REDLINE_MARKERS = ["红线", "零容忍", "绝不", "禁止", "纠正"]
+
+# S4: per-run cap on candidates evaluated for dormancy (LLM call guardrail)
+_STUB_EVAL_CAP = 10
+
+
+def _is_protected_rule(entry: str, meta: dict) -> bool:
+    """S6: A-class / red-line / high importance -> absolute protection
+    (never stub / never retype / never cross-tier dedup; merge+compress only)."""
+    if meta.get("importance", 0.8) >= IMPORTANCE_PROTECT:
+        return True
+    if any(kw in entry for kw in _RULE_META_MARKERS):
+        return True
+    if any(kw in entry for kw in _RULE_REDLINE_MARKERS):
+        return True
+    return False
+
+
+def _rule_retype_eligible(entry: str) -> bool:
+    """S2: completion re-check eligibility — embedded date >= 60d + >= 2
+    completion markers + zero behavior-directive words."""
+    d = parse_embedded_date(entry)
+    if d is None:
+        return False
+    days = (datetime.now(timezone.utc) - d).days
+    if days < RULE_RETYPE_DAYS:
+        return False
+    hits = [m for m in RULE_RETYPE_DONE_MARKERS if m in entry]
+    # nested dedup ("退役" ⊂ "已退役" counts once)
+    distinct = [m for m in hits
+                if not any(o != m and m in o for o in hits)]
+    if len(distinct) < RULE_RETYPE_MIN_DONE_MARKERS:
+        return False
+    if any(m in entry for m in RULE_RETYPE_BEHAVIOR_MARKERS):
+        return False
+    return True
+
+
+def _try_cross_layer_dedup(store, client, target: str, entry: str,
+                           stat: dict) -> bool:
+    """S5 (L1): the cold tier already holds an equivalent copy (same-level
+    match) -> drop the hot copy (zero information loss)."""
+    try:
+        existing = _recall_safe(client, entry)
+    except Exception:
+        return False
+    if not existing:
+        return False
+    matched = _find_best_match(entry, existing)
+    if not matched or matched["level"] != "same":
+        return False
+    _safe_remove_local(store, target, entry, stat)
+    if entry not in store.entries(target):
+        stat["overflowed"] += 1
+        return True
+    return False
+
+
+def _make_stub(entry: str) -> str:
+    """S4: stub pointer (<= STUB_MAX_CHARS, lexical, zero LLM dependency).
+
+    Format: [规则指针]{topic<=10 chars}→recall("{topic}") — pointer + recall hook.
+    """
+    kw = re.sub(r"\s+", "", (entry or "").strip().split("。")[0][:10])
+    if not kw:
+        kw = re.sub(r"\s+", "", (entry or "").strip()[:10])
+    stub = f"{STUB_PREFIX}{kw}→recall(\"{kw}\")"
+    if len(stub) > STUB_MAX_CHARS:
+        stub = stub[:STUB_MAX_CHARS - 1] + ")"
+    return stub
+
+
+def _llm_judge_dormant(entries: List[str],
+                       queries: List[str]) -> Dict[str, bool]:
+    """S4: LLM dormancy judge (<= 5 entries per batch, config LLM channel).
+
+    Returns {entry: dormant}; failures / unparseable output omit the entry
+    (caller treats it as active). Prompt hard constraints: uncertain = active;
+    judge topic recurrence only, never value.
+    """
+    from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT
+
+    if not LLM_API_KEY or not entries:
+        return {}
+    qs = "\n".join(f"- {q[:120]}" for q in queries[-60:])[:1500]
+    out: Dict[str, bool] = {}
+    import json
+    import urllib.request
+    for i in range(0, len(entries), 5):
+        chunk = entries[i:i + 5]
+        items = "\n".join(
+            f'<entry index="{j}">{e[:300]}</entry>'
+            for j, e in enumerate(chunk))
+        prompt = (
+            "你是记忆治理助手。判断下列记忆准则涉及的主题, 近期是否被用户讨论过。\n"
+            f"<queries>recent user messages (last 30 days):\n{qs}\n</queries>\n"
+            f"<entries>{items}</entries>\n"
+            "要求:\n"
+            '1. 只判断"准则涉及的主题是否在近期查询中被讨论/涉及", 不判断准则价值\n'
+            "2. 拿不准一律判活跃 (dormant=false)\n"
+            "3. 不添加/不修改任何事实\n"
+            '4. 只输出 JSON: {"results": [{"entry_index": 0, '
+            '"dormant": true, "reason": "..."}]}'
+        )
+        try:
+            payload = {
+                "model": LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 800,
+                "response_format": {"type": "json_object"},
+            }
+            req = urllib.request.Request(
+                LLM_BASE_URL.rstrip("/") + "/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {LLM_API_KEY}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode())
+            content = data["choices"][0]["message"]["content"].strip()
+            content = re.sub(r"^```(json)?|```$", "", content, flags=re.M).strip()
+            results = json.loads(content).get("results", [])
+            for r in results:
+                idx = r.get("entry_index")
+                d = r.get("dormant")
+                if (isinstance(idx, int) and 0 <= idx < len(chunk)
+                        and isinstance(d, bool)):
+                    out[chunk[idx]] = d
+        except Exception:
+            continue  # this batch counts as active
+    return out
+
+
+def _rule_topic_dormant(entry: str, queries: List[str]) -> bool:
+    """S4 dormancy evidence chain: lexically active -> False; lexically
+    inactive -> LLM confirm; any failure -> False (active).
+
+    Dormancy is a negative claim: insufficient evidence always means active
+    — better to keep than to mis-sink.
+    """
+    if not queries:
+        return False
+    for q in queries:
+        if _topic_overlap(q, entry) or _topic_overlap(entry, q):
+            return False  # lexically active (zero-cost fast screen)
+    res = _llm_judge_dormant([entry], queries)
+    return bool(res.get(entry, False))
+
+
+def _plan_stub_candidates(metastore, client, entries: List[str]) -> List[str]:
+    """L2 pre-planning: B-class + idle >= RULE_STUB_IDLE_DAYS + dormancy
+    confirmed -> stub candidates (<= MAX_STUB_PER_RUN).
+
+    Ordering: longest idle first; ties broken by length (chars saved per stub).
+    """
+    if not ACTIVITY_LOG_ENABLED:
+        return []
+    queries = load_recent_queries()
+    cands = []
+    for e in entries:
+        meta = metastore.get_entry(e)
+        if not meta or meta.get("type") != "rule":
+            continue
+        if _is_protected_rule(e, meta):
+            continue
+        age = entry_age_days(meta)
+        if age is None or age < RULE_STUB_IDLE_DAYS:
+            continue
+        cands.append((age, len(e), e))
+    cands.sort(key=lambda t: (-t[0], -t[1]))
+    picked: List[str] = []
+    for _, _, e in cands[:_STUB_EVAL_CAP]:
+        if len(picked) >= MAX_STUB_PER_RUN:
+            break
+        if _rule_topic_dormant(e, queries):
+            picked.append(e)
+    return picked
+
+
+def _handle_rule_retype(store, client, target: str, entry: str, meta: dict,
+                        metastore, stat: dict, anchor_parts: List[str]) -> None:
+    """S2 (L1): completion re-check — restamp as state
+    (origin=retype_overflow) then retire via the normal TTL path.
+
+    Safe order: stamp -> cold migration (local removed only after cold
+    confirmed). On cold failure the original rule stamp (timestamps /
+    importance / origin) is restored and the entry stays.
+    """
+    d = parse_embedded_date(entry)
+    try:
+        metastore.stamp(entry, "state", written_at=d, origin="retype_overflow")
+    except Exception:
+        pass  # F1 semantics: stamp failure never blocks (reconcile backstop)
+    before = len(store.entries(target))
+    if target == "user" and classify_user_pref(
+            entry, sentence_level=True) == "sink":
+        anchor_parts.append(entry)
+    _handle_cold_migration(store, client, target, entry, stat)
+    if len(store.entries(target)) < before:
+        stat["aged_sunk"] += 1
+        stat["retyped"] += 1
+        return
+    # rollback: restore the original rule stamp
+    try:
+        metastore.stamp(
+            entry, "rule",
+            written_at=(_parse_iso(str(meta["written_at"]))
+                        if meta.get("written_at") else None),
+            updated_at=(_parse_iso(str(meta["updated_at"]))
+                        if meta.get("updated_at") else None),
+            importance=meta.get("importance", 0.8),
+            origin=meta.get("origin", "legacy"),
+        )
+    except Exception:
+        pass
+
+
+def _handle_rule_stub_sink(store, client, target: str, entry: str,
+                           metastore, stat: dict,
+                           anchor_parts: List[str]) -> None:
+    """S4 (L2): dormant B-class rule -> full text written to the cold tier
+    first; only after cold confirms stored, the local entry is replaced by a
+    stub pointer. Any failure keeps the original entry untouched (errors+1).
+    """
+    if entry not in store.entries(target):
+        return  # already handled by another action this run (S2/S5)
+    try:
+        r = client.remember(entry, importance=0.6, scope="global")
+        if r.get("status") != "stored":
+            stat["errors"] += 1
+            return
+    except Exception:
+        stat["errors"] += 1
+        return
+    stub = _make_stub(entry)
+    if store.replace(target, entry, stub).get("success"):
+        try:
+            metastore.stamp(stub, "stub", origin="stub_sink")
+        except Exception:
+            pass  # stamp failure re-covered by reconcile (STUB_PREFIX)
+        stat["stubbed"] += 1
+        if target == "user":
+            anchor_parts.append(entry)  # full pref text joins the anchor
+    else:
+        stat["errors"] += 1
+
+
+def _stub_gc(store, metastore, target: str, stat: dict) -> None:
+    """Stub lifecycle GC — oldest-first pointer removal, <=
+    MAX_STUB_PER_RUN per overflow run.
+
+    Pointers only: zero cold-tier calls (full texts stay in cold, forget is
+    never called). Pointers younger than STUB_GC_MIN_AGE_DAYS are kept
+    (prevents create-then-collect thrash).
+    """
+    entries = store.entries(target)
+    stubs = []
+    for e in entries:
+        m = metastore.get_entry(e)
+        if m and m.get("type") == "stub":
+            age = entry_age_days(m)
+            stubs.append((age if age is not None else 9999, e))
+    stubs.sort(key=lambda t: -t[0])  # oldest first
+    removed = 0
+    for age, e in stubs:
+        if removed >= MAX_STUB_PER_RUN:
+            break
+        if age < STUB_GC_MIN_AGE_DAYS:
+            continue
+        if store.usage_pct(target) < HARD_THRESHOLD * 100:
+            break
+        before = len(store.entries(target))
+        _safe_remove_local(store, target, e, stat)
+        if len(store.entries(target)) < before:
+            stat["stub_gc"] += 1
+            removed += 1
+
+
+# S3 embedding channel (optional enhancement; unavailable -> lexical-only,
+# overflow never blocks on it)
+def _embed_batch(texts: List[str]) -> Optional[Dict[str, List[float]]]:
+    """Batch embeddings via the OpenAI-compatible endpoint configured in
+    config (MEMORYCORE_EMBED_URL, default ollama /v1); any failure -> None
+    (degrade to lexical-only)."""
+    if not texts:
+        return None
+    try:
+        import json
+        import urllib.request
+        req = urllib.request.Request(
+            MEMORYCORE_EMBED_URL.rstrip("/") + "/embeddings",
+            data=json.dumps({"model": MEMORYCORE_EMBED_MODEL,
+                             "input": texts}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        items = data.get("data") or []
+        if len(items) != len(texts):
+            return None
+        return {t: list(it.get("embedding") or [])
+                for t, it in zip(texts, items)}
+    except Exception:
+        return None
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    """Cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return (dot / (na * nb)) if na > 0 and nb > 0 else 0.0
+
+
 # ---- 主入口 ----------------------------------------------------------------
 
 def run_overflow(store, client, target: str) -> dict:
@@ -84,6 +429,9 @@ def run_overflow(store, client, target: str) -> dict:
         "errors": 0,
         "aged_sunk": 0,          # Phase 2: state entries retired by age
         "metadata_stamped": 0,   # Phase 2: legacy entries stamped by reconcile
+        "stubbed": 0,            # Phase 3 S4: dormant B rules -> stub pointers
+        "stub_gc": 0,            # Phase 3: stub pointers collected (oldest first)
+        "retyped": 0,            # Phase 3 S2: rule -> state completion re-checks
     }
 
     # P4: 收集本次下沉的用户偏好内容, 溢流末统一更新冷层摘要锚点
@@ -197,6 +545,16 @@ def run_overflow(store, client, target: str) -> dict:
         stat["errors"] += 1
         stat["metadata_stamped"] = 0
 
+    # ---- L2 pre-planning (Phase 3): dormant B-class rules under hard
+    # pressure -> stub candidates (evidence chain + LLM dormancy judge) ----
+    stub_candidates: Set[str] = set()
+    if store.usage_pct(target) >= HARD_THRESHOLD * 100:
+        try:
+            stub_candidates = set(_plan_stub_candidates(
+                metastore, client, entries))
+        except Exception:
+            stub_candidates = set()  # planning failure -> no stubbing (degrade)
+
     # ---- Step 2+3+5: 逐条处理 --------------------------------------------
     for entry in entries:
         # Phase 2 (2026-08-16): metadata-first — typed entries retire by
@@ -204,7 +562,8 @@ def run_overflow(store, client, target: str) -> dict:
         # legacy keyword path.
         meta = metastore.get_entry(entry)
         if meta and _handle_typed_entry(store, client, target, entry, meta,
-                                        metastore, stat, anchor_parts):
+                                        metastore, stat, anchor_parts,
+                                        stub_candidates):
             continue
 
         if should_keep_local(entry):
@@ -256,6 +615,15 @@ def run_overflow(store, client, target: str) -> dict:
         else:
             stat["kept"] += 1
 
+    # ---- Step 5.5 (Phase 3): stub GC — no stubs created this run and still
+    # under hard pressure -> collect the oldest pointers (opportunistic) ----
+    if (stat.get("stubbed", 0) == 0
+            and store.usage_pct(target) >= HARD_THRESHOLD * 100):
+        try:
+            _stub_gc(store, metastore, target, stat)
+        except Exception:
+            pass  # GC is opportunistic; never blocks overflow
+
     # ---- Step 6: 验证 ----------------------------------------------------
     if target == "user" and anchor_parts:
         _update_pref_anchor(client, store, anchor_parts, stat)
@@ -271,20 +639,34 @@ def run_overflow(store, client, target: str) -> dict:
 
 def _handle_typed_entry(store, client, target: str, entry: str,
                         meta: dict, metastore, stat: dict,
-                        anchor_parts: List[str]) -> bool:
+                        anchor_parts: List[str],
+                        stub_candidates: Optional[Set[str]] = None) -> bool:
     """Retirement decision for entries that have sidecar metadata.
 
+    - stub: pointer stays forever (GC via Step 5.5; never enters
+      retirement paths).
     - state: age >= STATE_TTL_DAYS -> cold migration via the safe path
       (cold write confirmed before local removal); not expired -> keep.
-    - rule: never sinks by age; >= RULE_COMPRESS_DAYS without update and
-      longer than _COMPRESS_MIN_CHARS -> LLM compression (compressed version
-      stays local, details sink to cold; any failure keeps the original).
+    - rule (Phase 3 tiered protection, 2026-08-20):
+        * S6: A-class / red-line / importance >= 0.9 -> long-compression
+          only; never stub / retype / cross-tier dedup
+        * S2 (L1 >=60%): completion re-check -> retype state -> TTL sink
+        * S5 (L1 >=60%, idle >=30d): cold tier holds an equivalent copy ->
+          drop the hot copy
+        * S4 (L2 >=80%): dormancy confirmed -> full text to cold + stub
+          pointer left locally
+        * existing: >= RULE_COMPRESS_DAYS without update and long -> LLM
+          compression (any failure keeps the original)
     - unknown type -> return False, caller falls back to legacy keywords.
 
     Returns: True = handled (caller continues); False = fall back to legacy.
     """
     etype = meta.get("type")
     age = entry_age_days(meta)
+
+    if etype == "stub":
+        stat["kept"] += 1  # pointer stays; GC via Step 5.5 under hard pressure
+        return True
 
     if etype == "state":
         if age is not None and age >= STATE_TTL_DAYS:
@@ -300,6 +682,33 @@ def _handle_typed_entry(store, client, target: str, entry: str,
         return True
 
     if etype == "rule":
+        protected = _is_protected_rule(entry, meta)
+        usage = store.usage_pct(target)
+
+        # S2 (L1): completion re-check -> retype -> TTL sink (cold failure
+        # restores the original rule stamp)
+        if (not protected and usage >= SOFT_THRESHOLD * 100
+                and _rule_retype_eligible(entry)):
+            _handle_rule_retype(store, client, target, entry, meta,
+                                metastore, stat, anchor_parts)
+            return True
+
+        # S5 (L1): cross-tier redundancy — only probed after
+        # CROSS_DEDUP_MIN_IDLE_DAYS idle (historical-redundancy oriented,
+        # keeps recall overhead low; cold copy confirmed -> drop hot, zero loss)
+        if (not protected and usage >= SOFT_THRESHOLD * 100
+                and age is not None and age >= CROSS_DEDUP_MIN_IDLE_DAYS
+                and _try_cross_layer_dedup(store, client, target, entry, stat)):
+            return True
+
+        # S4 (L2): dormant stub-sink (candidates pre-planned in run_overflow)
+        if (not protected and usage >= HARD_THRESHOLD * 100
+                and stub_candidates is not None
+                and entry in stub_candidates):
+            _handle_rule_stub_sink(store, client, target, entry,
+                                   metastore, stat, anchor_parts)
+            return True
+
         if (age is not None and age >= RULE_COMPRESS_DAYS
                 and len(entry) > _COMPRESS_MIN_CHARS):
             compressed = _llm_compress(client, entry)
@@ -528,11 +937,18 @@ def _smart_ratio(a: str, b: str) -> float:
 
 
 def _merge_local_fragments(entries: List[str]) -> Tuple[List[str], int]:
-    """检测本地同主题碎片并合并。返回 (merged, merge_count)。"""
+    """检测本地同主题碎片并合并。返回 (merged, merge_count)。
+
+    Phase 3 (2026-08-20): stub pointers ([规则指针] prefix) never merge —
+    they share a fixed format prefix, so lexical similarity is naturally
+    >= 0.5 and merging would silently drop pointers. They are opaque
+    retrieval hooks, not prose: merging has zero benefit.
+    """
     if len(entries) <= 1:
         return list(entries), 0
 
     n = len(entries)
+    skip = {i for i, e in enumerate(entries) if e.startswith(STUB_PREFIX)}
     parent = list(range(n))
 
     def find(x):
@@ -546,24 +962,48 @@ def _merge_local_fragments(entries: List[str]) -> Tuple[List[str], int]:
         if ra != rb:
             parent[ra] = rb
 
+    # Phase 3 S3: optional embedding channel (complements lexical; when the
+    # embedding API is down this degrades to lexical-only)
+    mergeable = [e for i, e in enumerate(entries) if i not in skip]
+    emb_map = _embed_batch(mergeable) if len(mergeable) >= 2 else None
     for i in range(n):
+        if i in skip:
+            continue
         for j in range(i + 1, n):
-            ratio = _smart_ratio(entries[i], entries[j])
-            if ratio > _SIMILAR_TOPIC_RATIO:
+            if j in skip:
+                continue
+            sim_ok = _smart_ratio(entries[i], entries[j]) > _SIMILAR_TOPIC_RATIO
+            if not sim_ok and emb_map:
+                va, vb = emb_map.get(entries[i]), emb_map.get(entries[j])
+                if (va is not None and vb is not None
+                        and _cosine(va, vb) >= CLUSTER_EMBED_THRESHOLD):
+                    sim_ok = True
+            if sim_ok:
                 union(i, j)
 
     groups: Dict[int, List[int]] = {}
     for i in range(n):
+        if i in skip:
+            continue
         root = find(i)
         groups.setdefault(root, []).append(i)
 
     merged = []
     merge_count = 0
-    for indices in groups.values():
+    emitted = set()
+    for i in range(n):
+        if i in skip:
+            merged.append(entries[i])
+            continue
+        root = find(i)
+        if root in emitted:
+            continue
+        emitted.add(root)
+        indices = groups[root]
         if len(indices) == 1:
             merged.append(entries[indices[0]])
         else:
-            group_entries = [entries[i] for i in indices]
+            group_entries = [entries[k] for k in indices]
             merged.append(_merge_group(group_entries))
             merge_count += len(indices) - 1
 

@@ -10,3 +10,5 @@ venv/
 build/
 dist/
 
+activity.jsonl
+activity.jsonl.lock

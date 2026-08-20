@@ -217,7 +217,8 @@ hermes config set memory.provider memorycore-prefetch
 - 每条条目被判定为 `state`(历史决策/状态记录)或 `rule`(准则/偏好):
   - `state`:写入 7 天后退役至冷层(可配置 `STATE_TTL_DAYS`)
   - `rule`:永不因年龄退役;30 天未更新的长条目(>200 字)成为 LLM 压缩
-    候选(可配置 `RULE_COMPRESS_DAYS`)
+    候选(可配置 `RULE_COMPRESS_DAYS`)。准则另有失效信号阶梯(见下文)
+    提供可持续出口,不误伤活跃偏好。
 - 条目内容变化 → 键变化 → 下次 reconcile 对内容重新判型并回收孤儿键。
 
 ### 双写入口治理
@@ -234,6 +235,31 @@ hermes config set memory.provider memorycore-prefetch
 每次溢流先 reconcile 元数据(补盖无元数据的存量条目、回收孤儿键),再按
 元数据退役;关键词表降级为无元数据条目的兜底。sidecar 故障自动降级到
 关键词路径,不阻塞溢流。
+
+### rule 失效信号(分层保护)
+
+纯 `rule` 构成的热层按设计没有出口("偏好永不下沉"),因此永不编辑的短准则
+会一直占位、最终塞满热层。MemoryCore 用**压力阶梯**补上出口:每轮溢流实测
+占用(基线),压力越高开放的出口越深(变化)。五个可观测信号只决定"资格与
+排序",压力决定"出不出手":
+
+| 信号 | 观测内容 | 动作 |
+|---|---|---|
+| S1 写入闲置 | sidecar `updated_at` | 压缩(30 天)/ stub(45 天)资格闸门 |
+| S2 完成态复核 | 内嵌日期 ≥60 天 + ≥2 个完成态词 + 零行为指令词 | 误戴 rule 章的历史记录重判为 `state` → 走 7 天 TTL 正常下沉 |
+| S3 同主题聚簇 | 词法相似度(+可选嵌入通道) | 同主题条目合并为一条;合并后变长的条目后续自动获得压缩资格 |
+| S4 主题活性 | 本地查询活动日志(prefetch/recall,滚动 45 天,可选)+ LLM 休眠判定 | 高压下的休眠 B 类准则:全文先写冷层确认,本地留 ≤40 字指针 |
+| S5 跨层冗余 | 冷层召回匹配 | 冷层已有等价全文 → 删本地副本(信息零丢失) |
+
+**分层保护**:A 类元准则(行为/交互/写作风格)、红线类与 importance ≥ 0.9
+的条目永不参与 S2/S4/S5,只允许合并/压缩。stub 指针自带生命周期(高压下
+最老优先回收,冷层零调用),指针不会二次塞满热层。所有出口遵循"先冷层
+后本地":冷层确认成功才动本地,任一失败保留原样。信号缺失(无活动日志、
+无 LLM key)时阶梯整体降级为原有行为,绝不猜测。
+
+常量(`memorycore/core/config.py`):`RULE_RETYPE_DAYS=60`、
+`RULE_STUB_IDLE_DAYS=45`、`ACTIVITY_WINDOW_DAYS=30`、`MAX_STUB_PER_RUN=3`、
+`STUB_MAX_CHARS=40`、`IMPORTANCE_PROTECT=0.9`。
 
 ### 体检工具: memorycore_memory_audit
 
@@ -299,6 +325,7 @@ MemoryCore 在万条级冷层规模下做了完整压力测试与召回优化(�
 | `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | Ollama 或 OpenAI 兼容 embedding API 基地址 |
 | `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding 模型名称(1024 维) |
 | `MEMORY_DIR` | `~/.hermes/memories` | 热层目录(`MEMORY.md` / `USER.md`) |
+| `ACTIVITY_LOG_ENABLED` | `1` | 查询活动日志(主题活性信号采集);设为 `0` 关闭日志并整体禁用 S4 stub-sink |
 | `MNEMOSYNE_TIMEOUT` | `10.0` | 冷层请求超时(远程模式,秒) |
 
 容量常量位于 `memorycore/core/config.py`(`CHAR_LIMIT_*`、`SOFT_THRESHOLD`、`HARD_THRESHOLD`、`TARGET_RATIO`)。

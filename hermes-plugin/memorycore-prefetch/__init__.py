@@ -68,6 +68,7 @@ try:
     from memorycore.core.overflow import run_overflow  # noqa: E402
     from memorycore.core.decay import _apply_decay  # noqa: E402
     from memorycore.core.metadata import direct_write_govern  # noqa: E402
+    from memorycore.core.metadata import log_activity_query  # noqa: E402  # Phase 3 S4
 except ImportError:
     _REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     sys.path.insert(0, _REPO_ROOT)
@@ -82,6 +83,7 @@ except ImportError:
     from memorycore.core.overflow import run_overflow  # noqa: E402
     from memorycore.core.decay import _apply_decay  # noqa: E402
     from memorycore.core.metadata import direct_write_govern  # noqa: E402
+    from memorycore.core.metadata import log_activity_query  # noqa: E402  # Phase 3 S4
 
 _RECALL_CANDIDATES = 20    # first-stage recall candidates (dense-only, 2026-08-11)
 _INJECT_TOP_N = 5          # max injected after dense ranking
@@ -348,6 +350,7 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         q = self._preprocess_query(query)
         if not q:
             return ""
+        log_activity_query(q)  # Phase 3 S4: topic-activity collection
         try:
             client = ColdStoreClient(timeout=_PREFETCH_TIMEOUT)
             results = client.recall_results(q, top_k=_RECALL_CANDIDATES)

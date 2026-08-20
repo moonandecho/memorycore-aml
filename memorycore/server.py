@@ -18,7 +18,7 @@ from .core.config import (SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOF
                          STATE_TTL_DAYS, RULE_COMPRESS_DAYS)
 from .core.classifier import (classify, classify_user_pref, should_keep_local,  # noqa: E402
                              classify_entry_type, COLD, STALE)
-from .core.metadata import MetaStore, entry_age_days  # noqa: E402
+from .core.metadata import MetaStore, entry_age_days, log_activity_query  # noqa: E402  # Phase 3 S4
 from .core.overflow import run_overflow, _recall_safe, _find_best_match, _merge_two_entries  # noqa: E402
 from .core.maintenance import run_maintenance  # noqa: E402
 from .core.decay import _apply_decay  # noqa: E402  # shared by recall + prefetch
@@ -189,8 +189,12 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
         r = _store.add(t, content)
         if r.get("success"):
             # Phase 2: stamp sidecar metadata after a successful hot write
+            # Phase 3 S6: importance passes through (protection line;
+            # missing field defaults to 0.8, backward compatible)
             try:
-                _metastore_for(t).stamp(content, "rule", origin="store_fact")
+                _metastore_for(t).stamp(content, "rule",
+                                        importance=importance,
+                                        origin="store_fact")
             except Exception:
                 pass  # metadata failure never blocks the write (reconcile re-stamps)
             return json.dumps({"status": "stored", "target": t,
@@ -308,6 +312,11 @@ def memorycore_memory_audit(target: str = "both") -> str:
                     else:
                         row["plan"] = f"sink_in_{STATE_TTL_DAYS - (age or 0)}d"
                         keep = True  # not expired: still kept for now
+                elif m.get("type") == "stub":
+                    # Phase 3 S4: pointer stays; oldest-first GC under hard
+                    # pressure (full text lives in the cold tier)
+                    row["plan"] = "stub_pointer (gc_oldest_on_hard_pressure)"
+                    keep = True
                 else:
                     row["plan"] = f"keep (compress after {RULE_COMPRESS_DAYS}d)"
                     keep = True
@@ -349,6 +358,7 @@ def memorycore_recall(query: str, top_k: int = 3) -> str:
     """
     try:
         k = max(1, min(int(top_k), 10))
+        log_activity_query(query)  # Phase 3 S4: topic-activity collection
         results = _client.recall_results(query, top_k=k)
         results = _apply_decay(results)
         return json.dumps({"results": results}, ensure_ascii=False)

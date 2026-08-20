@@ -241,7 +241,9 @@ instead of piling up:
     (configurable: `STATE_TTL_DAYS`)
   - `rule`: never retires by age; after 30 days without an update, long
     entries (>200 chars) become LLM-compression candidates
-    (configurable: `RULE_COMPRESS_DAYS`)
+    (configurable: `RULE_COMPRESS_DAYS`). Rules also get a sustainable exit
+    through the invalidation-signal ladder below — without ever
+    mis-retiring an active preference.
 - When an entry's content changes, its key changes — the next reconcile
   re-types the new content and garbage-collects orphaned keys.
 
@@ -266,6 +268,38 @@ Each overflow run first reconciles metadata (stamps untyped legacy entries,
 garbage-collects orphans), then retires entries by metadata — keywords only
 remain as the fallback for untyped entries. A sidecar failure degrades to
 the keyword path and never blocks the overflow.
+
+### Rule invalidation signals (tiered protection)
+
+A hot tier made of pure `rule` entries has no exit by design ("never sink
+a preference"), so short rules that are never edited would otherwise stay
+forever and eventually fill the tier. MemoryCore closes that gap with a
+**pressure ladder**: every overflow run measures the real usage (the
+baseline) and opens deeper exits as pressure rises (the response). Five
+observable signals decide *eligibility and ordering* — pressure decides
+*whether to act*:
+
+| Signal | What it observes | Action |
+|---|---|---|
+| S1 idle time | `updated_at` in the sidecar | eligibility gate for compression (30d) and stub-sink (45d) |
+| S2 completion re-check | embedded date ≥ 60d + ≥ 2 completion markers + zero behavior words | a historical record mis-typed as `rule` is restamped `state` → normal 7-day TTL sink |
+| S3 same-topic clustering | lexical similarity (+ optional embedding channel) | same-topic entries merge into one; merged long entries become compression candidates later |
+| S4 topic activity | local query-activity log (prefetch/recall, rolling 45 days, optional) + LLM dormancy judge | dormant B-class rules under hard pressure: full text to the cold tier (confirmed first), a ≤40-char pointer stub stays hot |
+| S5 cross-tier redundancy | cold-tier recall match | an equivalent cold copy already exists → drop the hot copy (zero information loss) |
+
+**Tiered protection**: A-class meta-rules (behavior / interaction /
+writing-style precepts), red-line rules and importance ≥ 0.9 entries never
+take S2/S4/S5 — they only merge or compress. Stub pointers have a lifecycle
+of their own (oldest-first GC under hard pressure; the cold tier is never
+touched), so pointers cannot fill the tier a second time. Every exit is
+*cold-write-first*: the local entry changes only after the cold tier
+confirms, and any failure keeps the original. When a signal is unavailable
+(no activity log, no LLM key), the ladder degrades to the previous
+behaviour instead of guessing.
+
+Constants (`memorycore/core/config.py`): `RULE_RETYPE_DAYS=60`,
+`RULE_STUB_IDLE_DAYS=45`, `ACTIVITY_WINDOW_DAYS=30`, `MAX_STUB_PER_RUN=3`,
+`STUB_MAX_CHARS=40`, `IMPORTANCE_PROTECT=0.9`.
 
 ### Health check: memorycore_memory_audit
 
@@ -350,6 +384,7 @@ See [examples/cold-store-contract.md](examples/cold-store-contract.md) for the f
 | `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | Ollama or OpenAI-compatible embedding API base URL |
 | `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding model name (1024-dim) |
 | `MEMORY_DIR` | `~/.hermes/memories` | Hot-tier directory (`MEMORY.md` / `USER.md`) |
+| `ACTIVITY_LOG_ENABLED` | `1` | Query-activity log for topic-activity signals; `0` disables the log and S4 stub-sink entirely |
 | `MNEMOSYNE_TIMEOUT` | `10.0` | Cold-tier request timeout (remote mode, seconds) |
 
 Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_THRESHOLD`, `HARD_THRESHOLD`, `TARGET_RATIO`).

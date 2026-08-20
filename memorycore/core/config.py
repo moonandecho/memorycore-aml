@@ -103,3 +103,58 @@ STATE_TTL_DAYS = 7
 RULE_COMPRESS_DAYS = 30
 # sidecar metadata filename suffix: MEMORY.md -> MEMORY.meta.json
 META_SUFFIX = ".meta.json"
+
+# ---- rule invalidation signals (Phase 3, 2026-08-20) ----
+# Tiered protection: B-class rules (domain/project preferences) may be
+# retired by layered evidence (merge / compress / sink / dedup); A-class
+# meta-rules (behavior/interaction/writing-style precepts), red-line rules
+# and high-importance entries are never touched (only merge/compress).
+
+# S2 completion re-check (rule -> state retype: historical decision records
+# wearing rule metadata)
+RULE_RETYPE_DAYS = 60              # embedded date must be >= N days old
+RULE_RETYPE_MIN_DONE_MARKERS = 2   # completion-marker hits required
+RULE_RETYPE_DONE_MARKERS = [
+    # same source as classifier done_markers + audit/fix/finalize extensions
+    "拍板", "已配置", "已停", "已切换", "已退役", "退役", "已装", "已加",
+    "停训", "停用", "已删", "已完成", "半搬", "已重开", "已停用", "已清除",
+    "已启用", "已禁用", "已定稿", "已定案",
+    "已修", "已禁", "已关闭", "已修复", "已固化", "已改用", "已迁",
+    "已落", "已建", "已改", "已切", "已恢复", "已回退", "不再使用", "无入侵",
+]
+RULE_RETYPE_BEHAVIOR_MARKERS = [
+    # hard condition: zero behavior-directive words (same source as
+    # classifier behavior_markers + F4 pending-prefix exclusions)
+    "用户要求我", "用户偏好", "红线", "禁止", "习惯", "行为准则",
+    "用户纠正", "交互习惯", "写作风格", "回答风格", "零容忍", "PM准则",
+    "准则", "偏好",
+    "未定稿", "未拍板", "未定案", "待定稿", "待拍板", "待定案", "需用户拍板",
+]
+
+# S4 topic-activity proxy + stub-sink (dormant B-class rule -> full text to
+# cold tier + small pointer stub left in the hot tier)
+RULE_STUB_IDLE_DAYS = 45           # stub eligibility: days without update
+ACTIVITY_WINDOW_DAYS = 30          # topic-dormancy window
+# Set ACTIVITY_LOG_ENABLED=0 to disable the query activity log; S4 stub-sink
+# is then disabled entirely (mechanism degrades to previous behaviour).
+ACTIVITY_LOG_ENABLED = os.environ.get("ACTIVITY_LOG_ENABLED", "1") != "0"
+ACTIVITY_LOG_RETENTION_DAYS = 45   # log rolling retention
+ACTIVITY_LOG_MAX_BYTES = 256 * 1024
+ACTIVITY_LOG_FILE = MEMORY_DIR / "activity.jsonl"
+MAX_STUB_PER_RUN = 3               # stubs per overflow run (gradual, never drains)
+STUB_MAX_CHARS = 40                # pointer length cap
+STUB_PREFIX = "[规则指针]"          # pointer prefix: identification / reconcile anchor
+STUB_GC_MIN_AGE_DAYS = 1           # stub GC min age (no create-then-collect thrash)
+
+# S5 cross-tier redundancy cleanup (cold tier already holds an equivalent
+# copy -> drop the hot copy; only probed after this many idle days to keep
+# overflow cheap)
+CROSS_DEDUP_MIN_IDLE_DAYS = RULE_COMPRESS_DAYS
+
+# S6 protection line: importance >= this = explicitly high value, protected
+# like A-class / red-line rules
+IMPORTANCE_PROTECT = 0.9
+
+# S3 clustering embedding channel (optional enhancement; falls back to
+# lexical-only when the embedding API is unavailable)
+CLUSTER_EMBED_THRESHOLD = 0.85

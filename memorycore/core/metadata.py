@@ -25,12 +25,15 @@ import json
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .classifier import classify_entry_type
-from .config import MEMORY_FILE, USER_FILE, META_SUFFIX
+from .config import (MEMORY_FILE, USER_FILE, META_SUFFIX,
+                     ACTIVITY_LOG_ENABLED, ACTIVITY_LOG_RETENTION_DAYS,
+                     ACTIVITY_LOG_MAX_BYTES, ACTIVITY_LOG_FILE,
+                     ACTIVITY_WINDOW_DAYS, STUB_PREFIX)
 
 _EMBEDDED_DATE_RE = re.compile(r"20\d\d-\d\d-\d\d")
 
@@ -133,10 +136,13 @@ class MetaStore:
     def stamp(self, content: str, entry_type: str,
               written_at: Optional[datetime] = None,
               updated_at: Optional[datetime] = None,
-              origin: str = "hermes") -> Dict[str, Any]:
+              origin: str = "hermes",
+              importance: float = 0.8) -> Dict[str, Any]:
         """盖章/覆盖盖章一条元数据 (updated_at 缺省 = now)。返回写入的元数据。
 
         updated_at 参数供测试回填历史时间 (rule 压缩年龄门) 与特殊场景使用。
+        importance: Phase 3 S6 protection-line field (default 0.8, backward
+        compatible — older sidecars lack it and are read as 0.8).
         """
         now = datetime.now(timezone.utc)
         meta = {
@@ -144,6 +150,7 @@ class MetaStore:
             "written_at": _iso(written_at or now),
             "updated_at": _iso(updated_at or now),
             "origin": origin,
+            "importance": importance,
         }
         with self._lock():
             data = self._load_unlocked()
@@ -168,7 +175,11 @@ class MetaStore:
                 h = self._hash(e)
                 current[h] = True
                 if h not in data:
-                    etype = classify_entry_type(e)
+                    # Phase 3 S4: stub-prefix recognition (reconcile backstop
+                    # when the stamp failed — keeps stub pointers from being
+                    # re-classified as rules and entering retirement paths)
+                    etype = ("stub" if e.startswith(STUB_PREFIX)
+                             else classify_entry_type(e))
                     data[h] = {
                         "type": etype,
                         "written_at": _iso(parse_embedded_date(e) or now),
@@ -255,10 +266,17 @@ def direct_write_govern(store, client, target: str, content: str,
     metastore = MetaStore(target, memory_path=store.memory_path,
                           user_path=store.user_path)
     etype = classify_entry_type(content)
+    # Phase 3: stub pointer prefix wins (restored/edited pointers stay
+    # stub-typed, never enter retirement paths)
+    if content.startswith(STUB_PREFIX):
+        etype = "stub"
 
     if etype == "rule":
         metastore.stamp(content, "rule", origin="hermes")
         return {"status": "stamped_rule"}
+    if etype == "stub":
+        metastore.stamp(content, "stub", origin="hermes")
+        return {"status": "stamped_stub"}
 
     # state: 冷迁移 (与 overflow _handle_cold_migration 同安全语义)
     # 惰性导入防环: overflow.py 顶层导入本模块, 这里运行时再取共享原语。
@@ -305,3 +323,135 @@ def direct_write_govern(store, client, target: str, content: str,
 
     metastore.stamp(content, "state", origin="hermes")
     return {"status": "kept_hot_backstop", "reason": "cold_write_failed"}
+
+
+# ---- Phase 3 S4: topic-activity log (query collection) --------------------
+
+def log_activity_query(query: str) -> None:
+    """Append one query line to the activity log ({ts, query}, truncated to
+    200 chars); any failure is silently ignored.
+
+    Collected by: the memorycore-prefetch plugin on every prefetch(query)
+    and by memorycore_recall(query).
+    Privacy: local-only log, rolling retention (45 days / 256KB cap),
+    ACTIVITY_LOG_ENABLED=0 disables it (S4 stub-sink is then disabled too
+    and the whole mechanism degrades to previous behaviour).
+    """
+    if not ACTIVITY_LOG_ENABLED:
+        return
+    q = (query or "").strip()
+    if not q:
+        return
+    try:
+        ACTIVITY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"ts": _iso(datetime.now(timezone.utc)),
+                           "query": q[:200]}, ensure_ascii=False)
+        # Append and rolling compaction share one flock: os.replace swaps the
+        # inode, so a bare append could write into the replaced old file and
+        # lose the line (rare, but one lock removes the race).
+        lock_path = Path(str(ACTIVITY_LOG_FILE) + ".lock")
+        fd = open(lock_path, "a+", encoding="utf-8")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            with open(ACTIVITY_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fd.close()
+    except Exception:
+        return
+    try:
+        if os.path.getsize(ACTIVITY_LOG_FILE) > ACTIVITY_LOG_MAX_BYTES:
+            _compact_activity_log()
+    except Exception:
+        pass
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomic text write (tempfile + os.replace, same pattern as LocalStore)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                               prefix=".memorycore-act-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _compact_activity_log() -> None:
+    """Rolling compaction: keep only lines within RETENTION days and at most
+    80% of the size cap (flock against concurrent processes)."""
+    lock_path = Path(str(ACTIVITY_LOG_FILE) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "a+", encoding="utf-8")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        try:
+            with open(ACTIVITY_LOG_FILE, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=ACTIVITY_LOG_RETENTION_DAYS)
+        kept = []
+        for ln in reversed(lines):
+            try:
+                ts = _parse_iso(json.loads(ln).get("ts"))
+            except Exception:
+                continue
+            if ts is not None and ts >= cutoff:
+                kept.append(ln)
+        kept.reverse()
+        budget = int(ACTIVITY_LOG_MAX_BYTES * 0.8)
+        tail = []
+        used = 0
+        for ln in reversed(kept):
+            used += len(ln.encode("utf-8")) + 1
+            if used > budget:
+                break
+            tail.append(ln)
+        tail.reverse()
+        _atomic_write_text(ACTIVITY_LOG_FILE,
+                           "\n".join(tail) + ("\n" if tail else ""))
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fd.close()
+
+
+def load_recent_queries(days: Optional[int] = None) -> List[str]:
+    """Query texts from the last N days (S4 dormancy-check input).
+
+    Missing/corrupt log or no samples in window -> [] (callers treat every
+    entry as active — conservative, stubbing stays off).
+    """
+    if not ACTIVITY_LOG_ENABLED:
+        return []
+    days = ACTIVITY_WINDOW_DAYS if days is None else days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out: List[str] = []
+    try:
+        with open(ACTIVITY_LOG_FILE, encoding="utf-8") as f:
+            for ln in f:
+                try:
+                    d = json.loads(ln)
+                    ts = _parse_iso(d.get("ts"))
+                    if ts is not None and ts >= cutoff:
+                        q = (d.get("query") or "").strip()
+                        if q:
+                            out.append(q)
+                except Exception:
+                    continue
+    except OSError:
+        return []
+    return out

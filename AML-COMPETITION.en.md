@@ -1,7 +1,7 @@
 # AML Competition Entry (Cycle 2) — MemoryCore (Online Memory Governance)
 
 > Submission draft: method disclosure / architecture / deployment / tests.
-> Route: Open-Method Leaderboard + Academic · Code (public GitHub repo + Docker startup, platform builds and evaluates).
+> Route: Open-Method Leaderboard + Academic · Code route (public GitHub repo + Docker startup, platform builds and evaluates).
 
 ## 1. Method (technical approach)
 

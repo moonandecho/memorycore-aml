@@ -98,8 +98,13 @@ def judge_dedup(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 def judge_stale(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Judge whether long entries (>80 chars) with "落地中/进行中" markers
-    are actually stale (the in-progress matter has completed).
+    """Judge whether long entries (>80 chars) carrying stale/in-progress
+    markers are actually stale.
+
+    Covers both marker classes (in-progress: 落地中/进行中/规划中/待定/未完成;
+    completed-state: 已修复/已解决/已退役/已停用/已废弃/不再使用/...).
+    A stale word is often just historical background inside an otherwise
+    valuable entry — such entries stay not_stale (prefer keeping).
 
     Args:
         entries: 1-5 candidate entries [{id, content}, ...]
@@ -118,15 +123,16 @@ def judge_stale(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         items.append(f"[{cid}] {content}")
 
     prompt = (
-        "你是记忆过时判定助手。以下是 1-5 条冷层记忆条目, 包含\"落地中/进行中\"等 "
-        "进行时状态标记, 但这些条目较长 (>80字), 可能只是部分内容过时。"
-        "请判断这些条目中\"进行时\"部分描述的事项是否已实际完成/过时:\n\n"
+        "你是记忆过时判定助手。以下是 1-5 条冷层记忆条目, 它们包含过时/进行时状态标记"
+        "(如: 落地中/进行中/规划中/待定/未完成/已修复/已解决/已切换/已退役/已停用/"
+        "已迁移/已删除/已完成/不再使用/已废弃), 但这些条目较长 (>80字), 过时词可能只是"
+        "条目内描述的历史背景, 条目本身仍是有保留价值的方案/事实/决策记录。\n\n"
         + "\n\n".join(items)
         + "\n\n判定规则:\n"
-        "1. 如果\"落地中/进行中\"描述的事项显然已经完成 (例如提到的时间已过、"
-        "引用的版本已升级、关联的项目已完成) → stale\n"
-        "2. 如果无法确定是否完成、或只是背景信息中偶尔出现进行时词 → not_stale\n"
-        "3. 如果拿不准 → not_stale (宁留不误删)\n"
+        "1. 如果条目整体就是一个已完成的过时状态记录(如\"某某已停用, 不再使用\"), 保留无价值 → stale\n"
+        "2. 如果过时词只是描述条目中的部分历史背景(如\"旧方案已退役, 新方案是...\"、"
+        "\"延迟已修复\"、\"旧服务已停用但替代方案如下\"), 条目本身仍有保留价值 → not_stale\n"
+        "3. 如果无法确定、或条目混合了有价值内容与过时描述 → not_stale (宁留不误删)\n"
         '4. 只输出 JSON: {"decision": "stale"|"not_stale", '
         '"stale_ids": ["已过时的条目id", ...], '
         '"reason": "一句话判据"}\n'

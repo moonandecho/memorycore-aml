@@ -15,9 +15,11 @@ Storage: single JSON file, atomic writes. Default path ~/.memorycore/trash.json
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -70,6 +72,34 @@ class TrashStore:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
+    # -- concurrency lock ------------------------------------------
+
+    @contextmanager
+    def _file_lock(self):
+        """Cross-process / cross-thread exclusive lock via a dedicated
+        .lock file (same fcntl.flock pattern as local_store.py).
+
+        add/remove perform load → modify → save read-modify-write cycles;
+        this lock serializes them so concurrent writers (e.g. a background
+        prefetch thread vs. the maintenance pass) cannot lose updates.
+        The lock file is never replaced via os.replace, so its inode (and
+        therefore the lock domain) stays stable; flock is tied to the open
+        file description, so separate open() calls within the same process
+        (threads) also exclude each other.
+        """
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield fd
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except (OSError, IOError):
+                pass
+            fd.close()
+
     # -- operations -----------------------------------------------
 
     def add(
@@ -80,34 +110,36 @@ class TrashStore:
         source_decision: str = "llm_not_stale",
     ) -> None:
         """Add an entry to the bin (dedupe by memory_id: re-trash updates)."""
-        data = self._load()
-        existing = [e for e in data["entries"] if e.get("memory_id") == memory_id]
-        if existing:
-            for e in existing:
-                e["trashed_at"] = datetime.now(tz=timezone.utc).isoformat()
-                e["reason"] = reason
-                e["source_decision"] = source_decision
-        else:
-            data["entries"].append({
-                "memory_id": memory_id,
-                "content": content[:300],  # truncated, enough for recall queries
-                "trashed_at": datetime.now(tz=timezone.utc).isoformat(),
-                "reason": reason,
-                "source_decision": source_decision,
-            })
-        self._save(data)
+        with self._file_lock():
+            data = self._load()
+            existing = [e for e in data["entries"] if e.get("memory_id") == memory_id]
+            if existing:
+                for e in existing:
+                    e["trashed_at"] = datetime.now(tz=timezone.utc).isoformat()
+                    e["reason"] = reason
+                    e["source_decision"] = source_decision
+            else:
+                data["entries"].append({
+                    "memory_id": memory_id,
+                    "content": content[:300],  # truncated, enough for recall queries
+                    "trashed_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "reason": reason,
+                    "source_decision": source_decision,
+                })
+            self._save(data)
 
     def remove(self, memory_id: str) -> bool:
         """Remove from bin (after revival or expiry purge). Returns success."""
-        data = self._load()
-        before = len(data["entries"])
-        data["entries"] = [
-            e for e in data["entries"] if e.get("memory_id") != memory_id
-        ]
-        if len(data["entries"]) < before:
-            self._save(data)
-            return True
-        return False
+        with self._file_lock():
+            data = self._load()
+            before = len(data["entries"])
+            data["entries"] = [
+                e for e in data["entries"] if e.get("memory_id") != memory_id
+            ]
+            if len(data["entries"]) < before:
+                self._save(data)
+                return True
+            return False
 
     def get_all(self) -> List[Dict[str, Any]]:
         """All entries currently in the bin."""

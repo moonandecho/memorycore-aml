@@ -208,8 +208,16 @@ class LocalBackend:
                channel_id: Optional[str] = None,
                source: Optional[str] = None,
                from_date: Optional[str] = None,
-               to_date: Optional[str] = None) -> Dict[str, Any]:
+               to_date: Optional[str] = None,
+               bump: bool = True) -> Dict[str, Any]:
         """Semantic recall. Returns {status, results: [...]} matching remote.
+
+        bump: True (default) keeps the engine's recall-bump side effects
+        (recall_count/last_recalled refresh); False requests a read-only
+        recall so governance enumeration/prescreen does not pollute
+        last_recalled freshness. On stock mnemosyne-memory builds without
+        the bump_recalled kwarg the read-only mode degrades to a plain
+        recall (governance still works, freshness tracking only).
 
         Each result dict carries the same keys the remote backend returns:
         id, content, dense_score, keyword_score, fts_score, importance.
@@ -231,7 +239,15 @@ class LocalBackend:
             kwargs["from_date"] = from_date
         if to_date is not None:
             kwargs["to_date"] = to_date
-        items = self._engine.recall(query, top_k=top_k, **kwargs)
+        if bump:
+            items = self._engine.recall(query, top_k=top_k, **kwargs)
+        else:
+            try:
+                items = self._engine.recall(
+                    query, top_k=top_k, bump_recalled=False, **kwargs)
+            except TypeError:
+                # stock mnemosyne-memory lacks bump_recalled → degrade
+                items = self._engine.recall(query, top_k=top_k, **kwargs)
         results = []
         for it in items:
             results.append({
@@ -253,13 +269,17 @@ class LocalBackend:
                        channel_id: Optional[str] = None,
                        source: Optional[str] = None,
                        from_date: Optional[str] = None,
-                       to_date: Optional[str] = None) -> List[Dict[str, Any]]:
+                       to_date: Optional[str] = None,
+                       bump: bool = True) -> List[Dict[str, Any]]:
         """Convenience: return just the results list (parsed, same shape
-        as ColdStoreClient.recall_results for remote)."""
+        as ColdStoreClient.recall_results for remote).
+
+        bump=False → read-only recall (see recall())."""
         raw = self.recall(query, top_k=top_k,
                           author_id=author_id, author_type=author_type,
                           channel_id=channel_id, source=source,
-                          from_date=from_date, to_date=to_date)
+                          from_date=from_date, to_date=to_date,
+                          bump=bump)
         return raw.get("results", [])
 
     # -- update ---------------------------------------------------------
@@ -526,7 +546,8 @@ class RemoteBackend:
                channel_id: Optional[str] = None,
                source: Optional[str] = None,
                from_date: Optional[str] = None,
-               to_date: Optional[str] = None) -> Dict[str, Any]:
+               to_date: Optional[str] = None,
+               bump: bool = True) -> Dict[str, Any]:
         args = _drop_none({
             "query": query, "top_k": top_k,
             "author_id": author_id,
@@ -536,6 +557,11 @@ class RemoteBackend:
             "from_date": from_date,
             "to_date": to_date,
         })
+        # Read-only recall: only send the flag when explicitly requested.
+        # The default path stays wire-compatible with older mnemosyne MCP
+        # servers (bump_recalled defaults to True there anyway).
+        if not bump:
+            args["bump_recalled"] = False
         return self._call_tool("recall", args)
 
     def recall_results(self, query: str, top_k: int = 5,
@@ -544,8 +570,11 @@ class RemoteBackend:
                        channel_id: Optional[str] = None,
                        source: Optional[str] = None,
                        from_date: Optional[str] = None,
-                       to_date: Optional[str] = None) -> List[Dict[str, Any]]:
+                       to_date: Optional[str] = None,
+                       bump: bool = True) -> List[Dict[str, Any]]:
         """Parse recall response into structured list.
+
+        bump=False → read-only recall (see recall())."
 
         Returns [{id, content, dense_score, keyword_score, fts_score,
                   importance}, ...]
@@ -553,7 +582,8 @@ class RemoteBackend:
         raw = self.recall(query, top_k=top_k,
                           author_id=author_id, author_type=author_type,
                           channel_id=channel_id, source=source,
-                          from_date=from_date, to_date=to_date)
+                          from_date=from_date, to_date=to_date,
+                          bump=bump)
 
         # _call_tool already tried json.loads + ast.literal_eval
         if "raw" in raw and len(raw) == 1:
@@ -705,12 +735,14 @@ class ColdStoreClient:
                channel_id: Optional[str] = None,
                source: Optional[str] = None,
                from_date: Optional[str] = None,
-               to_date: Optional[str] = None) -> Dict[str, Any]:
+               to_date: Optional[str] = None,
+               bump: bool = True) -> Dict[str, Any]:
         return self._backend.recall(
             query, top_k=top_k,
             author_id=author_id, author_type=author_type,
             channel_id=channel_id, source=source,
             from_date=from_date, to_date=to_date,
+            bump=bump,
         )
 
     def recall_results(self, query: str, top_k: int = 5,
@@ -719,12 +751,14 @@ class ColdStoreClient:
                        channel_id: Optional[str] = None,
                        source: Optional[str] = None,
                        from_date: Optional[str] = None,
-                       to_date: Optional[str] = None) -> List[Dict[str, Any]]:
+                       to_date: Optional[str] = None,
+                       bump: bool = True) -> List[Dict[str, Any]]:
         return self._backend.recall_results(
             query, top_k=top_k,
             author_id=author_id, author_type=author_type,
             channel_id=channel_id, source=source,
             from_date=from_date, to_date=to_date,
+            bump=bump,
         )
 
     def update(self, memory_id: str, content: str,

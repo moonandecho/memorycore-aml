@@ -726,16 +726,12 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int
                 if m not in _LONG_STALE_MARKERS
             )
 
-            if has_regular_stale:
-                # 含常规过时标记 (已修复等) → 直接 forget
-                try:
-                    client.forget(entry["id"])
-                    cleaned += 1
-                    forgotten_ids.add(entry["id"])
-                except Exception:
-                    pass
-            elif has_progress:
-                # 只有进行时标记 → 交 LLM
+            if has_regular_stale or has_progress:
+                # Long entries with any stale/in-progress marker → LLM judges
+                # the whole entry (a stale word is often mere historical
+                # background inside an otherwise valuable memory; direct
+                # forget misdeletes it). Judge failures land in the recycle
+                # bin as stale_candidate for observation.
                 stale_candidates.append(entry)
 
     # ---- LLM 确认 (分批 ≤5) ----

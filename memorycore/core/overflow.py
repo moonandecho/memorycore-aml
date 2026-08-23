@@ -765,7 +765,7 @@ def _update_pref_anchor(client, store, new_parts: List[str], stat: dict) -> None
     # 查已有锚点
     anchor_item = None
     try:
-        for m in client.recall_results(_ANCHOR_QUERY, top_k=5):
+        for m in client.recall_results(_ANCHOR_QUERY, top_k=5, bump=False):  # 内部锚点维护, 只读
             if _ANCHOR_PREFIX in (m.get("content") or ""):
                 anchor_item = m
                 break
@@ -902,19 +902,30 @@ def _handle_cold_migration(store, client, target: str, entry: str,
 # ---- Step 3: 过时处理 ----------------------------------------------------
 
 def _handle_stale(store, client, target: str, entry: str, stat: dict) -> None:
-    """过时条目: 尝试 forget 冷层匹配, 然后删本地。"""
+    """过时条目: 冷层匹配条目先进回收站再 forget, 然后删本地。
+
+    与治理路径 (_clean_stale 短条目) 对齐 — forget 前写入 TrashStore,
+    保留 30 天恢复窗口。reason 按长度分级: ≤80 字 stale_short,
+    >80 字 stale_long; source_decision 统一 rule_stale (同治理路径语义)。
+    """
     try:
         existing = _recall_safe(client, entry)
         if existing:
+            reason = "stale_short" if len(entry) <= 80 else "stale_long"
             for ex in existing:
                 ratio = difflib.SequenceMatcher(
                     None, entry, ex.get("content", "")
                 ).ratio()
                 if ratio > _SAME_FACT_RATIO:
                     try:
+                        from ..trash_store import TrashStore
+                        TrashStore().add(
+                            ex["id"], ex.get("content", ""),
+                            reason=reason,
+                            source_decision="rule_stale")
                         client.forget(ex["id"])
                     except Exception:
-                        pass  # forget 失败不阻塞
+                        pass  # forget 失败不阻塞 (回收站已有备份)
     except Exception:
         pass  # 冷层不可达, 至少删本地
 
@@ -1271,7 +1282,10 @@ def _recall_safe(client, entry: str) -> List[Dict[str, Any]]:
         query = entry[:150] + " " + entry[-100:]
     else:
         query = entry[:200]
-    return client.recall_results(query, top_k=_RECALL_TOP_K)
+    # 内部查重召回只读 — _recall_safe 仅服务溢流内部决策路径
+    # (跨层查重/下沉匹配/冷迁移/过时处理), 不服务用户召回路径;
+    # bump=False 避免污染 last_recalled (与治理枚举同根因)。
+    return client.recall_results(query, top_k=_RECALL_TOP_K, bump=False)
 
 
 def _find_best_match(entry: str,

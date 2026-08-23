@@ -12,3 +12,6 @@ dist/
 
 activity.jsonl
 activity.jsonl.lock
+
+# recycle-bin lock file (TrashStore flock)
+trash.json.lock

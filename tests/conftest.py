@@ -52,10 +52,11 @@ class MockMnemosyneClient:
         self.forgotten = []
         self._next_id = 0
 
-    def recall_results(self, query, top_k=5):
+    def recall_results(self, query, top_k=5, bump=True):
         if self._fail_recall:
             raise RuntimeError("cold tier unreachable (mock)")
         self.recall_queries.append(query)
+        self.recall_bumps = getattr(self, "recall_bumps", []) + [bump]
         return [{"id": f"c{i}", "content": c.get("content"),
                  "dense_score": c.get("dense_score", 0.0)}
                 for i, c in enumerate(self._cold)]

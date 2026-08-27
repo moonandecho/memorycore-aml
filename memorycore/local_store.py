@@ -10,6 +10,7 @@
 """
 import fcntl
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,6 +20,46 @@ ENTRY_DELIMITER = "\n§\n"
 MEMORY_DIR = Path(os.path.expanduser("~/.hermes/memories"))
 MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 USER_FILE = MEMORY_DIR / "USER.md"
+
+
+def normalize_for_compare(content: str) -> str:
+    """内容归一化 (仅用于比较, 写入仍存原始内容) — 2026-08-28 可复用原语。
+
+    规则:
+      1. 全角字符 → 半角: U+3000 (全角空格) → 空格; U+FF01-U+FF5E → 减 0xFEE0
+         (覆盖 ，！？：；（）～及全角字母数字); 显式映射表覆盖 CJK 标点块
+         (。、—…「」『』【】) 与排版引号 (“”‘’)
+      2. 连续空白折叠为单空格 (正则空白+ → 单空格)
+      3. 删除紧跟标点后的空格 (\", xxx\" 与 \"，xxx\" 变体等价 — 半角逗号输入
+         习惯性带空格, 全角不带, 不处理则仍能绕过去重)
+      4. strip
+
+    供 local_store.add 去重 / prefetch 热层去重 / stub 查找等场景共用
+    (单一真相源)。写入仍存原始内容, 归一化只进比较。
+    """
+    _EXTRA_MAP = {
+        0x3001: ",",    # 、
+        0x3002: ".",    # 。
+        0x300C: "[", 0x300D: "]",   # 「」
+        0x300E: "[", 0x300F: "]",   # 『』
+        0x3010: "[", 0x3011: "]",   # 【】
+        0x2018: "'", 0x2019: "'",   # ’‘
+        0x201C: '"', 0x201D: '"',   # “”
+        0x2026: "...",              # …
+    }
+    out = []
+    for ch in (content or ""):
+        o = ord(ch)
+        if o == 0x3000:
+            out.append(" ")
+        elif 0xFF01 <= o <= 0xFF5E:
+            out.append(chr(o - 0xFEE0))
+        else:
+            out.append(_EXTRA_MAP.get(o, ch))
+    text = re.sub(r"\s+", " ", "".join(out))
+    # 步骤 3: 删除紧跟半角标点后的空格 (折叠后至多单空格)
+    text = re.sub(r"(?<=[,.;:!?~])\s", "", text)
+    return text.strip()
 
 
 class LocalStore:
@@ -70,7 +111,8 @@ class LocalStore:
         path = self._path_for(target)
         with self._file_lock(path):
             entries = self.entries(target)
-            if content in entries:
+            norm = normalize_for_compare(content)
+            if any(normalize_for_compare(e) == norm for e in entries):
                 return {"success": False, "error": "Entry already exists (no duplicate added)."}
             limit = self._char_limit(target)
             new_total = len(ENTRY_DELIMITER.join(entries + [content]))

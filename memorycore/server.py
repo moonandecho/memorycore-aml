@@ -9,6 +9,7 @@ Internals: reads local MEMORY.md/USER.md (local_store), talks to a remote
 MCP memory service via ColdStoreClient (cold tier).
 """
 import json
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
@@ -18,8 +19,12 @@ from .core.config import (SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOF
                          STATE_TTL_DAYS, RULE_COMPRESS_DAYS)
 from .core.classifier import (classify, classify_user_pref, should_keep_local,  # noqa: E402
                              classify_entry_type, COLD, STALE)
-from .core.metadata import MetaStore, entry_age_days, log_activity_query  # noqa: E402  # Phase 3 S4
-from .core.overflow import run_overflow, _recall_safe, _find_best_match, _merge_two_entries  # noqa: E402
+from .core.metadata import MetaStore, entry_age_days, log_activity_query, _parse_iso  # noqa: E402  # Phase 3 S4
+from .core.overflow import (run_overflow, _recall_safe, _find_best_match,  # noqa: E402
+                           _merge_two_entries, _is_protected_rule,
+                           enforce_rule_budget, apply_activity_hits,
+                           restore_stubs_from_results, _rule_weight_eff)
+from .core.config import RULE_MIN_RESIDENCY_DAYS, RULE_BUDGET_CHARS, AUDIT_SINK_WEIGHT_THRESHOLD, AUDIT_SINK_INACTIVE_DAYS, MAX_EVICT_PER_RUN  # noqa: E402
 from .core.maintenance import run_maintenance  # noqa: E402
 from .core.decay import _apply_decay  # noqa: E402  # shared by recall + prefetch
 
@@ -197,6 +202,12 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
                                         origin="store_fact")
             except Exception:
                 pass  # metadata failure never blocks the write (reconcile re-stamps)
+            # Phase 4: post-write rule budget check (LRU eviction; new rules
+            # have 7-day residency so they are never evicted immediately)
+            try:
+                enforce_rule_budget(_store, _client, t, _metastore_for(t), {})
+            except Exception:
+                pass  # budget enforcement failure never blocks the write
             return json.dumps({"status": "stored", "target": t,
                                "usage_after": f"{_store.usage_pct(t)}%",
                                "detail": "热数据已写本地"}, ensure_ascii=False)
@@ -295,6 +306,7 @@ def memorycore_memory_audit(target: str = "both") -> str:
         rows = []
         sink_total = 0
         sink_chars = 0
+        lru_sink = 0  # 2026-08-28: activity-dimension sink candidates (new field, keeps legacy counters intact)
         for e in entries:
             keep = should_keep_local(e)  # keyword view (legacy fallback)
             m = meta.get_entry(e)
@@ -318,8 +330,45 @@ def memorycore_memory_audit(target: str = "both") -> str:
                     row["plan"] = "stub_pointer (gc_oldest_on_hard_pressure)"
                     keep = True
                 else:
-                    row["plan"] = f"keep (compress after {RULE_COMPRESS_DAYS}d)"
-                    keep = True
+                    # rule type: keep aligned with actual overflow behaviour
+                    # (S0 immediate exit, 2026-08-26) — keyword view sinkable
+                    # + unprotected → overflow will actually sink it
+                    protected = _is_protected_rule(e, m)
+                    kw_sink = not should_keep_local(e)
+                    if kw_sink and not protected:
+                        row["plan"] = "sink_now (kw_view + S0)"
+                        keep = False
+                    else:
+                        row["plan"] = f"keep (compress after {RULE_COMPRESS_DAYS}d)"
+                        keep = True
+                    row["protected"] = protected
+                    row["kw_sink"] = kw_sink
+                    # Phase 4 LRU observability (M2)
+                    row["weight"] = m.get("weight")
+                    row["w_eff"] = round(_rule_weight_eff(m), 4)
+                    row["last_active_at"] = m.get("last_active_at")
+                    row["residency_days"] = max(
+                        0, RULE_MIN_RESIDENCY_DAYS - (age or 0))
+                    row["next_gate"] = {
+                        "compress_in_d": max(0, RULE_COMPRESS_DAYS - (age or 0)),
+                    }
+                    # 2026-08-28 activity dimension: low weight + long-inactive +
+                    # unprotected → sink_candidate. Same data source as the
+                    # weight/w_eff/last_active_at columns; visibility only,
+                    # does NOT change overflow execution.
+                    w_raw = m.get("weight")
+                    laa_dt = (_parse_iso(str(m.get("last_active_at")))
+                              if m.get("last_active_at") else None)
+                    inactive_days = (
+                        (datetime.now(timezone.utc) - laa_dt).days
+                        if laa_dt else None)
+                    if (not protected and w_raw is not None
+                            and float(w_raw) < AUDIT_SINK_WEIGHT_THRESHOLD
+                            and (inactive_days is None
+                                 or inactive_days > AUDIT_SINK_INACTIVE_DAYS)):
+                        row["sink_candidate"] = True
+                        row["sink_reason"] = "low_weight+inactive"
+                        lru_sink += 1
                 # keep and plan stay consistent for typed entries (final review)
                 row["keep"] = keep
             else:
@@ -337,7 +386,80 @@ def memorycore_memory_audit(target: str = "both") -> str:
             "sink_chars": sink_chars,
             "rows": rows,
         }
+        # Phase 4 LRU summary: rule ecology chars vs budget
+        rule_chars = 0
+        for e in entries:
+            m = meta.get_entry(e)
+            if m and m.get("type") in ("rule", "stub"):
+                rule_chars += len(e)
+        result[t]["rule_chars"] = rule_chars
+        result[t]["rule_budget"] = RULE_BUDGET_CHARS
+        result[t]["rule_chars_vs_budget"] = rule_chars - RULE_BUDGET_CHARS
+        result[t]["lru_sink_candidates"] = lru_sink  # 2026-08-28: activity-dimension sink candidates
     return json.dumps(result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Tool 5b: memorycore_get_rule_weight — rule weight distribution (read-only LRU monitor)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memorycore_get_rule_weight(target: str = "memory") -> str:
+    """View hot-tier rule weight distribution (read-only, never modifies) —
+    LRU retirement monitor.
+
+    w_eff = weight × 0.5^(days since last_active_at / 30) (lazy discount,
+    same formula as retirement ordering); rules sorted by w_eff ascending =
+    eviction order when the budget is exceeded.
+    next_eviction_candidates = up to MAX_EVICT_PER_RUN rules that would be
+    evicted first if the budget were exceeded right now (observation only —
+    actual eviction is also gated by residency/lexical-activity protection,
+    see enforce_rule_budget).
+
+    Args:
+        target: 'memory' | 'user' | 'both' (default memory)
+    Returns:
+        JSON: {summary: {rule_count, rule_chars, rule_budget, over_budget,
+               w_eff_min/avg/max, next_eviction_candidates}, rules: [...]}
+    """
+    out = {}
+    for t in _targets(target):
+        entries = _store.entries(t)
+        ms = _metastore_for(t)
+        rules = []
+        rule_chars = 0
+        for e in entries:
+            m = ms.get_entry(e)
+            if not m or m.get("type") != "rule":
+                continue
+            rule_chars += len(e)
+            rules.append({
+                "text": e[:60],
+                "chars": len(e),
+                "weight": m.get("weight"),
+                "w_eff": round(_rule_weight_eff(m), 4),
+                "last_active_at": m.get("last_active_at"),
+                "age_days": entry_age_days(m),
+                "protected": _is_protected_rule(e, m),
+                "kw_sink": not should_keep_local(e),
+            })
+        rules.sort(key=lambda r: r["w_eff"])
+        w_effs = [r["w_eff"] for r in rules]
+        out[t] = {
+            "summary": {
+                "rule_count": len(rules),
+                "rule_chars": rule_chars,
+                "rule_budget": RULE_BUDGET_CHARS,
+                "over_budget": rule_chars > RULE_BUDGET_CHARS,
+                "w_eff_min": round(min(w_effs), 4) if w_effs else None,
+                "w_eff_avg": round(sum(w_effs) / len(w_effs), 4) if w_effs else None,
+                "w_eff_max": round(max(w_effs), 4) if w_effs else None,
+                "next_eviction_candidates":
+                    [r["text"] for r in rules[:MAX_EVICT_PER_RUN]],
+            },
+            "rules": rules,
+        }
+    return json.dumps(out, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -361,10 +483,16 @@ def memorycore_recall(query: str, top_k: int = 3) -> str:
         log_activity_query(query)  # Phase 3 S4: topic-activity collection
         results = _client.recall_results(query, top_k=k)
         results = _apply_decay(results)
+        # Phase 4: recall hit on a stub cold_id -> restore full text to hot tier
+        try:
+            results = restore_stubs_from_results(
+                _store, {t: _metastore_for(t) for t in ("memory", "user")}, results)
+        except Exception:
+            pass  # restore failure never blocks the recall response
         return json.dumps({"results": results}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport="stdio", show_banner=False)  # FastMCP 3.x banner pollutes stdio stdout

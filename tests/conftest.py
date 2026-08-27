@@ -80,6 +80,13 @@ class MockMnemosyneClient:
     def stats(self):
         return {"total": len(self._cold)}
 
+    def embed_texts(self, texts):
+        """Default: simulate embedding unavailable (None -> lexical fallback).
+
+        Tests needing semantic hits monkeypatch this to return fixed vectors.
+        """
+        return None
+
 
 @pytest.fixture
 def tmp_store(tmp_path):
@@ -99,3 +106,17 @@ def meta_for(tmp_store):
 @pytest.fixture
 def mock_client():
     return MockMnemosyneClient()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_activity(tmp_path, monkeypatch):
+    """Isolate activity.jsonl — default empty (never reads the real log).
+
+    Phase 4 activity signals (apply_activity_hits / enforce) depend on the
+    query log; tests without queries behave deterministically (lexical
+    inactive). Tests that need queries monkeypatch ACTIVITY_LOG_FILE
+    themselves and call log_activity_query.
+    """
+    from memorycore.core import metadata as meta_mod
+    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
+    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)

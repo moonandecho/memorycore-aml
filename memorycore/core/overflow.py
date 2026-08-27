@@ -14,9 +14,15 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
 import math
+import os
 import re
-from datetime import datetime, timezone
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .classifier import classify, classify_user_pref, should_keep_local, HOT, COLD, STALE
@@ -27,11 +33,19 @@ from .config import (
     RULE_RETYPE_DONE_MARKERS, RULE_RETYPE_BEHAVIOR_MARKERS,
     RULE_STUB_IDLE_DAYS, IMPORTANCE_PROTECT, MAX_STUB_PER_RUN,
     STUB_MAX_CHARS, STUB_PREFIX, STUB_GC_MIN_AGE_DAYS,
-    ACTIVITY_LOG_ENABLED, CROSS_DEDUP_MIN_IDLE_DAYS,
-    CLUSTER_EMBED_THRESHOLD, MEMORYCORE_EMBED_URL, MEMORYCORE_EMBED_MODEL,
+    ACTIVITY_LOG_ENABLED, ACTIVITY_WINDOW_DAYS, CROSS_DEDUP_MIN_IDLE_DAYS,
+    CLUSTER_EMBED_THRESHOLD,
+    RULE_BUDGET_CHARS, RULE_BUDGET_ENABLED, RULE_MIN_RESIDENCY_DAYS,
+    WEIGHT_INIT, WEIGHT_HIT_INCREMENT, WEIGHT_MAX, WEIGHT_HALF_LIFE_DAYS,
+    WEIGHT_PROTECT_MULT, WEIGHT_KWSINK_MULT, MAX_EVICT_PER_RUN,
+    HIT_STRONG_COS, HIT_WEAK_COS, HIT_STRONG_INCREMENT, HIT_WEAK_INCREMENT,
+    HIT_CAP_PER_SCAN, HIT_WEAK_MODE, LEX_EVIDENCE_BIGRAMS,
+    FRESH_QUERY_SCAN_CAP, EMBED_BATCH_MAX, EMBED_TIMEOUT,
+    EMBED_BACKEND, EMBED_MODEL, MEMORY_FILE, USER_FILE,
 )
 from .metadata import (MetaStore, entry_age_days, parse_embedded_date,
-                       _parse_iso, load_recent_queries)
+                       _parse_iso, load_recent_queries,
+                       load_recent_queries_with_ts)
 
 # ---- 相似度阈值 ------------------------------------------------------------
 
@@ -42,7 +56,7 @@ _RECALL_SCORE_SIMILAR = 0.48  # recall dense_score >= 此值视为同主题
 _RECALL_TOP_K = 3             # 查重时的召回数
 _MIN_TEXT_RATIO = 0.15        # 最低字面相似度门禁 (防向量误匹配)
 
-# ---- 反转检测 (2026-08-05: 写入侧反转覆盖) -------------------------------
+# ---- 反转检测 (2026-08-05: 写入侧反转覆盖, 与 maintenance 一致) ------------
 
 _REVERSAL_NEG_WORDS = ["不", "没", "无", "非", "否", "别", "不再",
                        "停止", "取消", "不要", "拒绝", "禁", "讨厌",
@@ -51,7 +65,10 @@ _REVERSAL_WEAK_NEG = ["不太", "不大", "不怎么", "未必", "难免", "不�
 
 
 def _topic_overlap(a: str, b: str) -> bool:
-    """判定两条是否同主题 (与 maintenance _is_reversal_pair 判定一致)。"""
+    """判定两条是否同主题 (与 maintenance _is_reversal_pair 判定一致)。
+
+    bigram 覆盖率 >= 0.55 或 ratio >= 0.40。
+    """
     if not a or not b:
         return False
     na = _norm_sentence(a)
@@ -63,38 +80,41 @@ def _topic_overlap(a: str, b: str) -> bool:
     if _bigram_coverage(na, bg_b) >= 0.55:
         return True
     return False
-# ---- 用户偏好摘要锚点 (P4) --------------------------------------------------
+
+# ---- 用户偏好摘要锚点 (P4, 2026-08-05 设计定稿 + 实验验证) ------------------
 
 _ANCHOR_PREFIX = "[用户偏好摘要]"   # 内容前缀: 识别/查重/召回锚点
 _ANCHOR_IMPORTANCE = 0.8        # 高 importance → prefetch 分层注入高档
 _ANCHOR_MAX_CHARS = 800         # 锚点长度上限 (超限截断保留头部)
-_ANCHOR_QUERY = _ANCHOR_PREFIX  # 从 _ANCHOR_PREFIX 派生 (原硬编码 "[用户偏好摘要]")
+_ANCHOR_QUERY = _ANCHOR_PREFIX  # P3-4: 从 _ANCHOR_PREFIX 派生 (原硬编码 "[用户偏好摘要]")
 
 
+# ---- Phase 3: rule 失效信号 (2026-08-20 设计定稿"分层保护") -----------------
+# 设计: /tmp/rule-stale-design.md
+# 约束 1 修正: B 类按失效证据分层放弃; A 类/红线类/importance≥0.9 绝不误伤。
 
-# ---- Phase 3: rule invalidation signals (2026-08-20) ----------------------
-# Tiered protection: B-class rules may retire by layered evidence
-# (merge / compress / sink / dedup); A-class meta-rules, red-line rules and
-# high-importance entries are never touched (only merge/compress).
-
-# S6 protection line: A-class meta-rules (apply every turn; topic-activity
-# signals are meaningless for them) — same source as classifier
-# strong_keep_markers / interact_words (word list is tunable).
+# S6 保护线: A 类元行为准则 (每轮适用, 主题活性信号无判别力) —
+# 与 classifier strong_keep_markers/interact_words 同源 (词表可校准, 设计 §4.6)
 _RULE_META_MARKERS = [
     "行为准则", "交互习惯", "写作风格", "回答风格", "措辞", "汇报", "沟通",
     "大白话", "结论先行", "验证", "准确", "严谨", "覆盖", "抑郁", "信任",
     "尊重", "纠正", "红线", "零容忍",
 ]
-# S6 red-line class (hard-veto words, A or B class alike) — absolute protection
+# S6 红线类 (硬性词汇, 不论 A/B 类) — 绝对保护
 _RULE_REDLINE_MARKERS = ["红线", "零容忍", "绝不", "禁止", "纠正"]
 
-# S4: per-run cap on candidates evaluated for dormancy (LLM call guardrail)
+# S3 嵌入通道 (ollama qwen3, prefetch 同款; 不可用 → 纯词法降级)
+_EMBED_URL = os.environ.get("MEMORYCORE_EMBED_URL", "http://localhost:11434")
+_EMBED_MODEL = os.environ.get("MEMORYCORE_EMBED_MODEL", "qwen3-embedding:0.6b")
+
+# S4: 单轮休眠判定评估的候选上限 (LLM 调用量护栏)
 _STUB_EVAL_CAP = 10
 
 
 def _is_protected_rule(entry: str, meta: dict) -> bool:
-    """S6: A-class / red-line / high importance -> absolute protection
-    (never stub / never retype / never cross-tier dedup; merge+compress only)."""
+    """S6: A 类/红线类/高 importance → 绝对保护 (不 stub/不 retype/不跨层删)。
+
+    只允许合并/压缩 (信息保留路径)。"""
     if meta.get("importance", 0.8) >= IMPORTANCE_PROTECT:
         return True
     if any(kw in entry for kw in _RULE_META_MARKERS):
@@ -105,8 +125,7 @@ def _is_protected_rule(entry: str, meta: dict) -> bool:
 
 
 def _rule_retype_eligible(entry: str) -> bool:
-    """S2: completion re-check eligibility — embedded date >= 60d + >= 2
-    completion markers + zero behavior-directive words."""
+    """S2: rule 完成态复核资格 — 内嵌日期 ≥60d + ≥2 完成态词 + 零行为指令词。"""
     d = parse_embedded_date(entry)
     if d is None:
         return False
@@ -114,7 +133,7 @@ def _rule_retype_eligible(entry: str) -> bool:
     if days < RULE_RETYPE_DAYS:
         return False
     hits = [m for m in RULE_RETYPE_DONE_MARKERS if m in entry]
-    # nested dedup ("退役" ⊂ "已退役" counts once)
+    # 嵌套去重 ("退役" ⊂ "已退役" 只算一次)
     distinct = [m for m in hits
                 if not any(o != m and m in o for o in hits)]
     if len(distinct) < RULE_RETYPE_MIN_DONE_MARKERS:
@@ -126,8 +145,7 @@ def _rule_retype_eligible(entry: str) -> bool:
 
 def _try_cross_layer_dedup(store, client, target: str, entry: str,
                            stat: dict) -> bool:
-    """S5 (L1): the cold tier already holds an equivalent copy (same-level
-    match) -> drop the hot copy (zero information loss)."""
+    """S5 (L1): 冷层已有等价全文 (same 级匹配) → 删本地 (信息零丢失)。"""
     try:
         existing = _recall_safe(client, entry)
     except Exception:
@@ -145,9 +163,9 @@ def _try_cross_layer_dedup(store, client, target: str, entry: str,
 
 
 def _make_stub(entry: str) -> str:
-    """S4: stub pointer (<= STUB_MAX_CHARS, lexical, zero LLM dependency).
+    """S4: stub 指针 (≤STUB_MAX_CHARS, 词法生成零 LLM 依赖)。
 
-    Format: [规则指针]{topic<=10 chars}→recall("{topic}") — pointer + recall hook.
+    格式: [规则指针]{主题词≤10字}→recall("{主题词}") — 指针+召回钩子。
     """
     kw = re.sub(r"\s+", "", (entry or "").strip().split("。")[0][:10])
     if not kw:
@@ -160,11 +178,10 @@ def _make_stub(entry: str) -> str:
 
 def _llm_judge_dormant(entries: List[str],
                        queries: List[str]) -> Dict[str, bool]:
-    """S4: LLM dormancy judge (<= 5 entries per batch, config LLM channel).
+    """S4: LLM 判休眠 (≤5 条/批, 复用 config LLM 通道)。
 
-    Returns {entry: dormant}; failures / unparseable output omit the entry
-    (caller treats it as active). Prompt hard constraints: uncertain = active;
-    judge topic recurrence only, never value.
+    返回 {entry: dormant}; 失败/解析不过 → 该条不出现 (调用方按活跃处理)。
+    prompt 硬约束: 拿不准判活跃; 只判主题是否被讨论过, 不判价值。
     """
     from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT
 
@@ -181,7 +198,7 @@ def _llm_judge_dormant(entries: List[str],
             for j, e in enumerate(chunk))
         prompt = (
             "你是记忆治理助手。判断下列记忆准则涉及的主题, 近期是否被用户讨论过。\n"
-            f"<queries>recent user messages (last 30 days):\n{qs}\n</queries>\n"
+            f"<queries>近 30 天用户消息样本:\n{qs}\n</queries>\n"
             f"<entries>{items}</entries>\n"
             "要求:\n"
             '1. 只判断"准则涉及的主题是否在近期查询中被讨论/涉及", 不判断准则价值\n'
@@ -219,31 +236,27 @@ def _llm_judge_dormant(entries: List[str],
                         and isinstance(d, bool)):
                     out[chunk[idx]] = d
         except Exception:
-            continue  # this batch counts as active
+            continue  # 本批按活跃
     return out
 
 
 def _rule_topic_dormant(entry: str, queries: List[str]) -> bool:
-    """S4 dormancy evidence chain: lexically active -> False; lexically
-    inactive -> LLM confirm; any failure -> False (active).
+    """S4 休眠证据链: 词法活跃→False; 词法不活跃→LLM 确认; 失败→False (活跃)。
 
-    Dormancy is a negative claim: insufficient evidence always means active
-    — better to keep than to mis-sink.
-    """
+    休眠是负断言: 任何证据不足一律按活跃处理, 宁可不动绝不误沉。"""
     if not queries:
         return False
     for q in queries:
         if _topic_overlap(q, entry) or _topic_overlap(entry, q):
-            return False  # lexically active (zero-cost fast screen)
+            return False  # 词法活跃 (零成本快筛)
     res = _llm_judge_dormant([entry], queries)
     return bool(res.get(entry, False))
 
 
 def _plan_stub_candidates(metastore, client, entries: List[str]) -> List[str]:
-    """L2 pre-planning: B-class + idle >= RULE_STUB_IDLE_DAYS + dormancy
-    confirmed -> stub candidates (<= MAX_STUB_PER_RUN).
+    """L2 预规划: B 类 + idle ≥ RULE_STUB_IDLE_DAYS + 休眠确认 → 候选 (≤3)。
 
-    Ordering: longest idle first; ties broken by length (chars saved per stub).
+    排序: 闲置最久优先, 同闲置字符长的先沉 (单位省字最高)。
     """
     if not ACTIVITY_LOG_ENABLED:
         return []
@@ -271,18 +284,16 @@ def _plan_stub_candidates(metastore, client, entries: List[str]) -> List[str]:
 
 def _handle_rule_retype(store, client, target: str, entry: str, meta: dict,
                         metastore, stat: dict, anchor_parts: List[str]) -> None:
-    """S2 (L1): completion re-check — restamp as state
-    (origin=retype_overflow) then retire via the normal TTL path.
+    """S2 (L1): 完成态复核 — 重盖 state (origin=retype_overflow) → TTL 下沉。
 
-    Safe order: stamp -> cold migration (local removed only after cold
-    confirmed). On cold failure the original rule stamp (timestamps /
-    importance / origin) is restored and the entry stays.
+    安全顺序: 盖章 → 冷迁移 (冷层确认成功才删本地)。
+    冷层失败 → 恢复原 rule 章 (原时间戳/importance/origin), 下次再试。
     """
     d = parse_embedded_date(entry)
     try:
         metastore.stamp(entry, "state", written_at=d, origin="retype_overflow")
     except Exception:
-        pass  # F1 semantics: stamp failure never blocks (reconcile backstop)
+        pass  # F1 语义: 盖章失败不阻塞 (下次 reconcile 兜底)
     before = len(store.entries(target))
     if target == "user" and classify_user_pref(
             entry, sentence_level=True) == "sink":
@@ -292,7 +303,10 @@ def _handle_rule_retype(store, client, target: str, entry: str, meta: dict,
         stat["aged_sunk"] += 1
         stat["retyped"] += 1
         return
-    # rollback: restore the original rule stamp
+    # 回退: 恢复原 rule 章 (设计 §4.2 失败回退)
+    # L2 (2026-08-26): 透传 weight/last_active_at — 否则回退重盖
+    # 把 rule 的 weight 重置为 1.0、last_active_at 刷成 now (stamp 默认),
+    # 冷层反复故障期间候选规则权重被反复"洗白", 排序退化。
     try:
         metastore.stamp(
             entry, "rule",
@@ -302,6 +316,9 @@ def _handle_rule_retype(store, client, target: str, entry: str, meta: dict,
                         if meta.get("updated_at") else None),
             importance=meta.get("importance", 0.8),
             origin=meta.get("origin", "legacy"),
+            weight=float(meta.get("weight") or WEIGHT_INIT),
+            last_active_at=(_parse_iso(str(meta["last_active_at"]))
+                            if meta.get("last_active_at") else None),
         )
     except Exception:
         pass
@@ -310,12 +327,14 @@ def _handle_rule_retype(store, client, target: str, entry: str, meta: dict,
 def _handle_rule_stub_sink(store, client, target: str, entry: str,
                            metastore, stat: dict,
                            anchor_parts: List[str]) -> None:
-    """S4 (L2): dormant B-class rule -> full text written to the cold tier
-    first; only after cold confirms stored, the local entry is replaced by a
-    stub pointer. Any failure keeps the original entry untouched (errors+1).
+    """S4 (L2): 休眠 B 类 rule → 全文先写冷层确认 → 本地替换为 stub 指针。
+
+    安全顺序: remember stored → replace 本地; 任一失败 → 原条目原样 (errors+1)。
+    Phase 4: 捕获冷层 memory_id → stub meta 写 cold_id (召回恢复链路用, 见
+    restore_stubs_from_results)。
     """
     if entry not in store.entries(target):
-        return  # already handled by another action this run (S2/S5)
+        return  # 已被本轮其他动作处理 (如 S2/S5), 保守跳过
     try:
         r = client.remember(entry, importance=0.6, scope="global")
         if r.get("status") != "stored":
@@ -324,26 +343,29 @@ def _handle_rule_stub_sink(store, client, target: str, entry: str,
     except Exception:
         stat["errors"] += 1
         return
+    cold_id = (r.get("memory_id") or "") if isinstance(r, dict) else ""
     stub = _make_stub(entry)
     if store.replace(target, entry, stub).get("success"):
         try:
-            metastore.stamp(stub, "stub", origin="stub_sink")
+            # L3: stub meta 记录原 importance — 恢复时透传保护线
+            orig_imp = float((metastore.get_entry(entry) or {}).get(
+                "importance") or 0.8)
+            metastore.stamp(stub, "stub", origin="stub_sink",
+                            cold_id=cold_id or None, importance=orig_imp)
         except Exception:
-            pass  # stamp failure re-covered by reconcile (STUB_PREFIX)
+            pass  # 盖章失败下次 reconcile 补 (STUB_PREFIX 识别)
         stat["stubbed"] += 1
         if target == "user":
-            anchor_parts.append(entry)  # full pref text joins the anchor
+            anchor_parts.append(entry)  # 偏好全文进锚点 (与下沉同语义)
     else:
         stat["errors"] += 1
 
 
 def _stub_gc(store, metastore, target: str, stat: dict) -> None:
-    """Stub lifecycle GC — oldest-first pointer removal, <=
-    MAX_STUB_PER_RUN per overflow run.
+    """§6: stub 回收 — 最老优先删本地指针, ≤MAX_STUB_PER_RUN/轮。
 
-    Pointers only: zero cold-tier calls (full texts stay in cold, forget is
-    never called). Pointers younger than STUB_GC_MIN_AGE_DAYS are kept
-    (prevents create-then-collect thrash).
+    只删指针: 冷层零调用 (全文不受影响, forget 零调用)。
+    年龄 < STUB_GC_MIN_AGE_DAYS 的指针不回收 (防刚建即被 GC 抖振)。
     """
     entries = store.entries(target)
     stubs = []
@@ -352,7 +374,7 @@ def _stub_gc(store, metastore, target: str, stat: dict) -> None:
         if m and m.get("type") == "stub":
             age = entry_age_days(m)
             stubs.append((age if age is not None else 9999, e))
-    stubs.sort(key=lambda t: -t[0])  # oldest first
+    stubs.sort(key=lambda t: -t[0])  # 最老优先
     removed = 0
     for age, e in stubs:
         if removed >= MAX_STUB_PER_RUN:
@@ -368,37 +390,32 @@ def _stub_gc(store, metastore, target: str, stat: dict) -> None:
             removed += 1
 
 
-# S3 embedding channel (optional enhancement; unavailable -> lexical-only,
-# overflow never blocks on it)
+# S3 嵌入通道 (可选增强; 不可用 → 纯词法降级, 溢流永不阻塞)
 def _embed_batch(texts: List[str]) -> Optional[Dict[str, List[float]]]:
-    """Batch embeddings via the OpenAI-compatible endpoint configured in
-    config (MEMORYCORE_EMBED_URL, default ollama /v1); any failure -> None
-    (degrade to lexical-only)."""
+    """ollama /api/embed 批量嵌入; 不可用/失败 → None (降级纯词法)。"""
     if not texts:
         return None
     try:
         import json
         import urllib.request
         req = urllib.request.Request(
-            MEMORYCORE_EMBED_URL.rstrip("/") + "/embeddings",
-            data=json.dumps({"model": MEMORYCORE_EMBED_MODEL,
-                             "input": texts}).encode(),
+            _EMBED_URL.rstrip("/") + "/api/embed",
+            data=json.dumps({"model": _EMBED_MODEL, "input": texts}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-        items = data.get("data") or []
-        if len(items) != len(texts):
+        vecs = data.get("embeddings") or []
+        if len(vecs) != len(texts):
             return None
-        return {t: list(it.get("embedding") or [])
-                for t, it in zip(texts, items)}
+        return {t: v for t, v in zip(texts, vecs)}
     except Exception:
         return None
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
-    """Cosine similarity between two vectors."""
+    """向量余弦相似度。"""
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
@@ -427,11 +444,11 @@ def run_overflow(store, client, target: str) -> dict:
         "compressed": 0,  # B: LLM 压缩条数 (2026-08-07)
         "kept": 0,
         "errors": 0,
-        "aged_sunk": 0,          # Phase 2: state entries retired by age
-        "metadata_stamped": 0,   # Phase 2: legacy entries stamped by reconcile
-        "stubbed": 0,            # Phase 3 S4: dormant B rules -> stub pointers
-        "stub_gc": 0,            # Phase 3: stub pointers collected (oldest first)
-        "retyped": 0,            # Phase 3 S2: rule -> state completion re-checks
+        "aged_sunk": 0,          # Phase 2: 因年龄到期退役的 state 条目数
+        "metadata_stamped": 0,   # Phase 2: reconcile 补盖的 legacy 条目数
+        "stubbed": 0,            # Phase 3 S4: 休眠 B 类 rule → stub 指针数
+        "stub_gc": 0,            # Phase 3 §6: 回收的 stub 指针数
+        "retyped": 0,            # Phase 3 S2: rule → state 完成态复核数
     }
 
     # P4: 收集本次下沉的用户偏好内容, 溢流末统一更新冷层摘要锚点
@@ -531,35 +548,39 @@ def run_overflow(store, client, target: str) -> dict:
         stat["merged"] = merge_count
         entries = merged_entries
 
-    # ---- Step 0.5 (Phase 2): metadata reconcile — legacy stamping / GC ----
-    # Runs after split/merge so their products are covered too. Idempotent;
-    # writes only the sidecar, never the .md files.
+    # ---- Step 0.5 (Phase 2): 元数据 reconcile — legacy 补盖 / 孤儿 GC ----
+    # 放在拆分/合并之后 (条目定稿, 拆分与合并产物也纳入), 幂等;
+    # 只写 sidecar 不碰 .md。之后主循环按元数据优先决策。
     metastore = MetaStore(target, memory_path=store.memory_path,
                           user_path=store.user_path)
     try:
         meta_stat = metastore.reconcile(entries)
         stat["metadata_stamped"] = meta_stat.get("stamped", 0)
     except Exception:
-        # F1 (final review): a sidecar failure (disk full / lock error) must
-        # never block the overflow — degrade to the legacy keyword path.
+        # F1 修复 (终审): sidecar 故障 (磁盘满/锁文件不可开) 不阻塞溢流 —
+        # 降级 legacy 关键词路径, get_entry 读损坏文件亦返回 None。
         stat["errors"] += 1
         stat["metadata_stamped"] = 0
 
-    # ---- L2 pre-planning (Phase 3): dormant B-class rules under hard
-    # pressure -> stub candidates (evidence chain + LLM dormancy judge) ----
+    # ---- Phase 4 Step A: 活性命中扫描 (语义两级判定; 失败降级不阻塞) ----
+    try:
+        apply_activity_hits({target: metastore}, {target: entries}, client, stat)
+    except Exception:
+        pass  # 命中扫描失败 → 本轮无新信号 (历史权重继续)
+
+    # ---- L2 预规划 (Phase 3): 高压下休眠 B 类 rule → stub 候选 ------------
     stub_candidates: Set[str] = set()
     if store.usage_pct(target) >= HARD_THRESHOLD * 100:
         try:
             stub_candidates = set(_plan_stub_candidates(
                 metastore, client, entries))
         except Exception:
-            stub_candidates = set()  # planning failure -> no stubbing (degrade)
+            stub_candidates = set()  # 规划失败 → 保守不 stub (机制降级)
 
     # ---- Step 2+3+5: 逐条处理 --------------------------------------------
     for entry in entries:
-        # Phase 2 (2026-08-16): metadata-first — typed entries retire by
-        # age+type (keywords play no part); untyped entries fall back to the
-        # legacy keyword path.
+        # Phase 2 (2026-08-16): 元数据优先 — 有元数据按"年龄+类型"退役,
+        # 关键词表不参与 (根治词表两周一复发); 无元数据回退 legacy 关键词路径。
         meta = metastore.get_entry(entry)
         if meta and _handle_typed_entry(store, client, target, entry, meta,
                                         metastore, stat, anchor_parts,
@@ -567,7 +588,7 @@ def run_overflow(store, client, target: str) -> dict:
             continue
 
         if should_keep_local(entry):
-            # B: 长条目压缩优先 (2026-08-07) — keep 但 >200 字:
+            # B: 长条目压缩优先 (2026-08-07 设计定稿) — keep 但 >200 字:
             # 先尝试 LLM 压缩成精简版留本地, 原始细节沉冷层; 失败保留原样。
             if len(entry) > _COMPRESS_MIN_CHARS:
                 compressed = _llm_compress(client, entry)
@@ -578,8 +599,7 @@ def run_overflow(store, client, target: str) -> dict:
                         try:
                             r = client.remember(entry, importance=0.6, scope="global")
                             if r.get("status") == "stored":
-                                # F3 (final review): only count after a
-                                # successful local replace
+                                # F3 修复 (终审): 校验 replace 成功才计数
                                 if store.replace(target, entry, compressed).get("success"):
                                     stat["compressed"] += 1
                                     anchor_parts.append(entry)
@@ -615,14 +635,19 @@ def run_overflow(store, client, target: str) -> dict:
         else:
             stat["kept"] += 1
 
-    # ---- Step 5.5 (Phase 3): stub GC — no stubs created this run and still
-    # under hard pressure -> collect the oldest pointers (opportunistic) ----
+    # ---- Step 5.5 (Phase 3): stub GC — 本轮未 stub 且仍高压 → 最老指针回收 --
     if (stat.get("stubbed", 0) == 0
             and store.usage_pct(target) >= HARD_THRESHOLD * 100):
         try:
             _stub_gc(store, metastore, target, stat)
         except Exception:
-            pass  # GC is opportunistic; never blocks overflow
+            pass  # GC 是机会性回收, 失败不阻塞溢流 (下次再试)
+
+    # ---- Phase 4 Step B: 规则预算挤权 (LRU; 冷层失败 break 不丢数据) ----
+    try:
+        enforce_rule_budget(store, client, target, metastore, stat)
+    except Exception:
+        pass  # 预算挤权失败不阻塞溢流 (下轮重试)
 
     # ---- Step 6: 验证 ----------------------------------------------------
     if target == "user" and anchor_parts:
@@ -633,39 +658,32 @@ def run_overflow(store, client, target: str) -> dict:
     return stat
 
 
-
-
-# ---- Phase 2: typed-entry retirement decision (2026-08-16) -----------------
+# ---- Phase 2: 有元数据条目的决策 (2026-08-16) --------------------------------
 
 def _handle_typed_entry(store, client, target: str, entry: str,
                         meta: dict, metastore, stat: dict,
                         anchor_parts: List[str],
                         stub_candidates: Optional[Set[str]] = None) -> bool:
-    """Retirement decision for entries that have sidecar metadata.
+    """有元数据条目的退役判定 (元数据优先, 关键词不参与)。
 
-    - stub: pointer stays forever (GC via Step 5.5; never enters
-      retirement paths).
-    - state: age >= STATE_TTL_DAYS -> cold migration via the safe path
-      (cold write confirmed before local removal); not expired -> keep.
-    - rule (Phase 3 tiered protection, 2026-08-20):
-        * S6: A-class / red-line / importance >= 0.9 -> long-compression
-          only; never stub / retype / cross-tier dedup
-        * S2 (L1 >=60%): completion re-check -> retype state -> TTL sink
-        * S5 (L1 >=60%, idle >=30d): cold tier holds an equivalent copy ->
-          drop the hot copy
-        * S4 (L2 >=80%): dormancy confirmed -> full text to cold + stub
-          pointer left locally
-        * existing: >= RULE_COMPRESS_DAYS without update and long -> LLM
-          compression (any failure keeps the original)
-    - unknown type -> return False, caller falls back to legacy keywords.
+    - stub: 指针永久驻留 (回收走 Step 5.5 stub GC, 不参与放弃路径)。
+    - state: age >= STATE_TTL_DAYS → 到期退役, 走 _handle_cold_migration
+      安全路径 (冷层写成功才删本地); 未到期 → 暂留。
+    - rule (Phase 3 分层保护, 2026-08-20):
+        * S6: A 类/红线类/importance≥0.9 → 只走长压缩, 不 stub/不 retype/不跨层删
+        * S2 (L1 ≥60%): 完成态复核 → retype state → TTL 下沉
+        * S5 (L1 ≥60%, 闲置≥30d): 冷层已有等价全文 → 删本地
+        * S4 (L2 ≥80%): 休眠确认 → 全文沉冷层 + stub 指针留本地
+        * 既有: age ≥ RULE_COMPRESS_DAYS 长条目 → LLM 压缩 (失败保留原样)
+    - 未知类型 → 返回 False, 调用方回退 legacy 关键词路径。
 
-    Returns: True = handled (caller continues); False = fall back to legacy.
+    Returns: True = 已处理 (调用方 continue); False = 回退 legacy。
     """
     etype = meta.get("type")
     age = entry_age_days(meta)
 
     if etype == "stub":
-        stat["kept"] += 1  # pointer stays; GC via Step 5.5 under hard pressure
+        stat["kept"] += 1  # 指针永久驻留; 高压回收走 Step 5.5 stub GC
         return True
 
     if etype == "state":
@@ -676,32 +694,41 @@ def _handle_typed_entry(store, client, target: str, entry: str,
                 anchor_parts.append(entry)
             _handle_cold_migration(store, client, target, entry, stat)
             if len(store.entries(target)) < before:
-                stat["aged_sunk"] += 1  # count only when it really left the hot tier
+                stat["aged_sunk"] += 1  # 只有条目真的离开热层才计数
             return True
-        stat["kept"] += 1  # not expired yet
+        stat["kept"] += 1  # 未到期, 暂留
         return True
 
     if etype == "rule":
         protected = _is_protected_rule(entry, meta)
         usage = store.usage_pct(target)
 
-        # S2 (L1): completion re-check -> retype -> TTL sink (cold failure
-        # restores the original rule stamp)
+        # S0 (2026-08-26 修复): 关键词视图已判可沉 (强 sink 组合) → 即时冷迁移
+        # 修复前: 元数据优先旁路 should_keep_local, audit 判 keep=False 的
+        # rule 条目溢流永不沉 (热层 88% 只增不减的结构性空转)
+        # 2026-08-26 修正: 门槛 HARD(80%) — SOFT(60%) 会让 kw 可沉 rule 在
+        # 低占用即查冷层, 绕过 S5 的 CROSS_DEDUP_MIN_IDLE_DAYS 闲置门槛
+        # (test_s5_skips_recent_rule 语义: 闲置 <30 天不查冷层)。
+        if (not protected and usage >= HARD_THRESHOLD * 100
+                and not should_keep_local(entry)):
+            _handle_cold_migration(store, client, target, entry, stat)
+            return True
+
+        # S2 (L1): 完成态复核 → retype → TTL 下沉 (冷层失败恢复原 rule 章)
         if (not protected and usage >= SOFT_THRESHOLD * 100
                 and _rule_retype_eligible(entry)):
             _handle_rule_retype(store, client, target, entry, meta,
                                 metastore, stat, anchor_parts)
             return True
 
-        # S5 (L1): cross-tier redundancy — only probed after
-        # CROSS_DEDUP_MIN_IDLE_DAYS idle (historical-redundancy oriented,
-        # keeps recall overhead low; cold copy confirmed -> drop hot, zero loss)
+        # S5 (L1): 跨层冗余 — 闲置 ≥ CROSS_DEDUP_MIN_IDLE_DAYS 才查冷层
+        # (历史冗余面向, 省 recall 开销; 冷层已有等价全文 → 删本地零丢失)
         if (not protected and usage >= SOFT_THRESHOLD * 100
                 and age is not None and age >= CROSS_DEDUP_MIN_IDLE_DAYS
                 and _try_cross_layer_dedup(store, client, target, entry, stat)):
             return True
 
-        # S4 (L2): dormant stub-sink (candidates pre-planned in run_overflow)
+        # S4 (L2): 休眠 stub-sink (候选由 run_overflow L2 预规划给出)
         if (not protected and usage >= HARD_THRESHOLD * 100
                 and stub_candidates is not None
                 and entry in stub_candidates):
@@ -717,13 +744,13 @@ def _handle_typed_entry(store, client, target: str, entry: str,
                 try:
                     r = client.remember(entry, importance=0.6, scope="global")
                     if r.get("status") == "stored":
-                        # F3 (final review): verify replace before counting
+                        # F3 修复 (终审): 校验 replace 成功才计数/盖章
                         if store.replace(target, entry, compressed).get("success"):
                             try:
                                 metastore.stamp(compressed, "rule",
                                                 origin="overflow")
                             except Exception:
-                                pass  # F1: stamp failure is non-fatal (reconcile re-stamps)
+                                pass  # F1: 盖章失败不阻塞 (下次 reconcile 补)
                             stat["compressed"] += 1
                             anchor_parts.append(entry)
                             return True
@@ -738,21 +765,22 @@ def _handle_typed_entry(store, client, target: str, entry: str,
         stat["kept"] += 1
         return True
 
-    return False  # unknown type -> legacy fallback
+    return False  # 未知类型 → legacy 回退
 
 
-# ---- P4: 用户偏好摘要锚点 --------------------------------------------------
+# ---- P4: 用户偏好摘要锚点 (2026-08-05 设计定稿) ----------------------------
 
 def _update_pref_anchor(client, store, new_parts: List[str], stat: dict) -> None:
     """维护冷层用户偏好摘要锚点。
 
     用户偏好内容下沉时, 不散落丢失, 合并成一条高 importance 锚点,
-    作为 prefetch 召回的用户偏好画像总索引。
+    作为 prefetch 召回的用户偏好画像总索引 (隔离库实验: 8/10 偏好查询
+    top-1 命中 + rerank 全部穿透 -3.5 线; 现状无锚点时仅 1/10 可达)。
 
     规则拼接 + 增量更新 (自包含零依赖, 关键词覆盖优先):
       - 首次建立: 并入 USER.md 当前 core 偏好 → 初始即完整画像
       - 后续溢流: 合入本次下沉的偏好内容 (句级去重)
-      - 已有锚点用 recall 前缀查询定位 (避开词法盲区)
+      - 已有锚点用 recall 前缀查询定位 (实测 4/4 top-1, 避开词法盲区)
       - 失败只记 errors, 不阻塞溢流 (散条已正常下沉, 锚点是附加索引)
     """
     if not new_parts:
@@ -765,7 +793,7 @@ def _update_pref_anchor(client, store, new_parts: List[str], stat: dict) -> None
     # 查已有锚点
     anchor_item = None
     try:
-        for m in client.recall_results(_ANCHOR_QUERY, top_k=5, bump=False):  # 内部锚点维护, 只读
+        for m in client.recall_results(_ANCHOR_QUERY, top_k=5, bump=False):  # 遗留2: 内部锚点维护, 只读
             if _ANCHOR_PREFIX in (m.get("content") or ""):
                 anchor_item = m
                 break
@@ -813,6 +841,7 @@ def _update_pref_anchor(client, store, new_parts: List[str], stat: dict) -> None
     except Exception:
         stat["errors"] += 1
 
+
 # ---- Step 2+5: 冷迁移 ----------------------------------------------------
 
 def _handle_cold_migration(store, client, target: str, entry: str,
@@ -833,8 +862,7 @@ def _handle_cold_migration(store, client, target: str, entry: str,
                 stat["overflowed"] += 1  # 算溢流 (已在冷层)
                 return
             elif matched["level"] == "similar":
-                # 反转检测 (双向化): 本地条或冷层旧条任一侧含否定词 + 同主题 → 覆盖
-                # 场景: 旧"不喜欢A" → 新"喜欢A" (新条无否定词, 旧条有) 同样是反转
+                # 反转检测 (P1-3 双向化): 本地条或冷层旧条任一侧含否定词 + 同主题 → 覆盖
                 has_neg = False
                 cold_content = matched["content"]
                 for w in _REVERSAL_NEG_WORDS:
@@ -848,7 +876,7 @@ def _handle_cold_migration(store, client, target: str, entry: str,
                         if not is_weak:
                             has_neg = True
                             break
-                    # 检查冷层旧条: 旧条否定+新条正向 → 正向替代
+                    # 检查冷层旧条 (P1-3: 旧条否定+新条正向 → 正向替代)
                     if w in cold_content:
                         is_weak = False
                         for wn in _REVERSAL_WEAK_NEG:
@@ -860,8 +888,8 @@ def _handle_cold_migration(store, client, target: str, entry: str,
                             break
                 if has_neg and _topic_overlap(entry, cold_content):
                     try:
-                        # 写入侧反转覆盖前, 旧条进回收站
-                        from ..trash_store import TrashStore
+                        # P1-6: 写入侧反转覆盖前, 旧条进回收站
+                        from trash_store import TrashStore
                         TrashStore().add(
                             matched["id"], cold_content,
                             reason="reversal_obsolete",
@@ -884,7 +912,7 @@ def _handle_cold_migration(store, client, target: str, entry: str,
                         return
                 except Exception:
                     stat["errors"] += 1
-                    return  # update 失败 → 本地保留
+                    return  # update 失败 -> 本地保留
             # 匹配不满足阈值或 update 返回非 updated → 降级到 remember
 
     # 无匹配 → 新写入冷层
@@ -904,9 +932,9 @@ def _handle_cold_migration(store, client, target: str, entry: str,
 def _handle_stale(store, client, target: str, entry: str, stat: dict) -> None:
     """过时条目: 冷层匹配条目先进回收站再 forget, 然后删本地。
 
-    与治理路径 (_clean_stale 短条目) 对齐 — forget 前写入 TrashStore,
-    保留 30 天恢复窗口。reason 按长度分级: ≤80 字 stale_short,
-    >80 字 stale_long; source_decision 统一 rule_stale (同治理路径语义)。
+    P2-1 (2026-08-23): 与治理路径 (_clean_stale 短条目) 对齐 — forget 前写入
+    TrashStore, 保留 30 天恢复窗口。reason 按长度分级: ≤80 字 "stale_short",
+    >80 字 "stale_long"; source_decision 统一 "rule_stale" (同治理路径语义)。
     """
     try:
         existing = _recall_safe(client, entry)
@@ -918,7 +946,7 @@ def _handle_stale(store, client, target: str, entry: str, stat: dict) -> None:
                 ).ratio()
                 if ratio > _SAME_FACT_RATIO:
                     try:
-                        from ..trash_store import TrashStore
+                        from trash_store import TrashStore
                         TrashStore().add(
                             ex["id"], ex.get("content", ""),
                             reason=reason,
@@ -950,10 +978,9 @@ def _smart_ratio(a: str, b: str) -> float:
 def _merge_local_fragments(entries: List[str]) -> Tuple[List[str], int]:
     """检测本地同主题碎片并合并。返回 (merged, merge_count)。
 
-    Phase 3 (2026-08-20): stub pointers ([规则指针] prefix) never merge —
-    they share a fixed format prefix, so lexical similarity is naturally
-    >= 0.5 and merging would silently drop pointers. They are opaque
-    retrieval hooks, not prose: merging has zero benefit.
+    Phase 3 (2026-08-20): stub 指针 ([规则指针] 前缀) 不参与合并 —
+    指针共享固定格式前缀, 词法相似度天然 ≥0.5, 参与合并会造成指针丢失;
+    它们是透明检索钩子而非散文条目, 合并零收益 (防误伤: 设计 §6)。
     """
     if len(entries) <= 1:
         return list(entries), 0
@@ -973,8 +1000,7 @@ def _merge_local_fragments(entries: List[str]) -> Tuple[List[str], int]:
         if ra != rb:
             parent[ra] = rb
 
-    # Phase 3 S3: optional embedding channel (complements lexical; when the
-    # embedding API is down this degrades to lexical-only)
+    # Phase 3 S3: 可选嵌入通道 (词法不达标时补充同主题判定; 嵌入不可用 → 纯词法)
     mergeable = [e for i, e in enumerate(entries) if i not in skip]
     emb_map = _embed_batch(mergeable) if len(mergeable) >= 2 else None
     for i in range(n):
@@ -1025,8 +1051,8 @@ def _norm_sentence(s: str) -> str:
     """规范化句子用于去重: 去空白/标点, 保留括号内容, 小写。
 
     括号内容 (路径/注释/别名如 Code Drive、SMB 共享) 是语义核心,
-    删除会导致同义句 "D 盘=/srv/data (Code Drive...)" 与
-    "D 盘=Code Drive (path=/srv/data...)" 规范化后反而不同。
+    删除会导致同义句 "D 盘=/home/user/D (Code Drive...)" 与
+    "D 盘=Code Drive (path=/home/user/D...)" 规范化后反而不同。
     """
     s = re.sub(r"[\s，。！？；;、,：:·\-—/\\=_]+", "", s)
     return s.lower()
@@ -1193,11 +1219,10 @@ def _llm_merge(base: str, new_sentences: List[str]) -> Optional[str]:
 # B: 长条目压缩阈值 (2026-08-07) — keep 且超过此长度的条目, 溢流时尝试 LLM 压缩
 _COMPRESS_MIN_CHARS = 200
 
-
 def _llm_compress(client, entry: str) -> Optional[str]:
     """LLM 压缩长记忆条目为精简版 (保留全部关键信息, 细节已沉冷层)。
 
-    边界 (与 _llm_merge 同款):
+    边界 (与 _llm_merge 同款, 遵循 LLM 增强方案 C 原则):
     - 只做\"压缩\", 不自由发挥 (prompt 硬约束: 保留路径/数字/日期/专有名词,
       不添加/不推断/不修改事实);
     - 失败路径 (无 key / 网络错误 / 超时 / 解析失败 / 信息保留校验不过 /
@@ -1277,14 +1302,15 @@ def _llm_compress(client, entry: str) -> Optional[str]:
 
 def _recall_safe(client, entry: str) -> List[Dict[str, Any]]:
     """安全调用 recall_results, 截前 200 字作查询。"""
-    # 长条目 (>250字) 用首尾拼接 (前150+后100), 保留首部语义 + 尾部关键信息
+    # P3-5: 长条目用首尾拼接 (前150+后100), 保留首部语义 + 尾部关键信息
     if len(entry) > 250:
         query = entry[:150] + " " + entry[-100:]
     else:
         query = entry[:200]
-    # 内部查重召回只读 — _recall_safe 仅服务溢流内部决策路径
-    # (跨层查重/下沉匹配/冷迁移/过时处理), 不服务用户召回路径;
-    # bump=False 避免污染 last_recalled (与治理枚举同根因)。
+    # 遗留2 (2026-08-23): 内部查重召回只读 — _recall_safe 仅服务溢流内部
+    # 决策路径 (跨层查重/下沉匹配/冷迁移/过时处理), 不服务用户召回路径
+    # (用户查询走 server.py recall 工具, 默认 bump=True 不受影响);
+    # bump=False 避免污染 last_recalled (与 P1-1 同根因)。
     return client.recall_results(query, top_k=_RECALL_TOP_K, bump=False)
 
 
@@ -1362,3 +1388,517 @@ def _rebuild_file(store, target: str, entries: List[str]) -> None:
     """合并后重建文件 (调用 store 的原子写)。"""
     path = store._path_for(target)
     store._write_entries(path, entries)
+
+
+# =============================================================================
+# Phase 4: 热层规则预算制 (LRU 缓存模型, 2026-08-26 设计定稿)
+# 设计: /tmp/memorycore-lru-design.md + /tmp/memorycore-lru-signal-design.md
+# 铁律: 无永久规则; 保护=乘数非豁免; 寿命由活性决定 (LRU 触达语义)
+# =============================================================================
+
+# ---- 系统噪声前缀黑名单 (fresh 查询清洗; 实测占日志 3.2%) -------------
+_NOISE_PREFIXES = (
+    "[IMPORTANT:", "[ASYNC DELEGATION", "[SUBAGENT", "[TOOL ",
+    "[BACKGROUND", "[OUT-OF-BAND",
+)
+
+
+def _emb_cache_path(target: str) -> Path:
+    """规则向量缓存文件 (MEMORY.emb.json / USER.emb.json, 与 .md 同目录)。"""
+    base = USER_FILE if target == "user" else MEMORY_FILE
+    return base.with_suffix(".emb.json")
+
+
+def _emb_cache_load(target: str) -> Dict[str, List[float]]:
+    """读向量缓存; 损坏/缺失 → {} (视为全缺失, 重嵌一次, 失败方向安全)。"""
+    p = _emb_cache_path(target)
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _emb_cache_save(target: str, data: Dict[str, List[float]]) -> None:
+    """原子写向量缓存 (tempfile + os.replace; 与 MetaStore 同模式)。"""
+    p = _emb_cache_path(target)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".memcore-emb-",
+                                   suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception:
+        pass  # 缓存失败不影响机制 (下次重嵌)
+
+
+def _rule_weight_eff(meta: Dict[str, Any],
+                     now: Optional[datetime] = None) -> float:
+    """惰性折现权重: w_eff = weight × 0.5 ^ ((now-last_active)/half_life)。
+
+    排序时才计算, 不写 sidecar (与冷层 decay.py 同模式, 无后台任务)。
+    缺失字段回退: weight=WEIGHT_INIT, last_active=written_at (零迁移成本)。
+    """
+    now = now or datetime.now(timezone.utc)
+    weight = float(meta.get("weight") or WEIGHT_INIT)
+    last = meta.get("last_active_at") or meta.get("written_at") or meta.get("updated_at")
+    dt = _parse_iso(str(last)) if last else None
+    if dt is None:
+        return weight
+    days = max((now - dt).days, 0)
+    return weight * (0.5 ** (days / WEIGHT_HALF_LIFE_DAYS))
+
+
+def _bump_weight(meta: Dict[str, Any], increment: float,
+                 refresh_anchor: bool, now: Optional[datetime] = None) -> None:
+    """命中加分 (幂等): 先折现再加 → weight = min(w_eff+inc, WEIGHT_MAX)。
+
+    强命中 (refresh_anchor=True) 刷新 last_active_at; 弱命中只小幅托底,
+    不刷新锚点 (弱命中不破坏区分度的关键设计)。
+    """
+    now = now or datetime.now(timezone.utc)
+    eff = _rule_weight_eff(meta, now)
+    meta["weight"] = min(eff + increment, WEIGHT_MAX)
+    if refresh_anchor:
+        meta["last_active_at"] = now.isoformat()
+
+
+def _lex_evidence(a: str, b: str) -> bool:
+    """词法弱命中判据: 归一化后共享 bigram ≥ LEX_EVIDENCE_BIGRAMS。
+
+    用户 FP 例 (sb=2) 保住弱命中语义; sb≥1 太宽 (37.2%), ratio 系判据
+    真实数据全灭 (实测 780 对通过 0 对, 仅作审计/降级用)。
+    """
+    na, nb = _norm_sentence(a), _norm_sentence(b)
+    if len(na) < 2 or len(nb) < 2:
+        return False
+    sa = {na[i:i + 2] for i in range(len(na) - 1)}
+    sb = {nb[i:i + 2] for i in range(len(nb) - 1)}
+    return len(sa & sb) >= LEX_EVIDENCE_BIGRAMS
+
+
+def _load_fresh_queries(metastores: Dict[str, MetaStore]) -> List[str]:
+    """fresh 查询清洗管线 (扫描端, 不动采集端)。Phase 4 命中扫描输入。
+
+    1. 30 天窗口 (ts, query) 元组 (load_recent_queries_with_ts)
+    2. fresh 过滤: ts > 各规则 last_scan_at 下界 (min, 保守不丢查询)
+    3. 系统噪声前缀过滤 + 内容去重 (保留最新) + 截断 200 字
+    4. 取**最近** FRESH_QUERY_SCAN_CAP 条 (增量语义; 追加式日志尾部=最新)
+    """
+    if not ACTIVITY_LOG_ENABLED:
+        return []
+    try:
+        rows = load_recent_queries_with_ts(days=ACTIVITY_WINDOW_DAYS)
+    except Exception:
+        return []
+    if not rows:
+        return []
+    now = datetime.now(timezone.utc)
+    # fresh 下界 = max(最晚扫描点, now-30d) — 增量语义:
+    # 全部规则扫过后 (last_scan_at=now) → 下界=now → 下一轮只扫新查询;
+    # 新规则 (written_at=now, 无 last_scan_at) → 出生前查询不扫 (设计 §6.1)。
+    scan_lower = now - timedelta(days=ACTIVITY_WINDOW_DAYS)
+    scan_upper: Optional[datetime] = None
+    for ms in metastores.values():
+        for m in _iter_meta_values(ms):
+            ts = m.get("last_scan_at") or m.get("written_at")
+            dt = _parse_iso(str(ts)) if ts else None
+            if dt and (scan_upper is None or dt > scan_upper):
+                scan_upper = dt
+    if scan_upper is not None:
+        scan_lower = max(scan_lower, scan_upper)
+    # 倒序遍历 (最近优先), 增量过滤 + 噪声过滤 + 去重 (保留最新)
+    fresh: List[str] = []
+    seen = set()
+    for ts, q in reversed(rows):
+        if ts is not None and ts < scan_lower:
+            continue
+        q = (q or "").strip()
+        if not q:
+            continue
+        if q.startswith(_NOISE_PREFIXES):
+            continue
+        h = hashlib.sha256(q.encode()).hexdigest()[:16]
+        if h in seen:
+            continue
+        seen.add(h)
+        fresh.append(q[:200])
+        if len(fresh) >= FRESH_QUERY_SCAN_CAP:
+            break
+    fresh.reverse()  # 恢复时间升序 (嵌入/排序无影响, 语义一致)
+    return fresh
+
+
+def _iter_meta_values(ms: MetaStore):
+    """枚举 MetaStore sidecar 的元数据值 (供 last_scan_at 下界扫描)。
+
+    直接读 sidecar data values, 不依赖条目内容 (键是 sha256, 内容不可反推)。
+    """
+    try:
+        return list(ms._load_unlocked().values())
+    except Exception:
+        return []
+
+
+def _embed_batch_mnemosyne(client, texts: List[str]) -> Optional[List[List[float]]]:
+    """方案 b: 经 Mnemosyne embed_texts 批量嵌入 (与 recall 同分数空间)。
+
+    按 EMBED_BATCH_MAX 分片; 任一异常 → None (降级纯词法, 保守方向)。
+    EMBED_BACKEND 接线 (M3, 2026-08-26):
+      mnemosyne (默认) → client.embed_texts (方案 b, 分数空间一致)
+      ollama      → 本地 _embed_batch (方案 c, 需重校准阈值)
+      off         → None (强制降级纯词法)
+    """
+    if EMBED_BACKEND == "off":
+        return None
+    if EMBED_BACKEND == "ollama":
+        # 本地 ollama 通道 (S3 聚簇嵌入复用): 可用 → list of vectors
+        try:
+            res = _embed_batch(texts)
+            if isinstance(res, dict):
+                emb = res.get("embeddings")
+                if (isinstance(emb, list) and emb
+                        and isinstance(emb[0], list)):
+                    return emb
+        except Exception:
+            return None
+        return None
+    out: List[List[float]] = []
+    try:
+        for i in range(0, len(texts), EMBED_BATCH_MAX):
+            chunk = texts[i:i + EMBED_BATCH_MAX]
+            vecs = client.embed_texts(chunk)
+            if not vecs or len(vecs) != len(chunk):
+                return None
+            out.extend(vecs)
+        return out
+    except Exception:
+        return None
+
+
+def _rule_vectors(metastores: Dict[str, MetaStore], rules: Dict[str, List[str]],
+                  client) -> Dict[str, Dict[str, List[float]]]:
+    """规则向量: sidecar 缓存命中 + 缺失批量补嵌 (惰性, 每轮 ≤1 批)。
+
+    返回 {target: {entry: [f32...]}}。embedding 不可达 → 该 target 返回 {}。
+    L5 (2026-08-26): save 前用当前 meta 键集合过滤孤儿键 —
+    规则内容变更后旧 sha256 键永存会缓慢膨胀, 此处对齐 GC。
+    """
+    result: Dict[str, Dict[str, List[float]]] = {}
+    for target, entries in rules.items():
+        if not entries:
+            result[target] = {}
+            continue
+        cache = _emb_cache_load(target)
+        vecs: Dict[str, List[float]] = {}
+        missing: List[str] = []
+        for e in entries:
+            h = hashlib.sha256((e or "").strip().encode()).hexdigest()
+            if h in cache and isinstance(cache[h], list):
+                vecs[e] = cache[h]
+            else:
+                missing.append(e)
+        if missing:
+            mvecs = _embed_batch_mnemosyne(client, missing)
+            if mvecs:
+                for e, v in zip(missing, mvecs):
+                    vecs[e] = v
+                    cache[hashlib.sha256((e or "").strip().encode()).hexdigest()] = v
+                # 孤儿 GC: 只保留当前规则集的键 (内容变更/删除的旧键清除)
+                live = {hashlib.sha256((e or "").strip().encode()).hexdigest()
+                        for e in entries}
+                stale = [k for k in cache if k not in live]
+                for k in stale:
+                    cache.pop(k, None)
+                _emb_cache_save(target, cache)
+        result[target] = vecs
+    return result
+
+
+def apply_activity_hits(metastores: Dict[str, MetaStore],
+                        entries_by_target: Dict[str, List[str]],
+                        client, stat: dict) -> None:
+    """Phase 4 活性信号: 语义两级判定 (实测校准, 2026-08-26)。
+
+    fresh 查询 → 批量嵌入 → 与规则向量全对余弦 (缓存后 ≈ 免费)
+      cos_max ≥ HIT_STRONG_COS → 强命中 +1.0/轮 (封顶, 刷新锚点)
+      embedding 不可达 → 降级纯词法弱命中 +0.3 (HIT_WEAK_MODE=degraded)
+    词法证据 (sb≥2) 正常模式仅作审计字段 (hits_lex), 不加分。
+    """
+    if not RULE_BUDGET_ENABLED:
+        return
+    rules: Dict[str, List[str]] = {}
+    for t, entries in entries_by_target.items():
+        rs = []
+        for e in entries:
+            m = metastores[t].get_entry(e)
+            if m and m.get("type") == "rule":
+                rs.append(e)
+        if rs:
+            rules[t] = rs
+    if not rules:
+        return
+    queries = _load_fresh_queries(metastores)
+    if not queries:
+        return
+    stat["scan_queries"] = len(queries)
+    # 查询嵌入 (每轮唯一真实成本, 1 批)
+    qvecs = _embed_batch_mnemosyne(client, queries)
+    if qvecs is None:
+        # 降级: 纯词法弱命中 (degraded 模式)
+        if HIT_WEAK_MODE == "degraded":
+            _degraded_lexical_hits(metastores, rules, queries, stat)
+        stat["embed_fail"] = stat.get("embed_fail", 0) + 1
+        return
+    rvecs = _rule_vectors(metastores, rules, client)
+    now = datetime.now(timezone.utc)
+    for target, rs in rules.items():
+        for e in rs:
+            meta = metastores[target].get_entry(e)
+            if not meta:
+                continue
+            rv = rvecs.get(target, {}).get(e)
+            if not rv:
+                continue
+            cos_max = max((_cosine(qv, rv) for qv in qvecs), default=0.0)
+            if cos_max >= HIT_STRONG_COS:
+                _bump_weight(meta, HIT_STRONG_INCREMENT, refresh_anchor=True, now=now)
+                stat["hits_strong"] = stat.get("hits_strong", 0) + 1
+            elif (HIT_WEAK_MODE == "grey" and cos_max >= HIT_WEAK_COS
+                    and any(_lex_evidence(q, e) for q in queries)):
+                # grey 档 (用户可开): 灰区语义 + 词法佐证 → 弱命中 (不刷新锚点)
+                _bump_weight(meta, HIT_WEAK_INCREMENT, refresh_anchor=False, now=now)
+                stat["hits_weak"] = stat.get("hits_weak", 0) + 1
+            else:
+                if any(_lex_evidence(q, e) for q in queries):
+                    stat["hits_lex"] = stat.get("hits_lex", 0) + 1
+            meta["last_scan_at"] = now.isoformat()
+            try:
+                metastores[target].stamp(
+                    e, meta.get("type", "rule"),
+                    written_at=_parse_iso(meta.get("written_at")) if meta.get("written_at") else None,
+                    updated_at=_parse_iso(meta.get("updated_at")) if meta.get("updated_at") else None,
+                    origin=meta.get("origin", "hermes"),
+                    importance=float(meta.get("importance") or 0.8),
+                    weight=float(meta.get("weight") or WEIGHT_INIT),
+                    last_active_at=_parse_iso(meta.get("last_active_at")) if meta.get("last_active_at") else None,
+                    last_scan_at=now,
+                    cold_id=meta.get("cold_id"),
+                )
+            except Exception:
+                pass  # 盖章失败不影响机制 (下次 reconcile 补)
+
+
+def _degraded_lexical_hits(metastores: Dict[str, MetaStore],
+                           rules: Dict[str, List[str]],
+                           queries: List[str], stat: dict) -> None:
+    """降级模式弱命中: 任一 fresh 查询共享 bigram ≥2 → +0.3/轮 (封顶, 不刷新锚点)。"""
+    now = datetime.now(timezone.utc)
+    for target, rs in rules.items():
+        for e in rs:
+            meta = metastores[target].get_entry(e)
+            if not meta:
+                continue
+            if any(_lex_evidence(q, e) for q in queries):
+                _bump_weight(meta, HIT_WEAK_INCREMENT, refresh_anchor=False, now=now)
+                stat["hits_weak"] = stat.get("hits_weak", 0) + 1
+            meta["last_scan_at"] = now.isoformat()
+            try:
+                metastores[target].stamp(
+                    e, meta.get("type", "rule"),
+                    written_at=_parse_iso(meta.get("written_at")) if meta.get("written_at") else None,
+                    updated_at=_parse_iso(meta.get("updated_at")) if meta.get("updated_at") else None,
+                    weight=float(meta.get("weight") or WEIGHT_INIT),
+                    last_active_at=_parse_iso(meta.get("last_active_at")) if meta.get("last_active_at") else None,
+                    last_scan_at=now,
+                    origin=meta.get("origin", "hermes"),
+                    importance=float(meta.get("importance") or 0.8),
+                    cold_id=meta.get("cold_id"))
+            except Exception:
+                pass
+
+
+def _rule_rank(entry: str, meta: Dict[str, Any], now: datetime) -> float:
+    """退役排序权重: w_rank = w_eff × mult (升序 = 先被挤)。
+
+    mult: A类/红线/importance≥0.9 → ×WEIGHT_PROTECT_MULT (更难挤, 非豁免);
+    kw 可沉型 (should_keep_local=False) → ×WEIGHT_KWSINK_MULT (优先挤)。
+    """
+    eff = _rule_weight_eff(meta, now)
+    mult = WEIGHT_PROTECT_MULT if _is_protected_rule(entry, meta) else 1.0
+    if not should_keep_local(entry):
+        mult *= WEIGHT_KWSINK_MULT
+    return eff * mult
+
+
+def _select_retirement_candidates(store, metastore, target: str,
+                                  need_chars: int, stat: dict) -> List[str]:
+    """按 w_rank 升序选择退役候选 (驻留期是唯一硬门槛)。
+
+    tie-break 三级: w_rank → last_active_at 早 → 字符长 → sha256 (幂等确定)。
+    返回按挤出顺序排列的候选条目列表; 冷层失败由调用方 break。
+
+    Phase 4 修正: protected 规则 (A 类/红线/importance≥0.9) 不参与 LRU 挤权 —
+    保留 Phase 3 设计定稿的"A 类绝不误伤"; "无永久保留"铁律由阶段 3 的
+    '长期失活降级' 路径实现 (protected 规则 N 天无命中 → 降级为普通规则后
+    再参与挤权)。
+    """
+    now = datetime.now(timezone.utc)
+    # 词法活跃保护: 近 7 天查询中 sb≥2 词法命中的规则不参与挤权
+    # (纯词法零 LLM — 避免 _rule_topic_dormant 的 LLM 确认段: 无 API key 时
+    #  全部判活跃 → 挤权失效; 有 key 时同步路径 LLM 瀑布时延失控)
+    # 窗口用 7 天而非全量 30 天: 实测 sb≥2 在 30 查询窗口覆盖 24/26 规则,
+    # 全量 350 条会几乎全活跃 → 挤权名存实亡。
+    try:
+        _active_queries = (load_recent_queries(days=7)
+                           if ACTIVITY_LOG_ENABLED else [])
+    except Exception:
+        _active_queries = []
+    cands = []
+    for e in store.entries(target):
+        m = metastore.get_entry(e)
+        if not m or m.get("type") != "rule":
+            continue
+        # 驻留期硬门槛 (新规则/恢复规则 7 天内不挤) — 最先过滤,
+        # 避免刚盖章的填充/新条目先触发词法判定 (零成本原则)
+        age = entry_age_days(m, now=now)
+        if age is not None and age < RULE_MIN_RESIDENCY_DAYS:
+            continue
+        if _active_queries and any(_lex_evidence(q, e) for q in _active_queries):
+            continue  # 词法活跃 (sb≥2) → 不挤 (宁可不挤, 不误伤在用规则)
+        # 2026-08-26 设计定稿 (方案 B): protected 规则 (A 类/红线/importance≥0.9)
+        # 也参与挤权 — 铁律"热层无永久保留"; 保护只是权重乘数 (×3.0 更难挤,
+        # 衰减后同样退役)。不豁免。
+        wrank = _rule_rank(e, m, now)
+        last = m.get("last_active_at") or m.get("written_at") or ""
+        cands.append((wrank, last, -len(e), hashlib.sha256(e.encode()).hexdigest(), e))
+    cands.sort(key=lambda c: (c[0], c[1], c[2], c[3]))
+    selected = []
+    freed = 0
+    for wrank, last, neglen, h, e in cands:
+        if freed >= need_chars:
+            break
+        if len(selected) >= MAX_EVICT_PER_RUN:
+            break
+        selected.append(e)
+        freed += len(e)
+    return selected
+
+
+def enforce_rule_budget(store, client, target: str, metastore,
+                        stat: dict) -> None:
+    """规则预算检查 + 挤权 (Phase 4 核心): rule+stub 字符超预算 → 退役最低权重规则。
+
+    安全顺序: 冷层写成功才动本地 (stub-sink/retype 现有语义);
+    冷层失败 → break (不丢数据, 下轮再试); 每轮 ≤ MAX_EVICT_PER_RUN。
+    """
+    if not RULE_BUDGET_ENABLED:
+        return
+    # 无活性信号 (日志关闭) → 预算机制禁用 (LRU 依赖活性才有意义;
+    # 退化为纯年龄排序又回到年龄不可靠的旧问题)。靠 5000 硬上限兜底。
+    if not ACTIVITY_LOG_ENABLED:
+        return
+    # 独立调用 (store_fact 写后) 传空 dict — 初始化被调函数依赖的计数键
+    for _k in ("stubbed", "errors", "retyped", "overflowed", "kept",
+               "aged_sunk"):
+        stat.setdefault(_k, 0)
+    entries = store.entries(target)
+    rule_chars = 0
+    for e in entries:
+        m = metastore.get_entry(e)
+        if m and m.get("type") in ("rule", "stub"):
+            rule_chars += len(e)
+    if rule_chars <= RULE_BUDGET_CHARS:
+        return
+    need = rule_chars - RULE_BUDGET_CHARS
+    anchor_parts: List[str] = []
+    for e in _select_retirement_candidates(store, metastore, target, need, stat):
+        if rule_chars <= RULE_BUDGET_CHARS:
+            break
+        before_n = (stat.get("stubbed", 0) + stat.get("retyped", 0)
+                    + stat.get("overflowed", 0))
+        m = metastore.get_entry(e)
+        if m and _rule_retype_eligible(e):
+            # 完成态记录 → 全文冷迁移, 不留指针 (历史记录无需召回钩子)
+            try:
+                _handle_rule_retype(store, client, target, e, m,
+                                    metastore, stat, anchor_parts)
+            except Exception:
+                stat["errors"] = stat.get("errors", 0) + 1
+            released = len(e)
+        else:
+            try:
+                _handle_rule_stub_sink(store, client, target, e, metastore,
+                                       stat, anchor_parts)
+            except Exception:
+                stat["errors"] = stat.get("errors", 0) + 1
+            # L1: stub 后本地仍占 ~40 字指针 — 实际释放 = len(e) - len(stub)
+            released = len(e) - len(_make_stub(e))
+        after_n = (stat.get("stubbed", 0) + stat.get("retyped", 0)
+                   + stat.get("overflowed", 0))
+        if after_n == before_n:
+            break  # 冷层失败/未动 → 停止 (不丢数据)
+        rule_chars -= max(released, 0)
+        stat["lru_evicted"] = stat.get("lru_evicted", 0) + 1
+    # L7 (2026-08-26): flush 挤掉的 user 偏好进 [用户偏好摘要] 锚点 —
+    # 否则 store_fact/direct_write 路径挤掉的偏好不进锚点 (仅 run_overflow 末尾 flush)
+    if target == "user" and anchor_parts:
+        try:
+            _update_pref_anchor(client, store, anchor_parts, stat)
+        except Exception:
+            pass
+
+
+def restore_stubs_from_results(store, metastores: Dict[str, MetaStore],
+                               results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """召回恢复 (Phase 4): recall 结果命中 stub 的 cold_id → 替换指针为全文。
+
+    恢复全文是新 sidecar 键 (sha256 不同) → written_at=now → 天然 7 天驻留
+    + 高权重 (WEIGHT_INIT + HIT_STRONG_INCREMENT), 不会"恢复即被再挤"。
+    返回未恢复的结果列表 (已恢复的从注入中剔除, 防重复注入)。
+    """
+    if not results:
+        return results
+    # 建 cold_id → (target, stub) 映射
+    id2stub = {}
+    for target, ms in metastores.items():
+        try:
+            for e in store.entries(target):
+                m = ms.get_entry(e)
+                if m and m.get("type") == "stub" and m.get("cold_id"):
+                    id2stub[m["cold_id"]] = (target, e)
+        except Exception:
+            continue
+    if not id2stub:
+        return results
+    now = datetime.now(timezone.utc)
+    restored_ids = set()
+    for r in results:
+        rid = r.get("id")
+        if not rid or rid not in id2stub:
+            continue
+        target, stub = id2stub[rid]
+        content = r.get("content") or ""
+        if not content:
+            continue
+        try:
+            if store.replace(target, stub, content).get("success"):
+                # L3 (2026-08-26): 从 stub meta 透传原 importance —
+                # 否则 importance≥0.9 的受保护规则被挤后恢复, 保护线丢失
+                # (文本标记保护仍在, 但 importance 保护线归零)。
+                stub_meta = metastores[target].get_entry(stub) or {}
+                orig_imp = float(stub_meta.get("importance") or 0.8)
+                metastores[target].stamp(
+                    content, "rule", origin="stub_restore",
+                    weight=WEIGHT_INIT + HIT_STRONG_INCREMENT,
+                    last_active_at=now,
+                    importance=orig_imp,
+                )
+                restored_ids.add(rid)
+        except Exception:
+            continue
+    if restored_ids:
+        return [r for r in results if r.get("id") not in restored_ids]
+    return results

@@ -13,7 +13,7 @@ Agent 积累记忆的速度很快——偏好、事实、决策——而不维�
 
 两层之间,一个治理核心维持记忆健康:
 
-- **写入时去重** —— 相似事实在存入前合并,而不是重复堆积。
+- **写入时去重** —— 通过全角→半角归一化、空白折叠、标点后空格删除 (`normalize_for_compare`) 后再比较去重;写入仍保留原始内容。
 - **容量控制** —— 软/硬阈值在热层写满之前触发溢流,让它永不拒绝写入。
 - **冷层治理** —— 周期性去重/清理,让冷层在增长中保持可检索。
 - **回收站** —— 被删除的条目有 30 天宽限期;召回一条被回收的记忆即可复活它。
@@ -26,6 +26,7 @@ Agent 积累记忆的速度很快——偏好、事实、决策——而不维�
 
 - **记忆治理(核心)** —— 冷层数据完整性的三层保护:
   - **冷层写入去重**:写入冷层前,语义召回 + LLM 判断检查重复,更新已有条目而非创建冗余。
+  - **热层去重归一化**:`normalize_for_compare` 执行全角→半角转换、空白折叠、标点后空格删除——确保去重在 CJK 标点变体和输入噪声下依然有效。写入始终保留原始内容。
   - **容量硬闸**:冷层强制软上限(6000 条,触发一次治理)和硬上限(10000 条,强制治理循环)——防止无界增长。
   - **回收站**(`trash_store.py`):被删除的冷层条目移入 `~/.memorycore/trash.json`,30 天过期。召回被回收的条目时,若带有新的语义证据则恢复("召回即复活")。
 - **冷/热路由** —— 每次写入都被分类:高重要度或偏好类 → 热层(本地);低频事实 → 冷层(远程);过时状态记录 → 丢弃。
@@ -144,6 +145,8 @@ python -m memorycore.server
 | `memorycore_trigger_overflow(target)` | 执行六步溢流,目标 ≤40% |
 | `memorycore_run_cold_storage_maintenance()` | 冷层治理流程 |
 | `memorycore_get_memory_usage()` | 热层用量 + 冷层统计 + 阈值 |
+| `memorycore_memory_audit(target)` | 热层体检:条目类型/年龄/keep/sink 判定/LRU 观测/sink 候选 |
+| `memorycore_get_rule_weight(target)` | 规则权重分布(只读 LRU 监控):w_eff、字符vs预算、下一批退役候选 |
 
 ## Hermes 集成 —— 每轮主动召回 prefetch
 
@@ -263,8 +266,14 @@ hermes config set memory.provider memorycore-prefetch
 
 ### 体检工具: memorycore_memory_audit
 
-只读工具,列出热层每条条目的类型、年龄、退役计划与 keep/sink 判定 ——
-排查"溢流空转"(热层满了却无条目可沉)的观测锚点。
+只读工具,列出热层每条条目的类型、年龄、退役计划与 keep/sink 判定,并附带
+Phase 4 LRU 观测(每条规则的 weight / 有效权重 / 最近活跃 / 驻留天数)与
+规则字符-预算对比 —— 排查"溢流空转"(热层满了却无条目可沉)的观测锚点。
+
+活性维度 sink 候选 (2026-08-28):对 rule 型条目,若 `weight < 1.5` 且
+`last_active_at` 距今超过 30 天且非 protected,体检将该条目标记为
+`sink_candidate: true`(reason 为 `low_weight+inactive`),并汇总至
+`lru_sink_candidates` 计数器 —— 仅体检可见,不改变溢流执行逻辑。
 
 ## 规模化测试与优化结果
 

@@ -7,7 +7,7 @@ Two backends, same interface (remember/recall/update/forget/stats):
 
 Selection: env MEMORYCORE_COLD_BACKEND, default "local".
 
-AML (Agent Memory Leaderboard) multi-tenant isolation:
+Multi-tenant isolation (AML per-user engines):
   remember/recall/update/forget accept optional identity filters
   (author_id / author_type / channel_id / source / from_date / to_date).
   - LocalBackend maps author_id to a per-user mnemosyne engine
@@ -45,7 +45,7 @@ class LocalBackend:
     These feed MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL
     which the mnemosyne library reads natively.
 
-    AML identity isolation (author_id):
+    Per-user identity isolation (author_id) — AML:
       The shared engine (session "memorycore") stays the default for
       single-tenant usage.  When author_id is given, writes go through a
       lazily-created per-user engine whose session_id is "aml:<author_id>"
@@ -55,7 +55,7 @@ class LocalBackend:
       across sessions (vector + FTS + fallback paths).
     """
 
-    _AML_SESSION_PREFIX = "aml:"
+    _USER_SESSION_PREFIX = "aml:"
 
     def __init__(self):
         from mnemosyne import Mnemosyne  # noqa: E402
@@ -144,7 +144,7 @@ class LocalBackend:
 
     def _engine_for(self, author_id: str, author_type: Optional[str] = None,
                     channel_id: Optional[str] = None):
-        """Return the per-user mnemosyne engine for an AML user_id.
+        """Return the per-user mnemosyne engine for a user_id.
 
         The engine's session_id is "aml:<author_id>" so exact-content
         dedup (mnemosyne scopes dedup by session_id + content) never
@@ -158,7 +158,7 @@ class LocalBackend:
             if eng is None:
                 from mnemosyne import Mnemosyne  # noqa: E402
                 eng = Mnemosyne(
-                    session_id=f"{self._AML_SESSION_PREFIX}{author_id}",
+                    session_id=f"{self._USER_SESSION_PREFIX}{author_id}",
                     author_id=author_id,
                     author_type=author_type or "agent",
                     channel_id=channel_id or "aml",
@@ -180,7 +180,7 @@ class LocalBackend:
 
         author_id (AML user_id isolation): when set, the write goes through
         a per-user engine (session "aml:<author_id>", author_id stamped).
-        source tags the origin (e.g. message role in AML ingestion).
+        source tags the origin (e.g. message role in multi-user ingestion).
         """
         if author_id:
             engine = self._engine_for(author_id, author_type, channel_id)
@@ -391,6 +391,23 @@ class LocalBackend:
         }
 
     # -- list_all (optional, not in core 5-method contract) -------------
+
+    def embed_texts(self, texts) -> List[List[float]]:
+        """Batch-embed texts via the in-process mnemosyne library.
+
+        Same score space as recall (same model, empty doc prefix).
+        Unavailable/failure -> [] (caller degrades to lexical mode).
+        """
+        if not texts:
+            return []
+        try:
+            from mnemosyne.core import embeddings as _emb  # noqa: E402
+            vecs = _emb.embed(list(texts))
+            if vecs is None:
+                return []
+            return [[round(float(x), 6) for x in v] for v in vecs]
+        except Exception:
+            return []
 
     def list_all(self) -> List[Dict[str, Any]]:
         """List all memories (both working + episodic)."""
@@ -685,6 +702,24 @@ class RemoteBackend:
 # ColdStoreClient — factory that picks backend based on env
 # ═══════════════════════════════════════════════════════════════════════════
 
+    def embed_texts(self, texts) -> List[List[float]]:
+        """Batch-embed texts via the remote MCP service's embed_texts tool.
+
+        Same score space as recall (same model). Unavailable/failure -> []
+        (caller degrades to lexical mode).
+        """
+        if not texts:
+            return []
+        try:
+            raw = self._call_tool("embed_texts", {"texts": list(texts)})
+            data = raw.get("raw", raw) if isinstance(raw, dict) else raw
+            if not isinstance(data, dict) or data.get("status") != "ok":
+                return []
+            emb = data.get("embeddings")
+            return emb if isinstance(emb, list) else []
+        except Exception:
+            return []
+
 class ColdStoreClient:
     """Cold-tier client factory.
 
@@ -784,6 +819,10 @@ class ColdStoreClient:
 
     def list_all(self) -> List[Dict[str, Any]]:
         return self._backend.list_all()
+
+    def embed_texts(self, texts) -> List[List[float]]:
+        """Batch-embed via the active backend (Phase 4 LRU activity signal)."""
+        return self._backend.embed_texts(texts)
 
 
 # -- CLI quick-test --------------------------------------------------------

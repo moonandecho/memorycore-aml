@@ -158,3 +158,40 @@ IMPORTANCE_PROTECT = 0.9
 # S3 clustering embedding channel (optional enhancement; falls back to
 # lexical-only when the embedding API is unavailable)
 CLUSTER_EMBED_THRESHOLD = 0.85
+
+# ---- Phase 4: hot-tier rule budget (LRU cache model, 2026-08-26) ----
+# Design: /tmp/memorycore-lru-design.md + /tmp/memorycore-lru-signal-design.md
+# Iron rule: no rule is permanently kept; protection is a weight multiplier,
+# lifetime is decided by activity (LRU touch semantics).
+RULE_BUDGET_CHARS = 3200            # rule ecology (rule+stub) char hard budget = 64% cap
+RULE_BUDGET_ENABLED = os.environ.get("MEMORYCORE_RULE_BUDGET_ENABLED", "1") != "0"  # rollback switch
+RULE_MIN_RESIDENCY_DAYS = 7         # new/restored rule min residency (temporary protection)
+WEIGHT_INIT = 1.0                   # new rule initial weight
+WEIGHT_HIT_INCREMENT = 1.0          # one strong hit ~ cancels one half-life (30d)
+WEIGHT_MAX = 5.0                    # weight cap (relative ordering unchanged)
+WEIGHT_HALF_LIFE_DAYS = 30          # half-life = ACTIVITY_WINDOW_DAYS (self-consistent)
+WEIGHT_PROTECT_MULT = 3.0           # A-class/red-line/importance>=0.9 multiplier: 3x harder to evict
+WEIGHT_KWSINK_MULT = 0.5            # kw-sinkable rules (should_keep_local=False) weight halved
+MAX_EVICT_PER_RUN = 3               # eviction cap per run (matches MAX_STUB_PER_RUN)
+# ---- Audit activity-dimension sink candidates (2026-08-28) ----
+# rule 型条目: weight 低于 AUDIT_SINK_WEIGHT_THRESHOLD 且 last_active_at
+# 距今超过 AUDIT_SINK_INACTIVE_DAYS 且非 protected → audit 标为 sink_candidate。
+# 仅体检可见性, 不改溢流执行逻辑 (实际被挤仍需超预算触发 enforce_rule_budget)。
+AUDIT_SINK_WEIGHT_THRESHOLD = 1.5
+AUDIT_SINK_INACTIVE_DAYS = 30
+
+# ---- Phase 4 activity signal (semantic two-tier, calibrated 2026-08-26) ----
+# Measured on real data: _topic_overlap passes 0/780 pairs (lexical-only main
+# signal is dead); noise band 0.25-0.45, relevant band 0.55-0.76.
+HIT_STRONG_COS = 0.48               # strong-hit threshold (3-way calibration: S5 0.48 / noise p90=0.487 / prefetch 0.4665)
+HIT_WEAK_COS = 0.42                 # grey-band lower bound (only with HIT_WEAK_MODE=grey)
+HIT_STRONG_INCREMENT = 1.0          # strong-hit increment (design value)
+HIT_WEAK_INCREMENT = 0.3            # weak-hit increment (conservative noise suppression)
+HIT_CAP_PER_SCAN = 1                # per-rule per-scan cap (saturation math: uncapped pins all rules at 5.0 in 1-2 days)
+HIT_WEAK_MODE = os.environ.get("MEMORYCORE_HIT_WEAK_MODE", "degraded")  # degraded/off/grey
+LEX_EVIDENCE_BIGRAMS = 2            # lexical weak hit: shared bigrams >= 2 (measured FP case has 2)
+FRESH_QUERY_SCAN_CAP = 50           # fresh queries per scan (≈1 day of queries, embed cost cap ~2.5s)
+EMBED_BATCH_MAX = 32                # server batch cap (32 ≈2s, keeps FastMCP responsive)
+EMBED_TIMEOUT = 30                  # embed timeout (cold model load measured 15s + margin)
+EMBED_BACKEND = os.environ.get("MEMORYCORE_EMBED_BACKEND", "mnemosyne")  # mnemosyne/ollama/off
+EMBED_MODEL = "qwen3-embedding-ctx256"  # same model as Mnemosyne recall (same score space)

@@ -11,7 +11,7 @@ It works as a two-tier memory system:
 - **Cold tier** — low-frequency facts, automatically migrated out, stored in an in-process SQLite engine (or a remote memory service if you configure one).
 
 Between the two, a governance core keeps memory healthy:
-- **Write-time dedup** — similar facts are merged before storing, not duplicated.
+- **Write-time dedup** — similar facts are deduplicated via full-width/half-width normalization, whitespace folding, and post-punctuation space removal (`normalize_for_compare`) before storing; the original content is kept.
 - **Capacity control** — soft/hard thresholds trigger overflow before the hot tier is full, so it never rejects writes.
 - **Cold-tier governance** — periodic dedup/cleanup passes keep the cold tier findable as it grows.
 - **Recycle bin** — deleted entries get a 30-day grace period; recalling a trashed entry revives it.
@@ -24,6 +24,7 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 
 - **Memory governance (the core)** — three layers of protection for cold-tier data integrity:
   - **Cold-write dedup**: before writing to the cold tier, a semantic recall + LLM judge checks for duplicates and updates existing entries instead of creating redundant ones.
+  - **Hot-tier dedup normalization**: `normalize_for_compare` applies full-width→half-width conversion, whitespace folding, and post-punctuation space removal — ensuring dedup works across CJK punctuation variants and input noise. The original content is always preserved.
   - **Capacity hard gate**: cold tier enforces a soft limit (6000 entries, triggers one maintenance pass) and a hard limit (10000 entries, forces maintenance loops) — prevents unbounded growth.
   - **Recycle bin** (`trash_store.py`): deleted cold-tier entries are moved to `~/.memorycore/trash.json` with a 30-day expiry. Recalling a trashed entry with fresh semantic evidence restores it ("recall to revive").
 - **Cold/hot routing** — every write is classified: high-importance or preference-like → hot (local); low-frequency fact → cold (remote); stale status record → dropped.
@@ -144,6 +145,8 @@ Exposed tools:
 | `memorycore_trigger_overflow(target)` | Run six-step overflow, target ≤40% |
 | `memorycore_run_cold_storage_maintenance()` | Cold-tier governance pass |
 | `memorycore_get_memory_usage()` | Hot-tier usage + cold-tier stats + thresholds |
+| `memorycore_memory_audit(target)` | Hot-tier health check: entry types, age, keep/sink plan, LRU observability, sink candidates |
+| `memorycore_get_rule_weight(target)` | Rule weight distribution (read-only LRU monitor): w_eff, rule_chars vs budget, next eviction candidates |
 
 ## Hermes integration — per-turn prefetch
 
@@ -304,8 +307,17 @@ Constants (`memorycore/core/config.py`): `RULE_RETYPE_DAYS=60`,
 ### Health check: memorycore_memory_audit
 
 A read-only tool listing every hot-tier entry with its type, age,
-retirement plan and keep/sink classification — the observability anchor for
+retirement plan and keep/sink classification, plus Phase 4 LRU
+observability per rule (weight / effective weight / last active / residency
+days) and a rule-chars-vs-budget summary — the observability anchor for
 diagnosing an overflow that finds nothing to sink.
+
+Activity-dimension sink candidates (2026-08-28): for rule-type entries
+where `weight < 1.5` and `last_active_at` is older than 30 days and
+the entry is not protected, the audit marks `sink_candidate: true` with
+`sink_reason: "low_weight+inactive"` and aggregates them into the
+`lru_sink_candidates` counter — visibility-only, does not change
+overflow execution.
 
 ## Scale test & optimisation results
 

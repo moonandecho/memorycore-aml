@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""tests/test_review_fixes.py — final-review regression locks (F1/F3/F4).
+"""tests/test_review_fixes.py — 终审修复回归 (F1/F3/F4)。
 
-Locks the three mandatory final-review fixes:
-  F1: sidecar failure never blocks overflow (reconcile/stamp exceptions
-      degrade to the legacy path, errors+1)
-  F3: replace failure is not counted/stamped (stat integrity)
-  F4: completion-marker negation/pending exclusion
-      (未定稿/未拍板/待拍板/定稿:规范... -> rule)
+终审 FINAL-REVIEW.md 的 3 项必修修复的锁定测试:
+  F1: sidecar 故障不阻塞溢流 (reconcile/stamp 异常降级 legacy, errors+1)
+  F3: replace 失败不计数不盖章 (统计真实性)
+  F4: 完成态词否定/待定前缀排除 (未定稿/未拍板/待拍板/定稿:规范 → rule)
 """
 import sys
 from pathlib import Path
@@ -21,7 +19,7 @@ from memorycore.core.overflow import run_overflow  # noqa: E402
 from conftest import days_ago_str  # noqa: E402
 
 
-# ---- F4: pending/negation exclusion (probes from the final review) ----
+# ---- F4: 否定/待定前缀排除 (探针回归, 终审实证 4 例 + 收紧后正例) ----
 
 @pytest.mark.parametrize("content", [
     "2026-08-16 公众号头像方案未定稿, 两版都保留",
@@ -32,23 +30,22 @@ from conftest import days_ago_str  # noqa: E402
     "2026-08-16 方案定稿前两版都保留",
 ])
 def test_f4_pending_or_rule_like_is_rule(content):
-    """In-progress / precept content must never be typed state (F4 lock)."""
+    """进行中/准则型内容不得误判 state (F4 锁定)。"""
     assert classify_entry_type(content) == "rule", content
 
 
 def test_f4_genuine_completion_still_state():
-    """Genuine completion (拍板/已定稿) still types state (no over-tightening)."""
+    """真完成态 (已定稿/拍板) 仍判 state (收紧不误伤正例)。"""
     assert classify_entry_type(
         f"{days_ago_str(8)} 拍板: GPU 压测方案定稿, 不再更换方案") == "state"
     assert classify_entry_type(
         f"{days_ago_str(2)} 方案已定稿, 不再更换") == "state"
 
 
-# ---- F1: sidecar failure never blocks overflow ----
+# ---- F1: sidecar 故障不阻塞溢流 ----
 
 def test_f1_reconcile_failure_degrades_to_legacy(tmp_store, mock_client, monkeypatch):
-    """reconcile raises OSError -> overflow continues via legacy keywords,
-    errors+1, and the 8-day state entry still sinks through the keyword path."""
+    """reconcile 抛 OSError → 溢流不中断, errors+1, 降级 legacy 关键词路径。"""
     def _boom(self, entries, now=None):
         raise OSError("disk full (mock)")
     monkeypatch.setattr(meta_mod.MetaStore, "reconcile", _boom)
@@ -56,22 +53,21 @@ def test_f1_reconcile_failure_degrades_to_legacy(tmp_store, mock_client, monkeyp
     entry = f"{days_ago_str(8)} 拍板: GPU 压测方案定稿, 不再更换方案"
     tmp_store.add("memory", entry)
     stat = run_overflow(tmp_store, mock_client, "memory")
-    assert stat["errors"] >= 1, "sidecar failure must be counted in errors"
-    # degraded to legacy: the 8-day state still sinks via the keyword path
+    assert stat["errors"] >= 1, "sidecar 故障应记 errors"
+    # 降级 legacy: 8 天 state 仍被关键词路径 (1.5 检测) 下沉, 溢流未中断
     assert entry not in tmp_store.entries("memory")
     assert entry in mock_client.stored
 
 
 def test_f1_stamp_failure_does_not_crash_overflow(tmp_store, mock_client,
                                                   monkeypatch, meta_for):
-    """Compression-path stamp raises OSError -> overflow does not crash,
-    compression still completes (reconcile re-stamps later)."""
+    """压缩分支 stamp 抛 OSError → 溢流不中断, 压缩仍完成 (下次 reconcile 补盖)。"""
     from datetime import datetime, timedelta, timezone
     from memorycore.core import overflow as ov
     filler = "".join(f"这是第{i}条细节, 展开说明背景与过程, 属于可压缩的长尾内容。" for i in range(1, 8))
     entry = f"用户偏好({days_ago_str(40)}): 极简选型。" + filler
     tmp_store.add("memory", entry)
-    # real stamp first (backdate updated_at), then make stamp fail
+    # 先用真 stamp 回填历史 updated_at (monkeypatch 之前)
     meta_for("memory").stamp(entry, "rule",
                              updated_at=datetime.now(timezone.utc) - timedelta(days=40))
 
@@ -83,16 +79,16 @@ def test_f1_stamp_failure_does_not_crash_overflow(tmp_store, mock_client,
     monkeypatch.setattr(ov, "_llm_compress", lambda client, e: compressed)
 
     stat = run_overflow(tmp_store, mock_client, "memory")
-    assert compressed in tmp_store.entries("memory"), "compression must complete (replace succeeded)"
+    assert compressed in tmp_store.entries("memory"), "压缩应完成 (replace 已成功)"
     assert stat["compressed"] == 1
-    assert stat["errors"] == 0, "stamp failure degrades silently (reconcile re-stamps)"
+    assert stat["errors"] == 0, "stamp 失败只降级不计数 (下次 reconcile 补盖)"
+    # 注意: 压缩路径 stamp 已包 try/except pass (F1 修复), 不阻塞不计错
 
 
-# ---- F3: replace result verification ----
+# ---- F3: replace 返回值校验 ----
 
 def test_f3_replace_failure_not_counted(tmp_store, mock_client, monkeypatch, meta_for):
-    """Compression replace fails (concurrent edit) -> compressed not counted,
-    errors+1, original entry stays hot."""
+    """压缩时 replace 失败 (并发编辑) → 不计数 compressed, errors+1, 原条目保留。"""
     from datetime import datetime, timedelta, timezone
     from memorycore.local_store import LocalStore
     from memorycore.core import overflow as ov
@@ -110,6 +106,6 @@ def test_f3_replace_failure_not_counted(tmp_store, mock_client, monkeypatch, met
     monkeypatch.setattr(LocalStore, "replace", _fail_replace)
 
     stat = run_overflow(tmp_store, mock_client, "memory")
-    assert stat["compressed"] == 0, "failed replace must not count compressed"
+    assert stat["compressed"] == 0, "replace 失败不得计数 compressed"
     assert stat["errors"] >= 1
-    assert entry in tmp_store.entries("memory"), "original entry stays hot"
+    assert entry in tmp_store.entries("memory"), "原条目仍在热层"

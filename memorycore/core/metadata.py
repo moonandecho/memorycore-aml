@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from .classifier import classify_entry_type
 from .config import (MEMORY_FILE, USER_FILE, META_SUFFIX,
+                     WEIGHT_INIT,
                      ACTIVITY_LOG_ENABLED, ACTIVITY_LOG_RETENTION_DAYS,
                      ACTIVITY_LOG_MAX_BYTES, ACTIVITY_LOG_FILE,
                      ACTIVITY_WINDOW_DAYS, STUB_PREFIX)
@@ -137,12 +138,20 @@ class MetaStore:
               written_at: Optional[datetime] = None,
               updated_at: Optional[datetime] = None,
               origin: str = "hermes",
-              importance: float = 0.8) -> Dict[str, Any]:
+              importance: float = 0.8,
+              weight: Optional[float] = None,
+              last_active_at: Optional[datetime] = None,
+              last_scan_at: Optional[datetime] = None,
+              cold_id: Optional[str] = None) -> Dict[str, Any]:
         """盖章/覆盖盖章一条元数据 (updated_at 缺省 = now)。返回写入的元数据。
 
         updated_at 参数供测试回填历史时间 (rule 压缩年龄门) 与特殊场景使用。
         importance: Phase 3 S6 protection-line field (default 0.8, backward
         compatible — older sidecars lack it and are read as 0.8).
+        weight/last_active_at/cold_id: Phase 4 LRU fields (defaults for
+        backward compatibility). last_scan_at: Phase 4 scan anchor (absent =
+        not written). rule type refreshes last_active_at=now (write = weak
+        activity signal).
         """
         now = datetime.now(timezone.utc)
         meta = {
@@ -151,7 +160,16 @@ class MetaStore:
             "updated_at": _iso(updated_at or now),
             "origin": origin,
             "importance": importance,
+            "weight": float(weight) if weight is not None else WEIGHT_INIT,
+            "last_active_at": _iso(last_active_at
+                                   if last_active_at is not None
+                                   else (now if entry_type == "rule"
+                                         else (written_at or now))),
         }
+        if last_scan_at is not None:
+            meta["last_scan_at"] = _iso(last_scan_at)
+        if cold_id is not None:
+            meta["cold_id"] = cold_id
         with self._lock():
             data = self._load_unlocked()
             data[self._hash(content)] = meta
@@ -183,8 +201,13 @@ class MetaStore:
                     data[h] = {
                         "type": etype,
                         "written_at": _iso(parse_embedded_date(e) or now),
-                        "updated_at": _iso(now),
+                        # R1 (2026-08-26): age anchor from embedded date, not
+                        # now — stamping 'now' kept every gate window young.
+                        "updated_at": _iso(parse_embedded_date(e) or now),
                         "origin": "legacy",
+                        "weight": WEIGHT_INIT,
+                        "last_active_at": _iso(parse_embedded_date(e) or now),
+                        "last_scan_at": _iso(parse_embedded_date(e) or now),
                     }
                     stamped += 1
             gc = 0
@@ -273,6 +296,13 @@ def direct_write_govern(store, client, target: str, content: str,
 
     if etype == "rule":
         metastore.stamp(content, "rule", origin="hermes")
+        # Phase 4: post-write rule budget check (Hermes built-in memory tool
+        # add/replace; lazy import to avoid cycle). Runs synchronously.
+        try:
+            from .overflow import enforce_rule_budget
+            enforce_rule_budget(store, client, target, metastore, {})
+        except Exception:
+            pass  # budget enforcement failure never blocks the write
         return {"status": "stamped_rule"}
     if etype == "stub":
         metastore.stamp(content, "stub", origin="hermes")
@@ -437,9 +467,20 @@ def load_recent_queries(days: Optional[int] = None) -> List[str]:
     """
     if not ACTIVITY_LOG_ENABLED:
         return []
+    return [q for _, q in load_recent_queries_with_ts(days)]
+
+
+def load_recent_queries_with_ts(days: Optional[int] = None) -> List[tuple]:
+    """Recent activity queries as (ts, query) tuples — Phase 4 scan input.
+
+    Same parsing as load_recent_queries, plus ts (for last_scan_at
+    incremental filtering). Missing/corrupt log -> [].
+    """
+    if not ACTIVITY_LOG_ENABLED:
+        return []
     days = ACTIVITY_WINDOW_DAYS if days is None else days
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    out: List[str] = []
+    out: List[tuple] = []
     try:
         with open(ACTIVITY_LOG_FILE, encoding="utf-8") as f:
             for ln in f:
@@ -449,7 +490,7 @@ def load_recent_queries(days: Optional[int] = None) -> List[str]:
                     if ts is not None and ts >= cutoff:
                         q = (d.get("query") or "").strip()
                         if q:
-                            out.append(q)
+                            out.append((ts, q))
                 except Exception:
                     continue
     except OSError:

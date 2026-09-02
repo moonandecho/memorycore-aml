@@ -1,15 +1,20 @@
-# MemoryCore AML 参赛镜像 — python + memorycore + ollama (qwen3 embedding) + aml_server
+# MemoryCore AML 参赛镜像 — python + memorycore + ollama (qwen3-embedding 预置) + aml_server
 #
 # 构建:  docker build -t memorycore-aml .
 # 运行:  docker run -p 8000:8000 -v aml-data:/data memorycore-aml
 # 冒烟:  curl http://localhost:8000/health
 #         curl -X POST http://localhost:8000/add -H "Content-Type: application/json" -d '{...}'
 #         curl -X POST http://localhost:8000/search -H "Content-Type: application/json" -d '{...}'
-FROM python:3.12-slim
+#
+# 说明:  构建期预置 qwen3-embedding:0.6b (~639MB) 进镜像, 容器启动零网络依赖;
+#        aml-entrypoint.sh 仍保留"模型缺失时联网拉取"的兜底分支。
+
+# ---- 阶段 1: 预取 embedding 模型 (ollama runtime + pull, 产物 COPY 进主镜像) ----
+FROM python:3.12-slim AS model-fetcher
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 系统依赖 (zstd 不再需要 — ollama 二进制直接 COPY, 不跑安装脚本)
+# 仅需 curl 做 ollama 就绪探测
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -18,6 +23,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   主二进制 → /usr/local/bin (PATH 内) + CPU 推理库 → /usr/local/lib/ollama
 COPY ollama-bin/ollama /usr/local/bin/ollama
 COPY ollama-lib/ /usr/local/lib/ollama/
+
+# 构建期拉取 embedding 模型: 启动 ollama → 等待就绪 → pull (3 次重试)。
+# 失败即构建失败 (评测平台构建阶段网络通常可用; 若此处失败, 问题暴露在构建期而非评测期)。
+RUN (ollama serve &) && \
+    READY=0; \
+    for _ in $(seq 1 30); do \
+        if curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1; then READY=1; break; fi; \
+        sleep 1; \
+    done; \
+    if [ "$READY" != "1" ]; then echo "ERROR: ollama did not become ready" >&2; exit 1; fi; \
+    PULL_OK=0; \
+    for attempt in 1 2 3; do \
+        echo "pulling qwen3-embedding:0.6b (attempt ${attempt}/3)"; \
+        if ollama pull qwen3-embedding:0.6b; then PULL_OK=1; break; fi; \
+        sleep 5; \
+    done; \
+    if [ "$PULL_OK" != "1" ]; then echo "ERROR: qwen3-embedding:0.6b pull failed after 3 attempts" >&2; exit 1; fi; \
+    pkill ollama || true
+
+# ---- 阶段 2: 主镜像 ----
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ollama runtime → /usr/local (PATH 内) + CPU 推理库
+COPY ollama-bin/ollama /usr/local/bin/ollama
+COPY ollama-lib/ /usr/local/lib/ollama/
+
+# 预置 embedding 模型 (阶段 1 产物; ollama 默认模型目录 /root/.ollama)
+COPY --from=model-fetcher /root/.ollama /root/.ollama
 
 WORKDIR /app
 COPY . /app

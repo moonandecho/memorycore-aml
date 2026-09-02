@@ -1,360 +1,114 @@
-# origin-memorycore
+# MemoryCore — AML 在线治理参赛版
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**MemoryCore 是一个面向 LLM Agent 的记忆治理层 (memory governance layer)。**
+**MemoryCore** 是面向 LLM Agent 的记忆治理层: Agent 积累记忆的速度很快——偏好、事实、决策——而不治理的记忆会静默退化。MemoryCore 让热层保持在预算内、冷层保持可检索、每次写入都经去重与合并。
 
-Agent 积累记忆的速度很快——偏好、事实、决策——而不维护的记忆会悄悄退化:重复条目堆积、过时事实滞留、热层塞满后开始拒绝写入。MemoryCore 阻止这一切发生。
+本仓库是 **Agent Memory Leaderboard (AML) 参赛版**。它把 MemoryCore 已验证的治理机制**在线化**, 直接跑在 AML 的写入/检索路径上:
 
-它采用双层记忆架构:
+- **写入治理(`/add`)** —— 消息 → 事实切分 → 过时过滤 → 语义去重/合并 → 冷层写入(按身份隔离)。
+- **检索治理(`/search`)** —— 样本内召回(top_k 至 100)→ 相似度 × 时间衰减排序(半衰期 90 天, 重要记忆不衰减)→ AML 格式证据。
+- **严格样本隔离** —— `user_id` 一对一映射存储层 `author_id`; 跨用户检索不到任何记忆(SQL 层过滤, 测试覆盖)。
+- **评测期零外部 API 调用** —— embedding 本地运行(ollama + `qwen3-embedding:0.6b`, 1024 维), 存储为进程内 SQLite 引擎([mnemosyne-memory](https://pypi.org/project/mnemosyne-memory/))。
 
-- **热层 (Hot tier)** —— 高频使用的行为知识(偏好、规则、纠正),存放在本地快速文件中,始终在上下文内。
-- **冷层 (Cold tier)** —— 低频事实,自动迁移出去,存放在进程内 SQLite 引擎中(或你配置的远程记忆服务)。
+上游开源项目: [moonandecho/origin-memorycore](https://github.com/moonandecho/origin-memorycore)(MIT)。本仓库在其之上新增 AML HTTP 适配层 `memorycore/aml_server.py` 与按身份( author_id )的透传隔离。
 
-两层之间,一个治理核心维持记忆健康:
+**完整方法披露 / 部署说明 / 可复现测试 / 诚实边界声明: [AML-COMPETITION.md](AML-COMPETITION.md)**(英文版: [AML-COMPETITION.en.md](AML-COMPETITION.en.md))。
 
-- **写入时去重** —— 通过全角→半角归一化、空白折叠、标点后空格删除 (`normalize_for_compare`) 后再比较去重;写入仍保留原始内容。
-- **容量控制** —— 软/硬阈值在热层写满之前触发溢流,让它永不拒绝写入。
-- **冷层治理** —— 周期性去重/清理,让冷层在增长中保持可检索。
-- **回收站** —— 被删除的条目有 30 天宽限期;召回一条被回收的记忆即可复活它。
+## 快速开始
 
-结果:热层保持在预算内,冷层保持可检索,无论 Agent 积累多少记忆,记忆始终可维护。
+### Docker(推荐)
 
-基于 [MCP](https://modelcontextprotocol.io)(Model Context Protocol)`streamable-http` / stdio 标准构建。适用于任何 MCP 客户端,已在 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 上测试。
+```bash
+docker build -t memorycore-aml .
+docker run -p 8000:8000 -v aml-data:/data memorycore-aml
+```
 
-## 特性
+> 镜像已在构建期预置 embedding 模型(`qwen3-embedding:0.6b`, 约 639MB)——容器启动无需联网。entrypoint 保留兜底: 仅当模型缺失(如自定义 `MEMORYCORE_EMBED_MODEL`)时才在运行时联网拉取。数据卷 `/data` 持久化 SQLite 记忆库, 重启不丢。
 
-- **记忆治理(核心)** —— 冷层数据完整性的三层保护:
-  - **冷层写入去重**:写入冷层前,语义召回 + LLM 判断检查重复,更新已有条目而非创建冗余。
-  - **热层去重归一化**:`normalize_for_compare` 执行全角→半角转换、空白折叠、标点后空格删除——确保去重在 CJK 标点变体和输入噪声下依然有效。写入始终保留原始内容。
-  - **容量硬闸**:冷层强制软上限(6000 条,触发一次治理)和硬上限(10000 条,强制治理循环)——防止无界增长。
-  - **回收站**(`trash_store.py`):被删除的冷层条目移入 `~/.memorycore/trash.json`,30 天过期。召回被回收的条目时,若带有新的语义证据则恢复("召回即复活")。
-- **冷/热路由** —— 每次写入都被分类:高重要度或偏好类 → 热层(本地);低频事实 → 冷层(远程);过时状态记录 → 丢弃。
-- **六步溢流** —— 容量基线 → 去重 → 过时过滤 → 合并 → 安全写入(先写冷层,再删本地)→ 验证。
-- **冷层治理** —— 去重合并、过时清理、冲突消解、embedding 完整性检查。
-- **容量控制** —— 软阈值(写入前溢流一次)/ 硬阈值(强制溢流)/ 目标比例。默认:5000 字符限制的 60% / 80% / 40%。
-- **优雅降级** —— 冷层不可达?写入大声失败(绝不静默丢弃),溢流保留本地条目,健康检查返回本地状态并标注 `cold.error`。
-- **零核心修改** —— 设计为即插即用的伴侣组件;Agent 内置的记忆工具继续正常工作。
+冒烟:
+
+```bash
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/add -H "Content-Type: application/json" -d '{
+  "request_id": "eval:smoke:0",
+  "messages": [{"role": "user", "content": "The user is a software engineer."}],
+  "user_id": "eval:smoke:u1",
+  "session_id": "eval:smoke:s0"}'
+curl -X POST http://localhost:8000/search -H "Content-Type: application/json" -d '{
+  "query": "What is the user\u0027s occupation?",
+  "options": ["A. software engineer", "B. teacher"],
+  "user_id": "eval:smoke:u1", "top_k": 100}'
+```
+
+### 裸机
+
+```bash
+pip install .
+ollama serve &
+ollama pull qwen3-embedding:0.6b
+MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # 默认 0.0.0.0:8000
+```
+
+## HTTP API
+
+全部为纯 REST 端点, 挂载在 FastMCP streamable-http 应用上(uvicorn)。可选鉴权: 设置 `AML_API_KEY` 后支持 Bearer / Token / X-Api-Key。
+
+| 端点 | 说明 |
+|---|---|
+| `POST /add` | AML 写入: 消息 → 事实切分 → 过时过滤 → 语义去重/合并 → 按身份写入冷层。写入落库后才返回 200(无异步任务 ID)。 |
+| `POST /search` | AML 检索: 按身份样本内召回 → 时间衰减排序 → AML 格式证据列表。`options` 会拼进检索查询做一次兜底召回(仅用于检索上下文——不生成答案、不写入记忆)。 |
+| `GET /health` | 存活探测。存储降级时仍返回 2xx(`status: degraded` + `storage.error`), 便于平台区分崩溃与依赖故障。 |
+
+错误码语义:
+
+- `400` — 请求格式错误(缺 `request_id`/`user_id`/`session_id`、`messages` 非数组等)
+- `401` — 设置了 `AML_API_KEY` 但鉴权缺失/无效
+- `500` — 存储后端不可用(如 embedding 服务宕机); 临时异常, 平台按 5xx 自动重试安全
+
+## 环境变量
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `AML_HOST` / `AML_PORT` | `0.0.0.0` / `8000` | HTTP 监听地址 |
+| `AML_API_KEY` | 空(不鉴权, smoke 模式) | 设置后 Add/Search 需 Bearer/Token/X-Api-Key |
+| `MNEMOSYNE_DATA_DIR` | `~/.memorycore/data` | SQLite 数据目录(评测请指向独立目录) |
+| `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | embedding API(ollama 或任何 OpenAI 兼容服务) |
+| `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型(1024 维) |
 
 ## 架构
 
 ```
-┌─────────────────────────────── Mac / 本地 ──────────────────────────────┐
-│  LLM Agent (如 Hermes)                                                 │
-│    │  MCP client                                                       │
-│    ▼                                                                   │
-│  MemoryCore MCP server                                                 │
-│    ├─ local_store.py        热层: MEMORY.md / USER.md (基于字符)        │
-│    ├─ classifier.py         冷/热/过时 路由规则                         │
-│    ├─ overflow.py           六步溢流                                   │
-│    ├─ maintenance.py        冷层治理                                   │
-│    └─ cold_store_client.py  →  LocalBackend (SQLite, 进程内)           │
-│                               or RemoteBackend (MCP streamable-http)   │
-└─────────────────────────────────────────────────────────────────────────┘
-                     LocalBackend: mnemosyne-memory (进程内引擎)
-                     RemoteBackend: 远程 MCP 记忆服务
-
-可选 (仅 Hermes Agent): hermes-plugin/memorycore-prefetch
-  ┌───────────────────────────────────────────────────────────────────────┐
-  │ MemoryProvider 插件 (单模型 qwen3, 默认开启)                           │
-  │   system_prompt_block → 静态索引 (常驻激活)                            │
-  │   prefetch → ColdStoreClient.recall_results(top_k=20)                 │
-  │            → dense 排序 → 会话 + 热层去重 → top-5 注入                │
-  │   关闭: MEMORYCORE_PREFETCH_ENABLED=0                                 │
-  └───────────────────────────────────────────────────────────────────────┘
+AML HTTP (FastMCP custom routes: /add /search /health, 可选 Bearer/Token/X-Api-Key)
+   │
+   ├─ Add: 事实切分 → 过时过滤 → 语义去重/合并 → 冷层写入 (author_id=user_id)
+   ├─ Search: 样本内召回 (author_id 过滤, top_k≤100) → 时间衰减排序 → AML 格式
+   └─ Health: 2xx 存活探测 (存储降级时仍 200, 报 degraded)
+        │
+        ▼
+MemoryCore cold-store client (per-user 引擎, 进程内 SQLite + 向量索引)
+        │
+        ▼
+embedding: ollama + qwen3-embedding:0.6b (本地, 无外部 API 依赖)
 ```
 
-## 快速开始
+底层治理层(冷热路由 / 写入时归一化去重 / 容量控制 / 溢流 / 回收站)的完整说明见[上游项目](https://github.com/moonandecho/origin-memorycore)。
 
-### 前置依赖
-
-- **ollama** — embedding API (安装: https://ollama.com)
-- **qwen3-embedding:0.6b** — 推荐 embedding 模型 (1024 维)
+## 测试(可复现)
 
 ```bash
-# 安装 ollama (macOS/Linux)
-curl -fsSL https://ollama.com/install.sh | sh
-
-# 拉取 embedding 模型
-ollama pull qwen3-embedding:0.6b
+# 需 ollama + qwen3-embedding:0.6b
+MNEMOSYNE_DATA_DIR=$(mktemp -d) python3 tests/test_aml.py
 ```
 
-### 安装与运行
+28 项断言覆盖: 跨 user_id 隔离(A 写 B 查不到)、同一事实二次写入去重、"方案 A → 改为 B"合并为一条、/add /search /health HTTP 全链路、options 兜底召回、长消息切分、错误码。
 
-```bash
-pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
+## 已知边界(诚实声明)
 
-# 就这样! MemoryCore 使用 ollama 提供 embedding:
-#   - 热层:  MEMORY.md / USER.md (默认 ~/.hermes/memories)
-#   - 冷层:  SQLite (通过 mnemosyne-memory, 默认 ~/.memorycore/data/)
-#   - Embedding: qwen3-embedding:0.6b (通过 ollama, http://localhost:11434/v1)
-python -m memorycore.server          # stdio 传输 (默认)
-```
+- 检索走存储层词法+向量混合排序, 存储层对长查询有词法相关性门禁; 选择题场景由 options 兜底召回覆盖, 开放题(英文自然问句)实测可正常召回。
+- 消息自带 timestamp 仅作参考, 排序使用持久化时间(写入时间); created_at 返回持久化时间(协议允许的"来源/持久化时间")。
+- 不做冷层全量治理巡检(维护性批处理)在线触发, 写入侧治理以去重/合并/过时过滤为主。
 
-**数据目录布局**(全部位于 `~/.memorycore/` 下):
+## 许可证
 
-```
-~/.memorycore/
-├── data/          # SQLite 数据库 (MNEMOSYNE_DATA_DIR)
-└── ...
-```
-
-可用 `MNEMOSYNE_DATA_DIR` 覆盖。
-
-### 模型切换
-
-默认 embedding 模型为 `qwen3-embedding:0.6b`(1024 维)。可通过环境变量使用任意 ollama 模型:
-
-```bash
-export MEMORYCORE_EMBED_URL="http://localhost:11434/v1"
-export MEMORYCORE_EMBED_MODEL="nomic-embed-text"   # 或你偏好的模型
-```
-
-也可指向任何 OpenAI 兼容的 embedding API:
-
-```bash
-export MEMORYCORE_EMBED_URL="https://api.openai.com/v1"
-export MEMORYCORE_EMBED_MODEL="text-embedding-3-small"
-```
-
-在 MCP 客户端注册(以 Hermes Agent `config.yaml` 为例):
-
-```yaml
-mcp_servers:
-  memorycore:
-    command: python
-    args: ["-m", "memorycore.server"]
-```
-
-### 远程模式(可选)
-
-如果你希望使用共享的远程 Mnemosyne MCP 服务而非本地引擎,设置 `MEMORYCORE_COLD_BACKEND=remote`:
-
-```bash
-export MEMORYCORE_COLD_BACKEND=remote
-export MNEMOSYNE_URL="http://your-memory-service:9000/mcp"
-python -m memorycore.server
-```
-
-暴露的工具:
-
-| 工具 | 用途 |
-|---|---|
-| `memorycore_store_fact(content, importance, scope, target)` | 统一写入入口:路由冷 / 热 / 过时 |
-| `memorycore_recall(query, top_k)` | 主动召回冷层记忆(只读,补充每轮 prefetch) |
-| `memorycore_trigger_overflow(target)` | 执行六步溢流,目标 ≤40% |
-| `memorycore_run_cold_storage_maintenance()` | 冷层治理流程 |
-| `memorycore_get_memory_usage()` | 热层用量 + 冷层统计 + 阈值 |
-| `memorycore_memory_audit(target)` | 热层体检:条目类型/年龄/keep/sink 判定/LRU 观测/sink 候选 |
-| `memorycore_get_rule_weight(target)` | 规则权重分布(只读 LRU 监控):w_eff、字符vs预算、下一批退役候选 |
-
-## Hermes 集成 —— 每轮主动召回 prefetch
-
-MCP server 与客户端无关。对于 **Hermes Agent**,有一个可选伴侣插件提供双通道冷层访问:
-
-### 双通道设计
-
-- **静态索引通道(常驻,零开销)** —— 系统提示块列出可用主题(通过 `MEMORYCORE_INDEX_TOPICS` 配置,逗号分隔),并引导 Agent 使用 `memorycore_recall(query)` 按需召回。
-- **每轮主动召回通道(默认开启)** —— 每轮对话自动召回冷层,按 dense 分数排序,注入 top-5 到上下文,让 Agent 开口前就"想起"相关内容。设置 `MEMORYCORE_PREFETCH_ENABLED=0` 可关闭,仅保留按需召回。
-
-### Prefetch 管道
-
-```
-query → 预处理 → 冷层召回(20 候选)
-  → dense 排序 (qwen3) → top-5
-  → 会话去重 → 热层去重 → 注入上下文
-```
-
-MemoryCore 采用**单模型 qwen3 架构(无 reranker)**。qwen3 的 dense 分数用于批次内相对排序;没有绝对阈值——dense 分数最高的 5 条候选在去重后始终注入。
-
-### 优雅降级
-
-当 ollama 不可达(未安装、未运行或模型未拉取)时,prefetch 静默返回空字符串——对话继续,没有注入的记忆,用户不会看到任何错误。DEBUG 级别日志会记录探测失败。
-
-### 部署方案(Hermes Agent)
-
-```bash
-# 1. 安装 origin-memorycore(提供冷层引擎 + ColdStoreClient)
-pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
-
-# 2. 把插件放入 Hermes 用户插件目录
-mkdir -p ~/.hermes/plugins
-cp -r hermes-plugin/memorycore-prefetch ~/.hermes/plugins/
-
-# 3. 激活(下一会话生效)
-hermes config set memory.provider memorycore-prefetch
-```
-
-部署后三种形态:
-
-| 形态 | 配置 | 行为 |
-|---|---|---|
-| 默认(推荐) | 无需额外配置 | 静态索引 + 每轮 prefetch,注入 top-5 |
-| 仅按需召回 | `MEMORYCORE_PREFETCH_ENABLED=0` | 只启用静态索引,Agent 通过 `memorycore_recall` 按需查询 |
-| 自定义 embedding | `MEMORYCORE_EMBED_URL` + `MEMORYCORE_EMBED_MODEL` | 指向不同 ollama 实例或 OpenAI 兼容 API |
-
-### 插件配置
-
-| 环境变量 | 默认值 | 含义 |
-|---|---|---|
-| `MEMORYCORE_PREFETCH_ENABLED` | *(未设置)* | 设为 `0` 关闭每轮主动召回 |
-| `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | Ollama 或 OpenAI 兼容 embedding API 基地址 |
-| `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding 模型名称(推荐 1024 维) |
-| `MEMORYCORE_INDEX_TOPICS` | *(未设置)* | 系统提示索引块的主题列表(逗号分隔) |
-
-要求与注意:
-
-- **Hermes 专用**:插件导入 Hermes 运行时模块(`agent.memory_provider`),不能作为独立包运行——它是 MemoryCore 的 Hermes 集成侧。完整说明见 [hermes-plugin/memorycore-prefetch/README.md](hermes-plugin/memorycore-prefetch/README.md)。
-- 每次召回保持 5s 超时;失败静默降级为空注入,绝不阻塞对话。
-
-## 热层治理机制
-
-热层(MEMORY.md / USER.md)每轮全量注入上下文,必须保持精简与时效。MemoryCore
-在六步溢流之上叠加三层机制,让历史记录确定性退役,而不是无限堆积:
-
-### 热层元数据老化
-
-- sidecar 元数据:`MEMORY.meta.json` / `USER.meta.json` 与 .md 文件同目录,
-  以条目内容的 SHA-256 为键;原子写 + 文件锁保证跨进程安全;§ 分隔的 .md
-  格式零改动,宿主 memory 工具不受影响。
-- 每条条目被判定为 `state`(历史决策/状态记录)或 `rule`(准则/偏好):
-  - `state`:写入 7 天后退役至冷层(可配置 `STATE_TTL_DAYS`)
-  - `rule`:永不因年龄退役;30 天未更新的长条目(>200 字)成为 LLM 压缩
-    候选(可配置 `RULE_COMPRESS_DAYS`)。准则另有失效信号阶梯(见下文)
-    提供可持续出口,不误伤活跃偏好。
-- 条目内容变化 → 键变化 → 下次 reconcile 对内容重新判型并回收孤儿键。
-
-### 双写入口治理
-
-- `store_fact` 写入口:内容呈完成态(含日期 + 拍板/已配置等完成态词,且
-  无行为指令词)→ 直接写冷层,污染不进热层。
-- 插件 `on_memory_write` 直写通道:内置 memory 工具每次 add/replace 提交后
-  立即判型;`state` 直写后台迁移冷层(查重 → 冷层写成功 → 删热层;冷层失败
-  则保留热层并盖章 state 作为 7 天到期兜底),与占用水位无关。单工作线程
-  消费有界队列(容量 128),队列满则跳过,由下次溢流 reconcile 兜底补盖。
-
-### 元数据优先溢流
-
-每次溢流先 reconcile 元数据(补盖无元数据的存量条目、回收孤儿键),再按
-元数据退役;关键词表降级为无元数据条目的兜底。sidecar 故障自动降级到
-关键词路径,不阻塞溢流。
-
-### rule 失效信号(分层保护)
-
-纯 `rule` 构成的热层按设计没有出口("偏好永不下沉"),因此永不编辑的短准则
-会一直占位、最终塞满热层。MemoryCore 用**压力阶梯**补上出口:每轮溢流实测
-占用(基线),压力越高开放的出口越深(变化)。五个可观测信号只决定"资格与
-排序",压力决定"出不出手":
-
-| 信号 | 观测内容 | 动作 |
-|---|---|---|
-| S1 写入闲置 | sidecar `updated_at` | 压缩(30 天)/ stub(45 天)资格闸门 |
-| S2 完成态复核 | 内嵌日期 ≥60 天 + ≥2 个完成态词 + 零行为指令词 | 误戴 rule 章的历史记录重判为 `state` → 走 7 天 TTL 正常下沉 |
-| S3 同主题聚簇 | 词法相似度(+可选嵌入通道) | 同主题条目合并为一条;合并后变长的条目后续自动获得压缩资格 |
-| S4 主题活性 | 本地查询活动日志(prefetch/recall,滚动 45 天,可选)+ LLM 休眠判定 | 高压下的休眠 B 类准则:全文先写冷层确认,本地留 ≤40 字指针 |
-| S5 跨层冗余 | 冷层召回匹配 | 冷层已有等价全文 → 删本地副本(信息零丢失) |
-
-**分层保护**:A 类元准则(行为/交互/写作风格)、红线类与 importance ≥ 0.9
-的条目永不参与 S2/S4/S5,只允许合并/压缩。stub 指针自带生命周期(高压下
-最老优先回收,冷层零调用),指针不会二次塞满热层。所有出口遵循"先冷层
-后本地":冷层确认成功才动本地,任一失败保留原样。信号缺失(无活动日志、
-无 LLM key)时阶梯整体降级为原有行为,绝不猜测。
-
-常量(`memorycore/core/config.py`):`RULE_RETYPE_DAYS=60`、
-`RULE_STUB_IDLE_DAYS=45`、`ACTIVITY_WINDOW_DAYS=30`、`MAX_STUB_PER_RUN=3`、
-`STUB_MAX_CHARS=40`、`IMPORTANCE_PROTECT=0.9`。
-
-### 体检工具: memorycore_memory_audit
-
-只读工具,列出热层每条条目的类型、年龄、退役计划与 keep/sink 判定,并附带
-Phase 4 LRU 观测(每条规则的 weight / 有效权重 / 最近活跃 / 驻留天数)与
-规则字符-预算对比 —— 排查"溢流空转"(热层满了却无条目可沉)的观测锚点。
-
-活性维度 sink 候选 (2026-08-28):对 rule 型条目,若 `weight < 1.5` 且
-`last_active_at` 距今超过 30 天且非 protected,体检将该条目标记为
-`sink_candidate: true`(reason 为 `low_weight+inactive`),并汇总至
-`lru_sink_candidates` 计数器 —— 仅体检可见,不改变溢流执行逻辑。
-
-## 规模化测试与优化结果
-
-MemoryCore 在万条级冷层规模下做了完整压力测试与召回优化(隔离测试环境,生产数据零接触,结果可复现)。
-
-**写入与容量**
-
-| 指标 | 结果 |
-|---|---|
-| 写入吞吐 | 10k 条共 467s,≈21.4 条/s(瓶颈在 embedding) |
-| 库文件体积 | 300MB / 10k 条 |
-| 内存占用 | 进程 RSS 仅 +19MB,全程平稳无泄漏特征 |
-
-**查询延迟** —— top_k=5 时中位 48ms;万条规模与百条规模持平,无延迟退化。
-
-**召回质量** —— 三项测试:
-
-1. **精确匹配(原文自召回)**:20/20 全部命中 top1 —— 精确匹配能力完整。
-2. **噪声抑制(无关查询)**:top1 dense 分数均值 0.056,绝大多数返回 0.0 —— 无关内容几乎不会混入结果。
-3. **短查询召回(修复前 → 修复后)** —— 关键优化成果:
-
-| 阶段 | 短查询命中率 |
-|---|---|
-| 修复前 | 0/8 |
-| 修复后 | 5/8 (62.5%) |
-
-**优化内容**:高密度主题下,固定候选截断 `k=max(top_k, 20)` 会把详细记忆挤出候选池,导致短查询召回失败。修复将候选截断放大为 `k=max(top_k*4, 300)`,并在召回入口内部放大候选后再截断返回——所有召回通道(每轮 prefetch + 按需 recall)一处修复全部受益。修复只发生在召回阶段,排序逻辑未改动,行为可预期、可回退。
-
-> 注:测试在 10k 条合成库上进行(80 条"黄金记忆"+ 9920 条日常口吻填充记忆,与生产同配置),生产数据零污染。
-
-## sqlite-vec 用户注意事项
-
-如果你为 Mnemosyne 冷层启用 sqlite-vec 向量索引,请注意 `beam.py` 的 `_wm_vec_search_sqlite` 使用原始相似度公式 `sim = 1 - distance / (2 * EMBEDDING_DIM)`,会把 float32 距离压缩到 ~1.0,使动态阈值实际失效(所有结果都通过)。
-
-**补丁**:在 float32 分支中,将公式替换为 `sim = 1 - d² / 2` —— 这给出归一化向量的精确余弦相似度,恢复正确的阈值行为。
-
-## 冷存储契约
-
-任何暴露以下五个 MCP 工具的服务都可以作为冷层:
-
-| 工具 | 语义 |
-|---|---|
-| `remember(content, importance, scope)` | 存储一条记忆,返回 `memory_id` |
-| `recall(query, top_k)` | 语义召回 |
-| `update(memory_id, content)` | 合并更新已有记忆 |
-| `forget(memory_id)` | 删除一条记忆 |
-| `stats()` | `total` + embedding 完整性 |
-
-完整契约与参考客户端见 [examples/cold-store-contract.md](examples/cold-store-contract.md)。
-
-## 配置
-
-| 环境变量 | 默认值 | 含义 |
-|---|---|---|
-| `MEMORYCORE_COLD_BACKEND` | `local` | 冷层后端:`local`(进程内)或 `remote`(MCP) |
-| `MNEMOSYNE_URL` | *(空)* | 冷层 MCP 端点(`remote` 模式必需) |
-| `MNEMOSYNE_DATA_DIR` | `~/.memorycore/data` | 本地 SQLite 数据目录 |
-| `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | Ollama 或 OpenAI 兼容 embedding API 基地址 |
-| `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding 模型名称(1024 维) |
-| `MEMORY_DIR` | `~/.hermes/memories` | 热层目录(`MEMORY.md` / `USER.md`) |
-| `ACTIVITY_LOG_ENABLED` | `1` | 查询活动日志(主题活性信号采集);设为 `0` 关闭日志并整体禁用 S4 stub-sink |
-| `MNEMOSYNE_TIMEOUT` | `10.0` | 冷层请求超时(远程模式,秒) |
-
-容量常量位于 `memorycore/core/config.py`(`CHAR_LIMIT_*`、`SOFT_THRESHOLD`、`HARD_THRESHOLD`、`TARGET_RATIO`)。
-
-## 工作原理
-
-1. **写入** —— `store_fact` 分类内容:
-   - importance ≥ 0.8 或命中热关键词(偏好 / 规则 / 纠正 / 红线)→ **热层**,留在本地
-   - 过时标记(短条目,如 "已修复 / fixed")→ **丢弃**(不迁移)
-   - 其他 → **冷层**,直接写入远程服务
-2. **溢流** —— 热层用量超过软阈值时,溢流将低频条目迁移到冷层;达到硬阈值时强制溢流直到 ≤ 目标。顺序永远是*先写冷层,验证,再删本地* —— 冷层失败也不会丢任何东西。
-3. **治理** —— 周期性对冷层执行:合并重复、移除过时、消解冲突、验证 embedding 完整性。
-
-## 许可
-
-[MIT](LICENSE) © 2026 moonandecho
-
-### 第三方许可
-
-- [mnemosyne-memory](https://github.com/mnemosyne-oss/mnemosyne) — MIT,by AxDSan。`LocalBackend` 使用的进程内记忆引擎。
-- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — MIT。
-- [ollama](https://ollama.com) — MIT。本地 embedding API 服务。
-- [qwen3-embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) — Apache-2.0,by Alibaba Cloud。默认 embedding 模型(非内置,通过 ollama 拉取)。
+MIT —— 见 [LICENSE](LICENSE)。引擎依赖 [mnemosyne-memory](https://pypi.org/project/mnemosyne-memory/) 与 [ollama](https://ollama.com) + qwen3-embedding 为 MIT / Apache-2.0。逐组件改动披露见 [AML-COMPETITION.md](AML-COMPETITION.md)。

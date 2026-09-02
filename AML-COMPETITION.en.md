@@ -99,6 +99,7 @@ the `/data` volume persists the SQLite memory store.
 ### Bare metal
 
 ```bash
+# For CN networks, add a mirror: pip install -i https://mirrors.aliyun.com/pypi/simple/ .
 pip install .
 ollama serve &
 ollama pull qwen3-embedding:0.6b
@@ -117,7 +118,7 @@ MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # defaults to 0.0.0.0
 
 ### Error-code semantics
 
-- 400/422 format errors (missing request_id/user_id/session_id, messages not an array, etc.)
+- 400 format errors (missing request_id/user_id/session_id, messages not an array, etc.)
 - 401 auth failure (when AML_API_KEY is configured)
 - 500 storage backend unavailable (temporary failures such as embedding service down; the platform retries 5xx automatically)
 - Never returns 202/task IDs; Add returns 200 only after synchronous completion
@@ -129,7 +130,7 @@ MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # defaults to 0.0.0.0
 MNEMOSYNE_DATA_DIR=$(mktemp -d) python3 tests/test_aml.py
 ```
 
-24 assertions cover: cross-user_id isolation (A writes, B cannot see),
+28 assertions cover: cross-user_id isolation (A writes, B cannot see),
 second write of the same fact deduplicated, "plan A → changed to B" merged into
 one entry, /add /search /health HTTP end-to-end, options fallback recall,
 long-message fragmentation, error codes.

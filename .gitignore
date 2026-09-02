@@ -15,3 +15,6 @@ activity.jsonl.lock
 
 # recycle-bin lock file (TrashStore flock)
 trash.json.lock
+
+# macOS AppleDouble (samba 挂载写入产物)
+._*

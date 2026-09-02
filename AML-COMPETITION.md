@@ -89,6 +89,7 @@ curl -X POST http://localhost:8000/search -H "Content-Type: application/json" -d
 ### 裸机
 
 ```bash
+# 国内网络建议加镜像: pip install -i https://mirrors.aliyun.com/pypi/simple/ .
 pip install .
 ollama serve &
 ollama pull qwen3-embedding:0.6b
@@ -107,7 +108,7 @@ MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # 默认 0.0.0.0:8000
 
 ### 错误码语义
 
-- 400/422 格式错误（缺 request_id/user_id/session_id、messages 非数组等）
+- 400 格式错误（缺 request_id/user_id/session_id、messages 非数组等）
 - 401 认证失败（配置了 AML_API_KEY 时）
 - 500 存储后端不可用（embedding 服务宕机等临时异常，平台按 5xx 自动重试）
 - 不返回 202/任务 ID；Add 同步完成后才返回 200
@@ -119,7 +120,7 @@ MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # 默认 0.0.0.0:8000
 MNEMOSYNE_DATA_DIR=$(mktemp -d) python3 tests/test_aml.py
 ```
 
-24 项断言覆盖：跨 user_id 隔离（A 写 B 查不到）、同一事实二次写入去重、
+28 项断言覆盖：跨 user_id 隔离（A 写 B 查不到）、同一事实二次写入去重、
 "方案 A → 改为 B"合并为一条、/add /search /health HTTP 全链路、
 options 兜底召回、长消息切分、错误码。
 

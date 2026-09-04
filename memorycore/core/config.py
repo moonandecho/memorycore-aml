@@ -173,6 +173,29 @@ WEIGHT_HALF_LIFE_DAYS = 30          # half-life = ACTIVITY_WINDOW_DAYS (self-con
 WEIGHT_PROTECT_MULT = 3.0           # A-class/red-line/importance>=0.9 multiplier: 3x harder to evict
 WEIGHT_KWSINK_MULT = 0.5            # kw-sinkable rules (should_keep_local=False) weight halved
 MAX_EVICT_PER_RUN = 3               # eviction cap per run (matches MAX_STUB_PER_RUN)
+
+# ---- smart tidy (weekly maintenance) constants — 2026-09 review P1 ----
+# Fast/slow two-track policy (review decision D3): fast track = 14d + 1
+# completion word + LLM confirm, runs only on Sundays when usage stays >60%
+# after overflow (constants below); slow track = RULE_RETYPE_DONE_MARKERS
+# (60d + 2 words + zero behavior words), runs any day at >=60%. The two word
+# lists deliberately differ; keeping both in this single config file avoids
+# drift (they previously lived as local constants inside weekly_maintenance).
+TIDY_ACTIVITY_EXEMPT_DAYS = 7    # activity exemption window (= RULE_MIN_RESIDENCY_DAYS / LRU lexical window)
+TIDY_COMPLETE_AGE_DAYS = 14      # min age to consider sinking (newer anchor: min(embedded date, written_at))
+TIDY_DONE_WORDS = [
+    # Fast-track completion words (22). Deliberately wider than
+    # RULE_RETYPE_DONE_MARKERS (slow track) — includes "不再/放弃/卸载" etc. —
+    # used only together with LLM confirmation. The two lists share only 5
+    # words (退役/已删/已修复/已停用/已退役).
+    "退役", "已删", "已清理", "已解决", "已卸载", "已放弃", "已归档", "已停用",
+    "已拆除", "已修复", "已废弃", "已移除", "已注销", "已退役", "放弃", "卸载",
+    "purge", "清理干净", "不再", "已退出", "已下线", "已弃用",
+]
+TIDY_MAX_SINK_PER_RUN = 3        # per-target sink cap per run
+TIDY_MAX_MERGE_PER_RUN = 1       # per-target merge pairs cap per run
+TIDY_MERGE_RATIO = 0.62          # merge similarity threshold
+
 # ---- Audit activity-dimension sink candidates (2026-08-28) ----
 # rule 型条目: weight 低于 AUDIT_SINK_WEIGHT_THRESHOLD 且 last_active_at
 # 距今超过 AUDIT_SINK_INACTIVE_DAYS 且非 protected → audit 标为 sink_candidate。

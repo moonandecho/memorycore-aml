@@ -112,9 +112,10 @@ _STUB_EVAL_CAP = 10
 
 
 def _is_protected_rule(entry: str, meta: dict) -> bool:
-    """S6: A 类/红线类/高 importance → 绝对保护 (不 stub/不 retype/不跨层删)。
+    """S6: A 类/红线类/高 importance → 保护判定 (不被直接 stub/retype/跨层删)。
 
-    只允许合并/压缩 (信息保留路径)。"""
+    只允许合并/压缩 (信息保留路径); 经 LRU 挤权仍可能退役为 stub
+    (×WEIGHT_PROTECT_MULT 更难挤, 非豁免)。"""
     if meta.get("importance", 0.8) >= IMPORTANCE_PROTECT:
         return True
     if any(kw in entry for kw in _RULE_META_MARKERS):
@@ -1740,10 +1741,9 @@ def _select_retirement_candidates(store, metastore, target: str,
     tie-break 三级: w_rank → last_active_at 早 → 字符长 → sha256 (幂等确定)。
     返回按挤出顺序排列的候选条目列表; 冷层失败由调用方 break。
 
-    Phase 4 修正: protected 规则 (A 类/红线/importance≥0.9) 不参与 LRU 挤权 —
-    保留 Phase 3 设计定稿的"A 类绝不误伤"; "无永久保留"铁律由阶段 3 的
-    '长期失活降级' 路径实现 (protected 规则 N 天无命中 → 降级为普通规则后
-    再参与挤权)。
+    Phase 4 (2026-08-26 设计定稿, 方案 B): protected 规则 (A 类/红线/importance≥0.9)
+    参与 LRU 挤权 — 铁律"热层无永久保留"; 保护只是权重乘数 (×WEIGHT_PROTECT_MULT
+    更难挤, 非豁免), 衰减后同样可退役 (代码内无"长期失活降级"路径)。
     """
     now = datetime.now(timezone.utc)
     # 词法活跃保护: 近 7 天查询中 sb≥2 词法命中的规则不参与挤权

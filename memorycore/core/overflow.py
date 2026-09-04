@@ -330,21 +330,23 @@ def _handle_rule_stub_sink(store, client, target: str, entry: str,
                            anchor_parts: List[str]) -> None:
     """S4 (L2): 休眠 B 类 rule → 全文先写冷层确认 → 本地替换为 stub 指针。
 
-    安全顺序: remember stored → replace 本地; 任一失败 → 原条目原样 (errors+1)。
+    安全顺序: 冷层保有全文 (P8: remember 前查重, same 不重复写/
+    similar merge-update) → replace 本地; 任一失败 → 原条目原样 (errors+1)。
     Phase 4: 捕获冷层 memory_id → stub meta 写 cold_id (召回恢复链路用, 见
     restore_stubs_from_results)。
     """
     if entry not in store.entries(target):
         return  # 已被本轮其他动作处理 (如 S2/S5), 保守跳过
+    # P8 (2026-09): remember 前查重 — 冷层已有等价全文 (same) 不重复写,
+    # similar merge-update; cold_id 一律指向冷层真实存在的 id。
     try:
-        r = client.remember(entry, importance=0.6, scope="global")
-        if r.get("status") != "stored":
-            stat["errors"] += 1
-            return
+        cold_ok, cold_id = _cold_write_with_dedup(client, entry)
     except Exception:
         stat["errors"] += 1
+        return  # 冷层不可达/查重异常 → 保留原样, 不 stub (保守语义)
+    if not cold_ok:
+        stat["errors"] += 1
         return
-    cold_id = (r.get("memory_id") or "") if isinstance(r, dict) else ""
     stub = _make_stub(entry)
     if store.replace(target, entry, stub).get("success"):
         try:
@@ -597,19 +599,18 @@ def run_overflow(store, client, target: str) -> dict:
                     # 校验 2: 压缩确实更短 (省字目标)
                     if len(compressed) < len(entry) * 0.8:
                         # 先沉原始细节到冷层 (原子性: 失败则保留本地原样)
+                        # P8: remember 前查重 — 冷层已有等价原文不重复写
+                        cold_ok = False
                         try:
-                            r = client.remember(entry, importance=0.6, scope="global")
-                            if r.get("status") == "stored":
-                                # F3 修复 (终审): 校验 replace 成功才计数
-                                if store.replace(target, entry, compressed).get("success"):
-                                    stat["compressed"] += 1
-                                    anchor_parts.append(entry)
-                                    continue
-                                stat["errors"] += 1
-                                stat["kept"] += 1
-                                continue
+                            cold_ok, _ = _cold_write_with_dedup(client, entry)
                         except Exception:
-                            pass
+                            cold_ok = False
+                        if cold_ok:
+                            # F3 修复 (终审): 校验 replace 成功才计数
+                            if store.replace(target, entry, compressed).get("success"):
+                                stat["compressed"] += 1
+                                anchor_parts.append(entry)
+                                continue
                         stat["errors"] += 1
                         stat["kept"] += 1
                         continue
@@ -742,24 +743,23 @@ def _handle_typed_entry(store, client, target: str, entry: str,
             compressed = _llm_compress(client, entry)
             if (compressed is not None and compressed != entry
                     and len(compressed) < len(entry) * 0.8):
+                # P8: remember 前查重 — 冷层已有等价原文不重复写
+                cold_ok = False
                 try:
-                    r = client.remember(entry, importance=0.6, scope="global")
-                    if r.get("status") == "stored":
-                        # F3 修复 (终审): 校验 replace 成功才计数/盖章
-                        if store.replace(target, entry, compressed).get("success"):
-                            try:
-                                metastore.stamp(compressed, "rule",
-                                                origin="overflow")
-                            except Exception:
-                                pass  # F1: 盖章失败不阻塞 (下次 reconcile 补)
-                            stat["compressed"] += 1
-                            anchor_parts.append(entry)
-                            return True
-                        stat["errors"] += 1
-                        stat["kept"] += 1
-                        return True
+                    cold_ok, _ = _cold_write_with_dedup(client, entry)
                 except Exception:
-                    pass
+                    cold_ok = False
+                if cold_ok:
+                    # F3 修复 (终审): 校验 replace 成功才计数/盖章
+                    if store.replace(target, entry, compressed).get("success"):
+                        try:
+                            metastore.stamp(compressed, "rule",
+                                            origin="overflow")
+                        except Exception:
+                            pass  # F1: 盖章失败不阻塞 (下次 reconcile 补)
+                        stat["compressed"] += 1
+                        anchor_parts.append(entry)
+                        return True
                 stat["errors"] += 1
                 stat["kept"] += 1
                 return True
@@ -1052,8 +1052,8 @@ def _norm_sentence(s: str) -> str:
     """规范化句子用于去重: 去空白/标点, 保留括号内容, 小写。
 
     括号内容 (路径/注释/别名如 Code Drive、SMB 共享) 是语义核心,
-    删除会导致同义句 "D 盘=/home/user/D (Code Drive...)" 与
-    "D 盘=Code Drive (path=/home/user/D...)" 规范化后反而不同。
+    删除会导致同义句 \"D 盘=/home/user/D (Code Drive...)\" 与
+    \"D 盘=Code Drive (path=/home/user/D...)\" 规范化后反而不同。
     """
     s = re.sub(r"[\s，。！？；;、,：:·\-—/\\=_]+", "", s)
     return s.lower()
@@ -1354,7 +1354,10 @@ def _find_best_match(entry: str,
 def _merge_two_entries(local: str, cold: str) -> str:
     """合并本地新条目与冷层已有条目。冲突取最新(本地 newer)。"""
     base = local
-    base_sentences = set(re.split(r"[。！？;；\n]", base))
+    # P8 修复 (2026-09): 过滤 split 产生的空串成员 — 句末标点结尾时
+    # re.split 会产出 "", 而 "" in s 恒 True 使冷层所有新句子被误判重复,
+    # 合并结果丢失冷层独有细节 (实测 "A记录。"+"B记录。新增信息。" → "A记录。")。
+    base_sentences = {s for s in re.split(r"[。！？;；\n]", base) if s.strip()}
 
     extra = []
     for s in re.split(r"[。！？;；\n]", cold):
@@ -1373,6 +1376,34 @@ def _merge_two_entries(local: str, cold: str) -> str:
     if extra:
         base = base.rstrip("。！？;；\n") + "。" + "。".join(extra) + "。"
     return base
+
+
+def _cold_write_with_dedup(client, entry: str) -> Tuple[bool, str]:
+    """P8 (2026-09): 冷层写前查重 — remember/update 前 recall+匹配。
+
+    语义与 _handle_cold_migration 查重一致 (同口径, 避免双源漂移):
+      - 无匹配 → remember (importance=0.6); 返回 (是否 stored, 新 memory_id)
+      - same → 冷层已有等价全文, 零调用不重复写; 返回 (True, 已有 id)
+      - similar → merge-update; 返回 (是否 updated, 已有 id)
+    冷层不可达/recall 异常 → 抛异常, 由调用方保守保留原样 (errors)。
+
+    cold_id 一律指向冷层真实存在的 id — stub 路径 stamp 后
+    restore_stubs_from_results 才能命中 (Phase 4 恢复链路契约)。
+    """
+    existing = _recall_safe(client, entry)
+    matched = _find_best_match(entry, existing)
+    if matched is None:
+        r = client.remember(entry, importance=0.6, scope="global")
+        if not isinstance(r, dict) or r.get("status") != "stored":
+            return False, ""
+        return True, r.get("memory_id") or ""
+    if matched["level"] == "same":
+        return True, matched.get("id") or ""
+    merged = _merge_two_entries(entry, matched["content"])
+    r = client.update(matched["id"], merged)
+    if not isinstance(r, dict) or r.get("status") != "updated":
+        return False, ""
+    return True, matched.get("id") or ""
 
 
 def _safe_remove_local(store, target: str, entry: str, stat: dict) -> None:

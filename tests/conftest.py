@@ -117,6 +117,25 @@ def _isolate_activity(tmp_path, monkeypatch):
     inactive). Tests that need queries monkeypatch ACTIVITY_LOG_FILE
     themselves and call log_activity_query.
     """
+    from memorycore.core import config as config_mod
     from memorycore.core import metadata as meta_mod
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    # E8: ACTIVITY_LOG_ENABLED consumers delegate via _cfg to config; patch config
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_config(tmp_path, monkeypatch):
+    """Isolate LLM config (2026-09-12, Phase 1): tests never read the real
+    ~/.hermes/.env / config.yaml, never call real endpoints.
+
+    File sources off + LLM env cleared + ENV_FILE/CONFIG_YAML pointed at tmp
+    paths + resolve cache invalidated (no cross-test leakage).
+    """
+    from memorycore.core import llm_config
+    monkeypatch.setenv("MEMCORE_LLM_FILE_SOURCES", "0")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("MEMCORE_LLM_ENABLED", raising=False)
+    monkeypatch.setattr(llm_config, "ENV_FILE", tmp_path / "hermes.env")
+    monkeypatch.setattr(llm_config, "CONFIG_YAML", tmp_path / "config.yaml")
+    llm_config.invalidate_cache()

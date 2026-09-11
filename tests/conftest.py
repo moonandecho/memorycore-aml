@@ -125,6 +125,18 @@ def _isolate_activity(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_llm_rot(tmp_path, monkeypatch):
+    """Isolate LLM rotation-cursor state (2026-09-12, final-audit low-risk
+    D2 tail-starvation fix).
+
+    Tests never read/write the production ~/.memorycore/llm_rot.json; the
+    rotation offset resets per test (no cross-talk with production rounds).
+    """
+    from memorycore.core import llm_rot
+    monkeypatch.setattr(llm_rot, "ROT_PATH", tmp_path / "llm_rot.json")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_llm_config(tmp_path, monkeypatch):
     """Isolate LLM config (2026-09-12, Phase 1): tests never read the real
     ~/.hermes/.env / config.yaml, never call real endpoints.

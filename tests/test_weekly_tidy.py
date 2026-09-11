@@ -248,13 +248,12 @@ def test_no_llm_key_skips_sink_path(tmp_store, mock_client, meta_for,
     assert mock_client.stored == [], "无 LLM → 零冷层调用"
 
 
-# ---- ④b mandatory change 2: weekly hard gate now resolves via llm_config -----
+# ---- ④b 必改项 2: weekly 硬闸改调 resolver --------------------------------
 
 def test_weekly_gate_respects_file_source_key(tmp_store, mock_client, meta_for,
                                               tmp_path, monkeypatch):
-    """env has no LLM_API_KEY but a file source (~/.hermes/.env whitelist) has
-    a key -> the b) merge path must proceed (the old os.environ.get hard gate
-    blocked every file-source key)."""
+    """env 无 LLM_API_KEY 但文件源 (~/.hermes/.env 白名单) 有 key → b) 合并
+    路径必须放行 (原 os.environ.get("LLM_API_KEY") 硬闸会把文件源 key 全拦)。"""
     from memorycore.core import llm_config
     f = tmp_path / "hermes.env"
     f.write_text("DEEPSEEK_API_KEY=sk-file-key\n", encoding="utf-8")
@@ -277,16 +276,16 @@ def test_weekly_gate_respects_file_source_key(tmp_store, mock_client, meta_for,
                         lambda x, y: (merge_calls.append((x, y)), None)[1])
 
     stat = _run_tidy(tmp_store, mock_client)
-    assert merge_calls, ("file-source key must pass the b) merge path "
-                         "(mandatory change 2); an env-only hard gate blocks here")
+    assert merge_calls, ("文件源 key 应使 b) 合并路径放行 (必改项 2); "
+                         "硬闸只认 env 时此处会被拦")
     assert stat["merge_skipped"] == 1
 
-    # control: file sources off + no env key -> merge path skipped entirely
+    # 对照: 文件来源关闭 + env 无 key → 合并路径整体跳过
     merge_calls.clear()
     monkeypatch.setenv("MEMCORE_LLM_FILE_SOURCES", "0")
     llm_config.invalidate_cache()
     stat = _run_tidy(tmp_store, mock_client)
-    assert merge_calls == [], "no key from any source -> b) merge path skipped"
+    assert merge_calls == [], "无任何 key 来源 → b) 合并路径跳过"
     assert stat["merge_skipped"] == 0
 
 

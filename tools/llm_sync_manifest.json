@@ -1,0 +1,25 @@
+{
+  "note": "三仓 LLM 共享文件归一化哈希清单 (归一化规则见 check_llm_sync.py)。三家仓库此文件必须完全一致; 不一致 = 同步漂移, 立即修。",
+  "files": {
+    "llm_config.py": {
+      "sha256": "782712c8a3fbc91a3d9ee45dfd57c723d500580c712c7e41caad09a1201d21f3",
+      "found_at": "core/llm_config.py"
+    },
+    "llm_check.py": {
+      "sha256": "87412624b88cc1b2cbc13f7d42bd28305e93ab628412602445313cbf552e58b3",
+      "found_at": "core/llm_check.py"
+    },
+    "test_llm_config.py": {
+      "sha256": "fea6dc52a7e055316a36bbf8d942a55f529279d14f314ae98b59b9f6c7085920",
+      "found_at": "tests/test_llm_config.py"
+    },
+    "test_e_visible.py": {
+      "sha256": "3051f1e3eb15f7001d54ca87d64719bc0b7704625a97fa5760466da1424dda6a",
+      "found_at": "tests/test_e_visible.py"
+    },
+    "test_weekly_tidy.py": {
+      "sha256": "a360b1ec8d2bf0511301ed34a88f7bdd2f98d3f6a2a3f16c094ebddd123796ec",
+      "found_at": "tests/test_weekly_tidy.py"
+    }
+  }
+}

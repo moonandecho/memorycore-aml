@@ -32,6 +32,21 @@ TIMEOUT = 10.0
 # LocalBackend — in-process mnemosyne-memory library
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+# ---- E11 helper (2026-09-12) ------------------------------------------------
+_embed_fail_warned = False
+
+
+def _warn_embed_once(e: Exception) -> None:
+    """Warn once per process about embedding failure (rate-limited)."""
+    global _embed_fail_warned
+    if not _embed_fail_warned:
+        _embed_fail_warned = True
+        import logging
+        logging.getLogger("memorycore.cold_store").warning(
+            "EMBED: 冷层向量嵌入失败 / cold-tier vector embedding failed (%s)"
+            " → lexical-only recall degradation (further failures silent)", e)
+
 class LocalBackend:
     """Cold-tier backend backed by the mnemosyne-memory in-process library.
 
@@ -406,7 +421,11 @@ class LocalBackend:
             if vecs is None:
                 return []
             return [[round(float(x), 6) for x in v] for v in vecs]
-        except Exception:
+        except Exception as e:
+            # E11 (2026-09-12): embedding failure is no longer silent —
+            # warn once per process (no spam); semantics unchanged (return []
+            # → caller degrades to lexical recall).
+            _warn_embed_once(e)
             return []
 
     def list_all(self) -> List[Dict[str, Any]]:

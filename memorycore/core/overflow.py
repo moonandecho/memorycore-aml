@@ -16,6 +16,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .classifier import classify, classify_user_pref, should_keep_local, HOT, COLD, STALE
+from . import llm_config  # noqa: E402  LLM single source of truth (lazy+observable+guards)
 from .config import (
     STATE_TTL_DAYS, RULE_COMPRESS_DAYS,
     SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO,
@@ -33,16 +35,21 @@ from .config import (
     RULE_RETYPE_DONE_MARKERS, RULE_RETYPE_BEHAVIOR_MARKERS,
     RULE_STUB_IDLE_DAYS, IMPORTANCE_PROTECT, MAX_STUB_PER_RUN,
     STUB_MAX_CHARS, STUB_PREFIX, STUB_GC_MIN_AGE_DAYS,
-    ACTIVITY_LOG_ENABLED, ACTIVITY_WINDOW_DAYS, CROSS_DEDUP_MIN_IDLE_DAYS,
+    ACTIVITY_WINDOW_DAYS, CROSS_DEDUP_MIN_IDLE_DAYS,
     CLUSTER_EMBED_THRESHOLD,
-    RULE_BUDGET_CHARS, RULE_BUDGET_ENABLED, RULE_MIN_RESIDENCY_DAYS,
+    RULE_BUDGET_CHARS, RULE_MIN_RESIDENCY_DAYS,
     WEIGHT_INIT, WEIGHT_HIT_INCREMENT, WEIGHT_MAX, WEIGHT_HALF_LIFE_DAYS,
     WEIGHT_PROTECT_MULT, WEIGHT_KWSINK_MULT, MAX_EVICT_PER_RUN,
     HIT_STRONG_COS, HIT_WEAK_COS, HIT_STRONG_INCREMENT, HIT_WEAK_INCREMENT,
-    HIT_CAP_PER_SCAN, HIT_WEAK_MODE, LEX_EVIDENCE_BIGRAMS,
+    HIT_CAP_PER_SCAN, LEX_EVIDENCE_BIGRAMS,
     FRESH_QUERY_SCAN_CAP, EMBED_BATCH_MAX, EMBED_TIMEOUT,
-    EMBED_BACKEND, EMBED_MODEL, MEMORY_FILE, USER_FILE,
+    EMBED_MODEL, MEMORY_FILE, USER_FILE,
 )
+# E8 (2026-09-12): ACTIVITY_LOG_ENABLED / RULE_BUDGET_ENABLED / HIT_WEAK_MODE /
+# EMBED_BACKEND delegate lazily via module __getattr__ to core.config.
+from . import config as _cfg
+log = logging.getLogger("memorycore.overflow")
+
 from .metadata import (MetaStore, entry_age_days, parse_embedded_date,
                        _parse_iso, load_recent_queries,
                        load_recent_queries_with_ts)
@@ -184,16 +191,17 @@ def _llm_judge_dormant(entries: List[str],
     返回 {entry: dormant}; 失败/解析不过 → 该条不出现 (调用方按活跃处理)。
     prompt 硬约束: 拿不准判活跃; 只判主题是否被讨论过, 不判价值。
     """
-    from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT
-
-    if not LLM_API_KEY or not entries:
+    if not entries:
         return {}
     qs = "\n".join(f"- {q[:120]}" for q in queries[-60:])[:1500]
     out: Dict[str, bool] = {}
     import json
-    import urllib.request
     for i in range(0, len(entries), 5):
         chunk = entries[i:i + 5]
+        cfg = llm_config.acquire("休眠判定")
+        if cfg is None:
+            # 未配置/上限/退避 → 已判定部分生效, 其余按活跃 (保守方向)
+            return out
         items = "\n".join(
             f'<entry index="{j}">{e[:300]}</entry>'
             for j, e in enumerate(chunk))
@@ -210,23 +218,13 @@ def _llm_judge_dormant(entries: List[str],
         )
         try:
             payload = {
-                "model": LLM_MODEL,
+                "model": cfg.model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
                 "max_tokens": 800,
                 "response_format": {"type": "json_object"},
             }
-            req = urllib.request.Request(
-                LLM_BASE_URL.rstrip("/") + "/chat/completions",
-                data=json.dumps(payload).encode(),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {LLM_API_KEY}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
-                data = json.loads(resp.read().decode())
+            data = llm_config.chat(cfg, payload)
             content = data["choices"][0]["message"]["content"].strip()
             content = re.sub(r"^```(json)?|```$", "", content, flags=re.M).strip()
             results = json.loads(content).get("results", [])
@@ -236,8 +234,13 @@ def _llm_judge_dormant(entries: List[str],
                 if (isinstance(idx, int) and 0 <= idx < len(chunk)
                         and isinstance(d, bool)):
                     out[chunk[idx]] = d
+            llm_config.note_success()
+        except llm_config.LLMError as e:
+            llm_config.note_failure(e.category, e.detail)
+            return out  # 退避: 剩余批次全部跳过 (评审 C2)
         except Exception:
-            continue  # 本批按活跃
+            llm_config.note_failure("bad_response")
+            return out
     return out
 
 
@@ -259,7 +262,7 @@ def _plan_stub_candidates(metastore, client, entries: List[str]) -> List[str]:
 
     排序: 闲置最久优先, 同闲置字符长的先沉 (单位省字最高)。
     """
-    if not ACTIVITY_LOG_ENABLED:
+    if not _cfg.ACTIVITY_LOG_ENABLED:
         return []
     queries = load_recent_queries()
     cands = []
@@ -452,7 +455,14 @@ def run_overflow(store, client, target: str) -> dict:
         "stubbed": 0,            # Phase 3 S4: 休眠 B 类 rule → stub 指针数
         "stub_gc": 0,            # Phase 3 §6: 回收的 stub 指针数
         "retyped": 0,            # Phase 3 S2: rule → state 完成态复核数
+        "trash_fail": 0,         # E3: recycle-bin write failures (recoverability alert)
+        "embed_fail": 0,         # E5: embedding failures (activity/merge paths)
     }
+
+    # LLM guard session (review C2): per-run call cap + fail backoff +
+    # observable three states; close() writes stat["llm"] (MCP tool output /
+    # weekly report readable).
+    llm_guard = llm_config.start_session(stat=stat, name="overflow")
 
     # P4: 收集本次下沉的用户偏好内容, 溢流末统一更新冷层摘要锚点
     anchor_parts: List[str] = []
@@ -464,6 +474,7 @@ def run_overflow(store, client, target: str) -> dict:
         stat["usage_after"] = f"{store.usage_pct(target)}%"
         stat["chars_before"] = 0
         stat["chars_after"] = 0
+        llm_guard.close()
         return stat
 
     stat["chars_before"] = store.char_count(target)
@@ -545,7 +556,7 @@ def run_overflow(store, client, target: str) -> dict:
         stat["chars_after_split"] = store.char_count(target)
 
     # ---- Step 4: 同类事实合并 (先于下沉) ---------------------------------
-    merged_entries, merge_count = _merge_local_fragments(entries)
+    merged_entries, merge_count = _merge_local_fragments(entries, stat)
     if merge_count > 0:
         _rebuild_file(store, target, merged_entries)
         stat["merged"] = merge_count
@@ -568,8 +579,10 @@ def run_overflow(store, client, target: str) -> dict:
     # ---- Phase 4 Step A: 活性命中扫描 (语义两级判定; 失败降级不阻塞) ----
     try:
         apply_activity_hits({target: metastore}, {target: entries}, client, stat)
-    except Exception:
-        pass  # 命中扫描失败 → 本轮无新信号 (历史权重继续)
+    except Exception as e:
+        # E4 可见化: 活性扫描失败不再零信号 (原 except: pass 静默)
+        stat["errors"] += 1
+        log.warning("ACTIVITY: 活性命中扫描失败 / activity-hit scan failed (%s) → no new signal this round, historical weights continue", e)
 
     # ---- L2 预规划 (Phase 3): 高压下休眠 B 类 rule → stub 候选 ------------
     stub_candidates: Set[str] = set()
@@ -657,6 +670,7 @@ def run_overflow(store, client, target: str) -> dict:
     stat["chars_after"] = store.char_count(target)
     stat["usage_after"] = f"{store.usage_pct(target)}%"
     stat["target"] = target
+    llm_guard.close()
     return stat
 
 
@@ -755,8 +769,10 @@ def _handle_typed_entry(store, client, target: str, entry: str,
                         try:
                             metastore.stamp(compressed, "rule",
                                             origin="overflow")
-                        except Exception:
-                            pass  # F1: 盖章失败不阻塞 (下次 reconcile 补)
+                        except Exception as e:
+                            # F1/E9 可见化: 盖章失败不再静默 (下次 reconcile 补)
+                            stat["stamp_skipped"] = stat.get("stamp_skipped", 0) + 1
+                            log.debug("META: stamp failed (%s) → next reconcile heals", e)
                         stat["compressed"] += 1
                         anchor_parts.append(entry)
                         return True
@@ -813,8 +829,10 @@ def _update_pref_anchor(client, store, new_parts: List[str], stat: dict) -> None
                 if classify_user_pref(e, sentence_level=True) == "core"
             ]
             base = "。".join(core_entries)
-        except Exception:
-            pass
+        except Exception as e:
+            # E7 可见化: 锚点基础内容读取失败不再静默 (散条已沉, 索引降级)
+            stat["anchor_degraded"] = stat.get("anchor_degraded", 0) + 1
+            log.warning("ANCHOR: preference-anchor base read failed (%s) → rebuilt from new parts only", e)
     # 合入新内容 (句级去重)
     merged = base
     for p in dedup_parts:
@@ -889,12 +907,13 @@ def _handle_cold_migration(store, client, target: str, entry: str,
                             break
                 if has_neg and _topic_overlap(entry, cold_content):
                     try:
-                        # P1-6: 写入侧反转覆盖前, 旧条进回收站
-                        from trash_store import TrashStore
-                        TrashStore().add(
-                            matched["id"], cold_content,
-                            reason="reversal_obsolete",
-                            source_decision="write_side_reversal")
+                        # P1-6 + E3: 写入侧反转覆盖前, 旧条先进回收站
+                        # (写成功才许 update 覆盖; 写失败 → 计数 + 中止)
+                        from trash_store import TrashStore, add_observed
+                        if not add_observed(
+                                TrashStore(), matched["id"], cold_content,
+                                "reversal_obsolete", "write_side_reversal", stat):
+                            return
                         r = client.update(matched["id"], entry)
                         if r.get("status") == "updated":
                             _safe_remove_local(store, target, entry, stat)
@@ -947,11 +966,12 @@ def _handle_stale(store, client, target: str, entry: str, stat: dict) -> None:
                 ).ratio()
                 if ratio > _SAME_FACT_RATIO:
                     try:
-                        from trash_store import TrashStore
-                        TrashStore().add(
-                            ex["id"], ex.get("content", ""),
-                            reason=reason,
-                            source_decision="rule_stale")
+                        # E3: 回收站写成功才许 forget (写失败 → 计数, 源保留)
+                        from trash_store import TrashStore, add_observed
+                        if not add_observed(
+                                TrashStore(), ex["id"], ex.get("content", ""),
+                                reason, "rule_stale", stat):
+                            continue
                         client.forget(ex["id"])
                     except Exception:
                         pass  # forget 失败不阻塞 (回收站已有备份)
@@ -976,7 +996,8 @@ def _smart_ratio(a: str, b: str) -> float:
     return full
 
 
-def _merge_local_fragments(entries: List[str]) -> Tuple[List[str], int]:
+def _merge_local_fragments(entries: List[str],
+                           stat: dict = None) -> Tuple[List[str], int]:
     """检测本地同主题碎片并合并。返回 (merged, merge_count)。
 
     Phase 3 (2026-08-20): stub 指针 ([规则指针] 前缀) 不参与合并 —
@@ -1002,8 +1023,11 @@ def _merge_local_fragments(entries: List[str]) -> Tuple[List[str], int]:
             parent[ra] = rb
 
     # Phase 3 S3: 可选嵌入通道 (词法不达标时补充同主题判定; 嵌入不可用 → 纯词法)
+    # E5: 嵌入失败与 activity 路径同口径计数 (embed_fail), 不再静默纯词法
     mergeable = [e for i, e in enumerate(entries) if i not in skip]
     emb_map = _embed_batch(mergeable) if len(mergeable) >= 2 else None
+    if emb_map is None and len(mergeable) >= 2 and stat is not None:
+        stat["embed_fail"] = stat.get("embed_fail", 0) + 1
     for i in range(n):
         if i in skip:
             continue
@@ -1148,9 +1172,8 @@ def _llm_merge(base: str, new_sentences: List[str]) -> Optional[str]:
     - 失败路径 (无 key / 网络错误 / 超时 / 解析失败 / 信息保留校验不过)
       一律返回 None, 由调用方回退纯规则拼接, 溢流永不阻塞。
     """
-    from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT
-
-    if not LLM_API_KEY:
+    cfg = llm_config.acquire("合并")
+    if cfg is None:
         return None
 
     supplements = "\n".join(f"- {s}" for s in new_sentences)
@@ -1167,30 +1190,24 @@ def _llm_merge(base: str, new_sentences: List[str]) -> Optional[str]:
 
     try:
         import json
-        import urllib.request
 
         payload = {
-            "model": LLM_MODEL,
+            "model": cfg.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_tokens": 2000,
             "response_format": {"type": "json_object"},
         }
-        req = urllib.request.Request(
-            LLM_BASE_URL.rstrip("/") + "/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {LLM_API_KEY}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode())
+        data = llm_config.chat(cfg, payload)
         content = data["choices"][0]["message"]["content"].strip()
         content = re.sub(r"^```(json)?|```$", "", content, flags=re.M).strip()
         text = json.loads(content).get("merged", "").strip()
+        llm_config.note_success()
+    except llm_config.LLMError as e:
+        llm_config.note_failure(e.category, e.detail)
+        return None
     except Exception:
+        llm_config.note_failure("bad_response")
         return None
 
     # 校验 1: 长度合理
@@ -1229,9 +1246,8 @@ def _llm_compress(client, entry: str) -> Optional[str]:
     - 失败路径 (无 key / 网络错误 / 超时 / 解析失败 / 信息保留校验不过 /
       压缩不省字) 一律返回 None, 由调用方保留原条目, 溢流永不阻塞。
     """
-    from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT
-
-    if not LLM_API_KEY:
+    cfg = llm_config.acquire("压缩")
+    if cfg is None:
         return None
 
     prompt = (
@@ -1252,10 +1268,9 @@ def _llm_compress(client, entry: str) -> Optional[str]:
 
     try:
         import json
-        import urllib.request
 
         payload = {
-            "model": LLM_MODEL,
+            "model": cfg.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_tokens": 3000,
@@ -1263,21 +1278,17 @@ def _llm_compress(client, entry: str) -> Optional[str]:
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
         }
-        req = urllib.request.Request(
-            LLM_BASE_URL.rstrip("/") + "/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {LLM_API_KEY}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read().decode())
+        # 压缩输出长、单条耗时高, 超时给足 45s (原实现同值)
+        data = llm_config.chat(cfg, payload, timeout=45.0)
         content = data["choices"][0]["message"]["content"].strip()
         content = re.sub(r"^```(json)?|```$", "", content, flags=re.M).strip()
         text = json.loads(content).get("compressed", "").strip()
+        llm_config.note_success()
+    except llm_config.LLMError as e:
+        llm_config.note_failure(e.category, e.detail)
+        return None
     except Exception:
+        llm_config.note_failure("bad_response")
         return None
 
     # 校验 1: 长度合理 (不能过短丢语义, 不能反而变长)
@@ -1519,7 +1530,7 @@ def _load_fresh_queries(metastores: Dict[str, MetaStore]) -> List[str]:
     3. 系统噪声前缀过滤 + 内容去重 (保留最新) + 截断 200 字
     4. 取**最近** FRESH_QUERY_SCAN_CAP 条 (增量语义; 追加式日志尾部=最新)
     """
-    if not ACTIVITY_LOG_ENABLED:
+    if not _cfg.ACTIVITY_LOG_ENABLED:
         return []
     try:
         rows = load_recent_queries_with_ts(days=ACTIVITY_WINDOW_DAYS)
@@ -1583,9 +1594,9 @@ def _embed_batch_mnemosyne(client, texts: List[str]) -> Optional[List[List[float
       ollama      → 本地 _embed_batch (方案 c, 需重校准阈值)
       off         → None (强制降级纯词法)
     """
-    if EMBED_BACKEND == "off":
+    if _cfg.EMBED_BACKEND == "off":
         return None
-    if EMBED_BACKEND == "ollama":
+    if _cfg.EMBED_BACKEND == "ollama":
         # 本地 ollama 通道 (S3 聚簇嵌入复用): 可用 → list of vectors
         try:
             res = _embed_batch(texts)
@@ -1659,7 +1670,7 @@ def apply_activity_hits(metastores: Dict[str, MetaStore],
       embedding 不可达 → 降级纯词法弱命中 +0.3 (HIT_WEAK_MODE=degraded)
     词法证据 (sb≥2) 正常模式仅作审计字段 (hits_lex), 不加分。
     """
-    if not RULE_BUDGET_ENABLED:
+    if not _cfg.RULE_BUDGET_ENABLED:
         return
     rules: Dict[str, List[str]] = {}
     for t, entries in entries_by_target.items():
@@ -1680,7 +1691,7 @@ def apply_activity_hits(metastores: Dict[str, MetaStore],
     qvecs = _embed_batch_mnemosyne(client, queries)
     if qvecs is None:
         # 降级: 纯词法弱命中 (degraded 模式)
-        if HIT_WEAK_MODE == "degraded":
+        if _cfg.HIT_WEAK_MODE == "degraded":
             _degraded_lexical_hits(metastores, rules, queries, stat)
         stat["embed_fail"] = stat.get("embed_fail", 0) + 1
         return
@@ -1698,7 +1709,7 @@ def apply_activity_hits(metastores: Dict[str, MetaStore],
             if cos_max >= HIT_STRONG_COS:
                 _bump_weight(meta, HIT_STRONG_INCREMENT, refresh_anchor=True, now=now)
                 stat["hits_strong"] = stat.get("hits_strong", 0) + 1
-            elif (HIT_WEAK_MODE == "grey" and cos_max >= HIT_WEAK_COS
+            elif (_cfg.HIT_WEAK_MODE == "grey" and cos_max >= HIT_WEAK_COS
                     and any(_lex_evidence(q, e) for q in queries)):
                 # grey 档 (用户可开): 灰区语义 + 词法佐证 → 弱命中 (不刷新锚点)
                 _bump_weight(meta, HIT_WEAK_INCREMENT, refresh_anchor=False, now=now)
@@ -1784,7 +1795,7 @@ def _select_retirement_candidates(store, metastore, target: str,
     # 全量 350 条会几乎全活跃 → 挤权名存实亡。
     try:
         _active_queries = (load_recent_queries(days=7)
-                           if ACTIVITY_LOG_ENABLED else [])
+                           if _cfg.ACTIVITY_LOG_ENABLED else [])
     except Exception:
         _active_queries = []
     cands = []
@@ -1825,11 +1836,11 @@ def enforce_rule_budget(store, client, target: str, metastore,
     安全顺序: 冷层写成功才动本地 (stub-sink/retype 现有语义);
     冷层失败 → break (不丢数据, 下轮再试); 每轮 ≤ MAX_EVICT_PER_RUN。
     """
-    if not RULE_BUDGET_ENABLED:
+    if not _cfg.RULE_BUDGET_ENABLED:
         return
     # 无活性信号 (日志关闭) → 预算机制禁用 (LRU 依赖活性才有意义;
     # 退化为纯年龄排序又回到年龄不可靠的旧问题)。靠 5000 硬上限兜底。
-    if not ACTIVITY_LOG_ENABLED:
+    if not _cfg.ACTIVITY_LOG_ENABLED:
         return
     # 独立调用 (store_fact 写后) 传空 dict — 初始化被调函数依赖的计数键
     for _k in ("stubbed", "errors", "retyped", "overflowed", "kept",
@@ -1933,3 +1944,10 @@ def restore_stubs_from_results(store, metastores: Dict[str, MetaStore],
     if restored_ids:
         return [r for r in results if r.get("id") not in restored_ids]
     return results
+
+# ---- E8: env switches lazy delegation (2026-09-12) --------------------------
+def __getattr__(name):
+    if name in ("ACTIVITY_LOG_ENABLED", "RULE_BUDGET_ENABLED",
+                "HIT_WEAK_MODE", "EMBED_BACKEND"):
+        return getattr(_cfg, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -19,40 +19,40 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
-from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT
+from . import llm_config
 
 
 def _call_llm(prompt: str) -> Optional[Dict[str, Any]]:
-    """Call the LLM, return the parsed JSON dict. None on any failure."""
-    if not LLM_API_KEY:
+    """Call the LLM, return the parsed JSON dict. None on any failure.
+
+    Guard (review C2): unconfigured / per-run cap / fail backoff -> None
+    (conservative fallback, never blocks maintenance). Observable three
+    states go through llm_config into the current session stat["llm"] + logs.
+    """
+    cfg = llm_config.acquire("冷层判定")
+    if cfg is None:
         return None
 
     try:
-        import urllib.request
-
         payload = {
-            "model": LLM_MODEL,
+            "model": cfg.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
             "max_tokens": 1000,
             "response_format": {"type": "json_object"},
         }
-        req = urllib.request.Request(
-            LLM_BASE_URL.rstrip("/") + "/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {LLM_API_KEY}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode())
+        data = llm_config.chat(cfg, payload)
         content = data["choices"][0]["message"]["content"].strip()
         # Strip markdown code fences
         content = re.sub(r"^```(json)?|```$", "", content, flags=re.M).strip()
-        return json.loads(content)
+        result = json.loads(content)
+        llm_config.note_success()
+        return result
+    except llm_config.LLMError as e:
+        llm_config.note_failure(e.category, e.detail)
+        return None
     except Exception:
+        llm_config.note_failure("bad_response")
         return None
 
 
@@ -156,8 +156,6 @@ def judge_reversal(entries):
     仅当规则反转检测 (_is_reversal_pair) 因缺少否定词返回 False,
     但两条同主题 + 时间可判时才调用。LLM 不可用 -> 返回 None -> 保守保留。
     """
-    if not LLM_API_KEY:
-        return None
     if len(entries) != 2:
         return None
 

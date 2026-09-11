@@ -11,11 +11,15 @@
 from __future__ import annotations
 
 import difflib
+import logging
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+log = logging.getLogger("memorycore.maintenance")
+
 from .classifier import STALE, classify
 from .overflow import _norm_sentence, _bigram_coverage
+from . import llm_config  # noqa: E402  LLM single source of truth
 
 # ---- 阈值 ----------------------------------------------------------------
 
@@ -166,12 +170,18 @@ def run_maintenance(client) -> dict:
         "trash_cleared": 0,    # 本次到期清空
         "trash_revived": 0,    # 本次恢复 (被召回命中)
         "forgotten": 0,        # 冷层降权遗忘数
+        "trash_fail": 0,      # E3: recycle-bin write failures (recoverability alert)
     }
 
     # ---- Step 0: 回收站巡检 (召回恢复 + 到期清空) ----------------------
     trash_revived, trash_cleared = _trash_cycle(client)
     stat["trash_revived"] = trash_revived
     stat["trash_cleared"] = trash_cleared
+
+    # LLM guard session (review C2): separate cold-tier call cap + fail
+    # backoff; close() writes stat["llm"] (MCP tool output / weekly report).
+    llm_guard = llm_config.start_session(
+        stat=stat, max_calls=llm_config.cold_max_calls(), name="cold")
 
     from ..trash_store import TrashStore
     trash = TrashStore()
@@ -195,22 +205,23 @@ def run_maintenance(client) -> dict:
         except Exception:
             pass
         stat["note"] = "no entries enumerated (cold layer may be empty or list_all unavailable)"
+        llm_guard.close()
         return stat
 
     # ---- Step 2: 向量预筛去重 (B2 重写 + 反转消解) ---------------
     fuzzy_reversal_candidates: list = []
-    stat["merged"], fuzzy_groups, rev_count, fuzzy_dedup, step2_forgotten = _merge_duplicates(client, all_entries)
+    stat["merged"], fuzzy_groups, rev_count, fuzzy_dedup, step2_forgotten = _merge_duplicates(client, all_entries, stat)
     fuzzy_reversal_candidates.extend(fuzzy_dedup)
     stat["reversals_resolved"] += rev_count
 
     # ---- Step 2b: 模糊组 LLM 确认 (B4) ----------------------------------
     step2b_forgotten: Set[str] = set()
     if fuzzy_groups:
-        llm_merged, step2b_forgotten = _llm_dedup_confirm(client, fuzzy_groups)
+        llm_merged, step2b_forgotten = _llm_dedup_confirm(client, fuzzy_groups, stat)
         stat["merged"] += llm_merged
 
     # ---- Step 3: 过时事实清理 (B3 + 回收站入站) ------------------------
-    stat["cleaned"], step3_forgotten = _clean_stale(client, all_entries, trash)
+    stat["cleaned"], step3_forgotten = _clean_stale(client, all_entries, trash, stat)
     stat["pending_stale"] = trash.count()  # 更新回收站计数
 
     # ---- Step 4: 冲突事实取舍 --------------------------------------------
@@ -241,7 +252,7 @@ def run_maintenance(client) -> dict:
 
     if fuzzy_reversal_candidates:
         from .llm_judge import judge_reversal
-        from ..trash_store import TrashStore
+        from ..trash_store import TrashStore, add_observed
 
         batch_size = 5
         llm_reversal_hits = 0       # Fix2: 真正 LLM 确认反转数
@@ -258,13 +269,17 @@ def run_maintenance(client) -> dict:
                 result = judge_reversal([older, newer])
                 if result is None:
                     # R2: LLM 不可用/失败 → 退回直接合并 (排除反转后就是同主题重复)
+                    # 上限/退避拦截 → 跳过该对 (评审 C2: 剩余候选全部跳过)
+                    if llm_config.block_kind() in ("cap", "backoff"):
+                        continue
                     _merged = _merge_for_dedup(newer.get("content", ""), older.get("content", ""))
                     try:
                         client.update(newer["id"], _merged)
-                        TrashStore().add(
-                            older["id"], older.get("content", ""),
-                            reason="merge_obsolete",
-                            source_decision="llm_fallback_merge")
+                        # E3: 回收站先写成功才许 forget (写失败 → 计数 + 跳过删除)
+                        if not add_observed(
+                                TrashStore(), older["id"], older.get("content", ""),
+                                "merge_obsolete", "llm_fallback_merge", stat):
+                            continue
                         client.forget(older["id"])
                         step4b_forgotten.add(older["id"])
                         llm_candidates_processed += 1  # Fix2: fallback 合并也算处理
@@ -276,10 +291,11 @@ def run_maintenance(client) -> dict:
                     _merged = _merge_for_dedup(newer.get("content", ""), older.get("content", ""))
                     try:
                         client.update(newer["id"], _merged)
-                        TrashStore().add(
-                            older["id"], older.get("content", ""),
-                            reason="merge_obsolete",
-                            source_decision="llm_not_reversal_fallback")
+                        # E3: 回收站先写成功才许 forget
+                        if not add_observed(
+                                TrashStore(), older["id"], older.get("content", ""),
+                                "merge_obsolete", "llm_not_reversal_fallback", stat):
+                            continue
                         client.forget(older["id"])
                         step4b_forgotten.add(older["id"])
                         llm_candidates_processed += 1  # Fix2: 非反转合并也算处理
@@ -292,11 +308,13 @@ def run_maintenance(client) -> dict:
                 if not older_id:
                     continue
                 try:
+                    # E3 顺序修复: 原实现先 forget 后写回收站 — 回收站写失败时
+                    # 源条目已被删、无可恢复。现在回收站先写成功才许 forget。
+                    if not add_observed(
+                            TrashStore(), older_id, older.get("content", ""),
+                            "reversal_llm", "llm_reversal", stat):
+                        continue
                     client.forget(older_id)
-                    TrashStore().add(
-                        older_id, older.get("content", ""),
-                        reason="reversal_llm",
-                        source_decision="llm_reversal")
                     step4b_forgotten.add(older_id)
                     llm_reversal_hits += 1
                     llm_candidates_processed += 1  # Fix2
@@ -308,7 +326,7 @@ def run_maintenance(client) -> dict:
         processed_ids.update(step4b_forgotten)  # 4b 处理完并入
 
     # ---- Step 4c: 冷层降权遗忘 (decay → trash) ---------------------------
-    stat["forgotten"], decay_errors = _forget_decayed(client, all_entries, trash, processed_ids)
+    stat["forgotten"], decay_errors = _forget_decayed(client, all_entries, trash, processed_ids, stat)
     stat["errors"] += decay_errors
     stat["pending_stale"] = trash.count()
 
@@ -323,6 +341,7 @@ def run_maintenance(client) -> dict:
         stat["vector_ok"] = None
         stat["vector_error"] = str(e)
 
+    llm_guard.close()
     return stat
 
 
@@ -370,8 +389,10 @@ def _trash_cycle(client) -> Tuple[int, int]:
             continue
         try:
             client.forget(mid)
-        except Exception:
-            pass  # 可能已被遗忘, 不影响回收站清理
+        except Exception as e:
+            # E3 可见化: 到期清空 forget 失败不再静默 (可能已被遗忘, 不影响清理)
+            log.warning("TRASH: expiry purge forget failed (%s: %s) → still removed from bin",
+                        mid, e)
         trash.remove(mid)
         cleared += 1
 
@@ -435,7 +456,8 @@ def _enumerate_all(client, total_hint: int = 0) -> List[Dict[str, Any]]:
 
 # ---- Step 2: 向量预筛去重 (B2 重写) -----------------------------------------
 
-def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list, int, list, set]:
+def _merge_duplicates(client, entries: List[Dict[str, Any]],
+                       stat: dict = None) -> Tuple[int, list, int, list, set]:
     """B2 向量预筛去重: sqlite-vec 邻居替代 bigram 倒排。
 
     1. 对每条条目 recall top_k=_VEC_NEIGHBOR_K 找向量邻居
@@ -447,6 +469,8 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list,
 
     返回 (merged_count, fuzzy_groups, reversal_count, fuzzy_reversal_candidates)。
     """
+    from ..trash_store import TrashStore, add_observed
+
     n = len(entries)
     if n <= 1:
         return 0, [], 0, [], set()
@@ -599,11 +623,11 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list,
                 )
                 try:
                     client.update(keeper["id"], merged_content)
-                    # P1-5: victim 进回收站再 forget
-                    TrashStore().add(
-                        victim["id"], victim.get("content", ""),
-                        reason="merge_obsolete",
-                        source_decision="rule_merge")
+                    # P1-5 + E3: victim 进回收站 (写成功) 再 forget
+                    if not add_observed(
+                            TrashStore(), victim["id"], victim.get("content", ""),
+                            "merge_obsolete", "rule_merge", stat):
+                        continue
                     client.forget(victim["id"])
                     to_forget.add(victim["id"])
                     merged += 1
@@ -616,12 +640,14 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]]) -> Tuple[int, list,
     return merged, fuzzy_groups, reversal_count, fuzzy_reversal_candidates, to_forget
 
 
-def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]]) -> Tuple[int, Set[str]]:
+def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]],
+                       stat: dict = None) -> Tuple[int, Set[str]]:
     """模糊去重组交 LLM 确认。返回 (LLM 确认合并数, 已 forget 的 victim id 集合)。
 
     victim id 供 Step 4c decay 过滤 — 已 forget 的条目不再重复评估。
     """
     from .llm_judge import judge_dedup
+    from ..trash_store import TrashStore, add_observed
 
     merged = 0
     forgotten: Set[str] = set()
@@ -648,12 +674,11 @@ def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]]) -> Tuple[int, Set
                     keeper.get("content", ""), victim.get("content", "")
                 )
                 client.update(keeper["id"], merged_content)
-                # Fix3: victim 进回收站 (P1-5 遗漏)
-                from ..trash_store import TrashStore
-                TrashStore().add(
-                    victim_id, victim.get("content", ""),
-                    reason="merge_obsolete",
-                    source_decision="llm_dedup")
+                # Fix3 + E3: victim 进回收站 (写成功) 再 forget
+                if not add_observed(
+                        TrashStore(), victim_id, victim.get("content", ""),
+                        "merge_obsolete", "llm_dedup", stat):
+                    continue
                 client.forget(victim_id)
                 merged += 1
                 forgotten.add(victim_id)
@@ -668,7 +693,8 @@ def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]]) -> Tuple[int, Set
 _LONG_STALE_MARKERS = ["落地中", "进行中", "规划中", "待定", "未完成"]  # P2-2: 进行时词在此判定
 
 
-def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int, Set[str]]:
+def _clean_stale(client, entries: List[Dict[str, Any]], trash=None,
+                stat: dict = None) -> Tuple[int, Set[str]]:
     """B3 过时清理: 短条目直接 forget, 长条目含进行时标记 → LLM → 回收站。
 
     Returns:
@@ -686,7 +712,7 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int
     """
     from .config import STALE_MARKERS
     from .llm_judge import judge_stale
-    from ..trash_store import TrashStore
+    from ..trash_store import TrashStore, add_observed
 
     if trash is None:
         trash = TrashStore()
@@ -707,12 +733,12 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int
 
         if is_short:
             # 短条目: 先进回收站再 forget (P2-2: 与长条目对称, 统一进回收站)
+            # E3: 回收站写失败 → 计数 + 跳过 forget (可恢复性保护不可静默失效)
             try:
-                trash.add(
-                    entry["id"],
-                    entry.get("content", ""),
-                    reason="stale_short",
-                    source_decision="rule_stale")
+                if not add_observed(
+                        trash, entry["id"], entry.get("content", ""),
+                        "stale_short", "rule_stale", stat):
+                    continue
                 client.forget(entry["id"])
                 cleaned += 1
                 forgotten_ids.add(entry["id"])
@@ -743,13 +769,14 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int
 
             if result is None:
                 # LLM 失败 → 保守入回收站
+                # 上限/退避拦截 → 跳过该批 (评审 C2: 剩余候选全部跳过)
+                if llm_config.block_kind() in ("cap", "backoff"):
+                    continue
                 for entry in batch:
-                    trash.add(
-                        entry["id"],
-                        entry.get("content", ""),
-                        reason="stale_candidate",
-                        source_decision="llm_failed",
-                    )
+                    # E3: 写失败计数可见 (无后续删除, 不中断治理)
+                    add_observed(
+                        trash, entry["id"], entry.get("content", ""),
+                        "stale_candidate", "llm_failed", stat)
                 continue
 
             if result.get("decision") == "stale":
@@ -763,16 +790,12 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int
                 for entry in batch:
                     if entry["id"] in stale_ids:
                         try:
-                            # LLM 判 stale 的长条目 forget 前先进回收站,
-                            # 与短条目 (stale_short) / 溢流路径对齐, 保留
-                            # 30 天恢复窗口。先写回收站成功才 forget
-                            # (保守: trash.add 失败 → 条目保留冷层, 下轮再评估)。
-                            trash.add(
-                                entry["id"],
-                                entry.get("content", ""),
-                                reason="stale_long",
-                                source_decision="llm_stale",
-                            )
+                            # LLM 判 stale 的长条目 forget 前先进回收站
+                            # (写成功才 forget; E3: 失败计数可见)。
+                            if not add_observed(
+                                    trash, entry["id"], entry.get("content", ""),
+                                    "stale_long", "llm_stale", stat):
+                                continue
                             client.forget(entry["id"])
                             cleaned += 1
                             forgotten_ids.add(entry["id"])
@@ -781,28 +804,25 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int
                     else:
                         # 同批未标记为 stale → 入回收站
                         # (stale_ids 为空时标注 llm_stale_no_ids)
-                        trash.add(
-                            entry["id"],
-                            entry.get("content", ""),
-                            reason="stale_candidate",
-                            source_decision=fallback_label,
-                        )
+                        # E3: 写失败计数可见 (无后续删除, 不中断治理)
+                        add_observed(
+                            trash, entry["id"], entry.get("content", ""),
+                            "stale_candidate", fallback_label, stat)
             else:
                 # LLM 判 not_stale → 入回收站
                 for entry in batch:
-                    trash.add(
-                        entry["id"],
-                        entry.get("content", ""),
-                        reason="stale_candidate",
-                        source_decision="llm_not_stale",
-                    )
+                    # E3: 写失败计数可见 (无后续删除, 不中断治理)
+                    add_observed(
+                        trash, entry["id"], entry.get("content", ""),
+                        "stale_candidate", "llm_not_stale", stat)
 
     return cleaned, forgotten_ids
 
 
 # ---- Step 3b: 冷层降权遗忘判定 --------------------------------------------
 
-def _forget_decayed(client, entries, trash=None, processed_ids=None):
+def _forget_decayed(client, entries, trash=None, processed_ids=None,
+                    stat: dict = None):
     """冷层降权遗忘: final_score = importance × 0.5^(days/90) < 0.05 且 importance < 0.8 → 移入回收站。
 
     语义: 存储层留存决策, 回答"该条目是否值得保留"。
@@ -821,7 +841,7 @@ def _forget_decayed(client, entries, trash=None, processed_ids=None):
         (int, int): (本次遗忘数, forget 失败数)
     """
     from datetime import datetime, timezone as _tz
-    from ..trash_store import TrashStore
+    from ..trash_store import TrashStore, add_observed
 
     if trash is None:
         trash = TrashStore()
@@ -875,17 +895,12 @@ def _forget_decayed(client, entries, trash=None, processed_ids=None):
         final_score = importance * factor
 
         if final_score < 0.05:
-            # 安全顺序: 先入回收站, 成功后再从冷层删除。
-            # trash.add 失败时跳过该条 (不 forget), 下轮巡检再试。
-            try:
-                trash.add(
-                    eid,
-                    entry.get("content", ""),
-                    reason="decayed",
-                    source_decision="decay_forget",
-                )
-            except Exception:
-                continue  # 回收站写入失败 → 保守, 不删冷层数据
+            # 安全顺序 (E3): 先入回收站 (写成功), 再从冷层删除。
+            # 写失败 → 计数 + 跳过该条 (不 forget), 下轮巡检再试。
+            if not add_observed(
+                    trash, eid, entry.get("content", ""),
+                    "decayed", "decay_forget", stat):
+                continue
             try:
                 client.forget(eid)
                 forgotten += 1
@@ -922,7 +937,8 @@ def _merge_for_dedup(base: str, other: str) -> str:
 
 # ---- Step 4: 冲突取舍 -----------------------------------------------------
 
-def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_candidates: list = None) -> Tuple[int, int, set]:
+def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_candidates: list = None,
+                       stat: dict = None) -> Tuple[int, int, set]:
     """解决同主题冲突: 反转冲突按时间取舍, 普通冲突保留最新, victim 进回收站。
 
     冲突判定: 两条内容同主题 (相似度 > CONFLICT_THRESHOLD)
@@ -935,7 +951,7 @@ def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_can
     if len(entries) <= 1:
         return 0, 0, set()
 
-    from ..trash_store import TrashStore
+    from ..trash_store import TrashStore, add_observed
 
     n = len(entries)
     resolved = 0
@@ -963,11 +979,14 @@ def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_can
                     victim_id = older.get("id", "")
                     if victim_id and victim_id not in to_forget:
                         try:
+                            # E3 顺序修复: 原实现先 forget 后写回收站 — 回收站
+                            # 写失败时源条目已被删、无可恢复。现回收站先写。
+                            if not add_observed(
+                                    TrashStore(), victim_id,
+                                    older.get("content", ""),
+                                    "reversal_obsolete", "rule_reversal", stat):
+                                continue
                             client.forget(victim_id)
-                            TrashStore().add(
-                                victim_id, older.get("content", ""),
-                                reason="reversal_obsolete",
-                                source_decision="rule_reversal")
                             to_forget.add(victim_id)
                             reversal_count += 1
                             resolved += 1
@@ -1001,11 +1020,13 @@ def _resolve_conflicts(client, entries: List[Dict[str, Any]], fuzzy_reversal_can
                 victim_id = victim.get("id", "")
                 if victim_id and victim_id not in to_forget:
                     try:
+                        # E3 顺序修复: 回收站先写成功才许 forget
+                        if not add_observed(
+                                TrashStore(), victim_id,
+                                victim.get("content", ""),
+                                "conflict_obsolete", "rule_conflict", stat):
+                            continue
                         client.forget(victim_id)
-                        TrashStore().add(
-                            victim_id, victim.get("content", ""),
-                            reason="conflict_obsolete",
-                            source_decision="rule_conflict")
                         to_forget.add(victim_id)
                         resolved += 1
                     except Exception:

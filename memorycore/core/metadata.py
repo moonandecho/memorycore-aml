@@ -32,9 +32,13 @@ from typing import Any, Dict, List, Optional
 from .classifier import classify_entry_type
 from .config import (MEMORY_FILE, USER_FILE, META_SUFFIX,
                      WEIGHT_INIT,
-                     ACTIVITY_LOG_ENABLED, ACTIVITY_LOG_RETENTION_DAYS,
+                     ACTIVITY_LOG_RETENTION_DAYS,
                      ACTIVITY_LOG_MAX_BYTES, ACTIVITY_LOG_FILE,
                      ACTIVITY_WINDOW_DAYS, STUB_PREFIX)
+# E8 (2026-09-12): ACTIVITY_LOG_ENABLED delegates lazily through the module
+# __getattr__ at file end to core.config (runtime env changes take effect;
+# monkeypatch.setattr overrides still work).
+from . import config as _cfg
 
 _EMBEDDED_DATE_RE = re.compile(r"20\d\d-\d\d-\d\d")
 
@@ -367,7 +371,7 @@ def log_activity_query(query: str) -> None:
     ACTIVITY_LOG_ENABLED=0 disables it (S4 stub-sink is then disabled too
     and the whole mechanism degrades to previous behaviour).
     """
-    if not ACTIVITY_LOG_ENABLED:
+    if not _cfg.ACTIVITY_LOG_ENABLED:
         return
     q = (query or "").strip()
     if not q:
@@ -465,7 +469,7 @@ def load_recent_queries(days: Optional[int] = None) -> List[str]:
     Missing/corrupt log or no samples in window -> [] (callers treat every
     entry as active — conservative, stubbing stays off).
     """
-    if not ACTIVITY_LOG_ENABLED:
+    if not _cfg.ACTIVITY_LOG_ENABLED:
         return []
     return [q for _, q in load_recent_queries_with_ts(days)]
 
@@ -476,7 +480,7 @@ def load_recent_queries_with_ts(days: Optional[int] = None) -> List[tuple]:
     Same parsing as load_recent_queries, plus ts (for last_scan_at
     incremental filtering). Missing/corrupt log -> [].
     """
-    if not ACTIVITY_LOG_ENABLED:
+    if not _cfg.ACTIVITY_LOG_ENABLED:
         return []
     days = ACTIVITY_WINDOW_DAYS if days is None else days
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -496,3 +500,9 @@ def load_recent_queries_with_ts(days: Optional[int] = None) -> List[tuple]:
     except OSError:
         return []
     return out
+
+# ---- E8: env switch lazy delegation (2026-09-12) ----------------------------
+def __getattr__(name):
+    if name == "ACTIVITY_LOG_ENABLED":
+        return getattr(_cfg, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

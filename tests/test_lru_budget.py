@@ -162,9 +162,10 @@ def _mk_meta(tmp_store, meta_for, entry, days=100):
 def test_fresh_queries_take_recent_not_oldest(tmp_store, meta_for, tmp_path,
                                               monkeypatch):
     """S2 回归: fresh 查询取最近而非最老 (追加式日志尾部=最新)。"""
+    from memorycore.core import config as config_mod
     from memorycore.core import metadata as meta_mod
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     # 写 60 条查询 (时间递增)
@@ -181,9 +182,10 @@ def test_fresh_queries_take_recent_not_oldest(tmp_store, meta_for, tmp_path,
 def test_last_scan_at_persists_anchor(tmp_store, meta_for, tmp_path,
                                       monkeypatch):
     """S3 回归: last_scan_at 落盘 — 第二轮同批查询不再加分。"""
+    from memorycore.core import config as config_mod
     from memorycore.core import metadata as meta_mod
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     entry = _mk_meta(tmp_store, meta_for, "规则乙: 打印机配置细节。")
     meta_mod.log_activity_query("打印机怎么设置")
     from memorycore.core.overflow import apply_activity_hits
@@ -209,9 +211,10 @@ def test_last_scan_at_persists_anchor(tmp_store, meta_for, tmp_path,
 def test_candidate_selection_lexical_without_llm(tmp_store, meta_for, tmp_path,
                                                  monkeypatch):
     """S1 回归: 候选筛选纯词法 (sb≥2), 无 LLM key 时非活跃规则可被选中。"""
+    from memorycore.core import config as config_mod
     from memorycore.core import metadata as meta_mod
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     from memorycore.core.overflow import _select_retirement_candidates
     # 词法活跃的规则 (7 天内有相关查询) → 不挤
     e_active = _mk_meta(tmp_store, meta_for, "规则丙: 打印机型号与耗材。")
@@ -226,9 +229,10 @@ def test_candidate_selection_lexical_without_llm(tmp_store, meta_for, tmp_path,
 def test_apply_activity_hits_strong_and_cap(tmp_store, meta_for, tmp_path,
                                             monkeypatch):
     """S1 补充: apply_activity_hits 语义强命中 +1.0, 每轮封顶 1 次。"""
+    from memorycore.core import config as config_mod
     from memorycore.core import metadata as meta_mod
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     entry = _mk_meta(tmp_store, meta_for, "规则戊: Samba 配置说明。")
     meta_mod.log_activity_query("怎么在服务器上共享文件夹")
     meta_mod.log_activity_query("Samba 怎么设置")

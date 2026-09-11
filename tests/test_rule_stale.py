@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from memorycore.core import overflow as ov
+from memorycore.core import config as config_mod
 from memorycore.core import metadata as meta_mod
 from memorycore.core.config import MAX_STUB_PER_RUN, STUB_MAX_CHARS, STUB_PREFIX
 from memorycore.core.metadata import MetaStore
@@ -50,7 +51,7 @@ def _stamp_stub(meta_for, entry, days, target="memory"):
 
 def _setup_activity(monkeypatch, tmp_path, queries):
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     for q in queries:
         meta_mod.log_activity_query(q)
 
@@ -260,7 +261,7 @@ def test_protected_only_can_be_evicted(tmp_store, mock_client, meta_for,
 
 def test_s4_disabled_when_log_disabled(tmp_store, mock_client, meta_for,
                                        tmp_path, monkeypatch):
-    monkeypatch.setattr(ov, "ACTIVITY_LOG_ENABLED", False)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", False)
     entry = "自托管选型偏好: 极轻极简, Go/Rust 单二进制。"
     tmp_store.add("memory", entry)
     _stamp_rule(meta_for, entry, days=50)
@@ -431,23 +432,23 @@ def test_idempotent_second_run_no_side_effects(tmp_store, mock_client, meta_for,
 
 def test_activity_log_roundtrip_and_truncate(tmp_path, monkeypatch):
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     meta_mod.log_activity_query("  测试查询内容  ")
     qs = meta_mod.load_recent_queries(days=1)
     assert any("测试查询内容" in q for q in qs)
     meta_mod.log_activity_query("长" * 300)
     qs = meta_mod.load_recent_queries(days=1)
     assert max(len(q) for q in qs) <= 200, "日志截前 200 字"
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", False)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", False)
     meta_mod.log_activity_query("不应写入")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     qs = meta_mod.load_recent_queries(days=1)
     assert all("不应写入" not in q for q in qs), "关闭时不得落盘" 
 
 
 def test_activity_log_compaction(tmp_path, monkeypatch):
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "act.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_MAX_BYTES", 4096)
     for i in range(300):
         meta_mod.log_activity_query(f"查询{i} " + "x" * 40)
@@ -464,7 +465,7 @@ def test_prefetch_logs_activity(tmp_path, monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "act.jsonl")
-    monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_ENABLED", True)
+    monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
     mod.MnemosyneClient = lambda **k: MockMnemosyneClient()
     provider = mod.MemoryCorePrefetchProvider()
     provider._recall_sync("自托管选型调查")

@@ -64,9 +64,24 @@ if "MNEMOSYNE_EMBEDDING_MODEL" not in os.environ:
 if "MNEMOSYNE_EMBEDDING_DIM" not in os.environ:
     os.environ["MNEMOSYNE_EMBEDDING_DIM"] = "1024"
 
-# ---- LLM (optional, merge enhancement for ambiguous groups) ----
-# Used by overflow merge when rule-based dedup cannot resolve an ambiguous
-# same-topic group. Falls back to pure rules when unset or on any failure.
+# E13 (2026-09-12): import-time os.environ writes are no longer silent —
+# one info log line documents the exported values (paths/URLs/model names,
+# no secrets).
+import logging as _logging
+_logging.getLogger("memorycore.config").info(
+    "MNEMOSYNE env export: DATA_DIR=%s EMBEDDING_API_URL=%s "
+    "EMBEDDING_MODEL=%s EMBEDDING_DIM=%s",
+    os.environ["MNEMOSYNE_DATA_DIR"], os.environ["MNEMOSYNE_EMBEDDING_API_URL"],
+    os.environ["MNEMOSYNE_EMBEDDING_MODEL"], os.environ["MNEMOSYNE_EMBEDDING_DIM"])
+
+# ---- LLM (frozen semantics, DO NOT use in new code!) ----
+# 2026-09-12 review v2: the LLM config single source of truth moved to
+# core/llm_config.py (lazy resolve + ~/.hermes/.env whitelist + config.yaml
+# provider gating + observable three states + safety valves; file sources are
+# OFF by default in this release — opt-in via MEMCORE_LLM_FILE_SOURCES=1,
+# review mandatory-change 3). These constants stay only for backward
+# compatibility with old tests/scripts: bound once at import, runtime env
+# changes do NOT take effect (frozen). New code: llm_config.resolve().
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
@@ -137,7 +152,7 @@ RULE_STUB_IDLE_DAYS = 45           # stub eligibility: days without update
 ACTIVITY_WINDOW_DAYS = 30          # topic-dormancy window
 # Set ACTIVITY_LOG_ENABLED=0 to disable the query activity log; S4 stub-sink
 # is then disabled entirely (mechanism degrades to previous behaviour).
-ACTIVITY_LOG_ENABLED = os.environ.get("ACTIVITY_LOG_ENABLED", "1") != "0"
+# ACTIVITY_LOG_ENABLED: E8 lazy resolve (module-level __getattr__ at file end)
 ACTIVITY_LOG_RETENTION_DAYS = 45   # log rolling retention
 ACTIVITY_LOG_MAX_BYTES = 256 * 1024
 ACTIVITY_LOG_FILE = MEMORY_DIR / "activity.jsonl"
@@ -164,7 +179,7 @@ CLUSTER_EMBED_THRESHOLD = 0.85
 # Iron rule: no rule is permanently kept; protection is a weight multiplier,
 # lifetime is decided by activity (LRU touch semantics).
 RULE_BUDGET_CHARS = 3200            # rule ecology (rule+stub) char hard budget = 64% cap
-RULE_BUDGET_ENABLED = os.environ.get("MEMORYCORE_RULE_BUDGET_ENABLED", "1") != "0"  # rollback switch
+# RULE_BUDGET_ENABLED: E8 lazy resolve (module-level __getattr__ at file end)  # rollback switch
 RULE_MIN_RESIDENCY_DAYS = 7         # new/restored rule min residency (temporary protection)
 WEIGHT_INIT = 1.0                   # new rule initial weight
 WEIGHT_HIT_INCREMENT = 1.0          # one strong hit ~ cancels one half-life (30d)
@@ -211,10 +226,35 @@ HIT_WEAK_COS = 0.42                 # grey-band lower bound (only with HIT_WEAK_
 HIT_STRONG_INCREMENT = 1.0          # strong-hit increment (design value)
 HIT_WEAK_INCREMENT = 0.3            # weak-hit increment (conservative noise suppression)
 HIT_CAP_PER_SCAN = 1                # per-rule per-scan cap (saturation math: uncapped pins all rules at 5.0 in 1-2 days)
-HIT_WEAK_MODE = os.environ.get("MEMORYCORE_HIT_WEAK_MODE", "degraded")  # degraded/off/grey
+# HIT_WEAK_MODE: E8 lazy resolve (module-level __getattr__ at file end)  # degraded/off/grey
 LEX_EVIDENCE_BIGRAMS = 2            # lexical weak hit: shared bigrams >= 2 (measured FP case has 2)
 FRESH_QUERY_SCAN_CAP = 50           # fresh queries per scan (≈1 day of queries, embed cost cap ~2.5s)
 EMBED_BATCH_MAX = 32                # server batch cap (32 ≈2s, keeps the MCP server responsive)
 EMBED_TIMEOUT = 30                  # embed timeout (cold model load measured 15s + margin)
-EMBED_BACKEND = os.environ.get("MEMORYCORE_EMBED_BACKEND", "mnemosyne")  # mnemosyne/ollama/off
+# EMBED_BACKEND: E8 lazy resolve (module-level __getattr__ at file end)  # mnemosyne/ollama/off
 EMBED_MODEL = "qwen3-embedding-ctx256"  # same model as Mnemosyne recall (same score space)
+
+# ---- E8: env switches lazy resolve (PEP 562, 2026-09-12) ---------------------
+# Previously read once at import (same freeze pattern as LLM_API_KEY): a
+# long-running process (MCP server) ignores runtime env changes. Now every
+# attribute access re-reads the env. Consumers (overflow/metadata) delegate
+# through their own module-level __getattr__; monkeypatch.setattr(module,
+# "NAME", v) overrides still work (test contract unchanged).
+
+_ENV_SWITCH_SPECS = {
+    "ACTIVITY_LOG_ENABLED": ("ACTIVITY_LOG_ENABLED", "1"),
+    "RULE_BUDGET_ENABLED": ("MEMORYCORE_RULE_BUDGET_ENABLED", "1"),
+    "HIT_WEAK_MODE": ("MEMORYCORE_HIT_WEAK_MODE", "degraded"),
+    "EMBED_BACKEND": ("MEMORYCORE_EMBED_BACKEND", "mnemosyne"),
+}
+
+
+def __getattr__(name):
+    spec = _ENV_SWITCH_SPECS.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    env_name, default = spec
+    val = os.environ.get(env_name, default)
+    if name in ("ACTIVITY_LOG_ENABLED", "RULE_BUDGET_ENABLED"):
+        return val != "0"
+    return val

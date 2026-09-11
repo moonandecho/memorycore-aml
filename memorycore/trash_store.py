@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+
+log = logging.getLogger("memorycore.trash")
 
 TRASH_PATH = Path(
     os.environ.get(
@@ -31,6 +34,26 @@ TRASH_PATH = Path(
     )
 )
 TRASH_TTL_DAYS = 30
+
+
+def add_observed(trash: "TrashStore", memory_id: str, content: str,
+                 reason: str, source_decision: str, stat: dict) -> bool:
+    """E3 visible (2026-09-12): trash write failure -> stat["trash_fail"] + warning.
+
+    Returns True=added; False=failed. Caller contract: on False the caller
+    MUST skip the subsequent delete (forget/update) — the recycle-bin
+    recoverability protection must not fail silently; never delete the source
+    when the recycle-bin write failed.
+    """
+    try:
+        trash.add(memory_id, content, reason=reason,
+                  source_decision=source_decision)
+        return True
+    except Exception as e:
+        stat["trash_fail"] = stat.get("trash_fail", 0) + 1
+        log.warning("TRASH: recycle-bin write failed (%s: %s) → abort delete, source kept",
+                    memory_id, e)
+        return False
 
 
 class TrashStore:

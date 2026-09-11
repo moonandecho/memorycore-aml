@@ -133,18 +133,36 @@ def test_no_activity_control_sinks(tmp_store, meta_for, monkeypatch):
 
 # ---- ② 恢复条目较新锚点 --------------------------------------------------
 
-def test_entry_date_days_newer_anchor(tmp_store, meta_for):
-    """P4: _entry_date_days 取 min(内嵌, written_at) — 恢复条目获得全新时钟。"""
+def test_entry_date_days_newer_anchor(tmp_store, meta_for, monkeypatch):
+    """P4: _entry_date_days 取 min(内嵌, written_at) — 恢复条目获得全新时钟。
+
+    change-detector 修复 (2026-09-12 评审 D1): 原断言写死 == 30, 而
+    days_ago_str(30) 按本地朴素时钟生成、_entry_date_days 按 UTC 解析,
+    差值随本地时区/运行时刻在 29/30 间漂移 (早上红下午绿、随日历漂移)。
+    修复: 冻结 wm 时钟 + 断言语义区间 {29, 30, 31} 的关系断言, 不再写死绝对天数。
+    """
+    frozen = datetime.now(timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz else frozen.replace(tzinfo=None)
+
+    monkeypatch.setattr(wm, "datetime", _FrozenDatetime)
+
     e = f"{days_ago_str(30)} 已删: 打印机驱动冲突, 卸载重装。"
     tmp_store.add("memory", e)
-    meta_for("memory").stamp(e, "state", written_at=datetime.now(timezone.utc))
+    # written_at 用冻结时钟盖章 (与 _entry_date_days 内部 now 同源 → 恒 0 天)
+    meta_for("memory").stamp(e, "state", written_at=frozen)
     meta = meta_for("memory").get_entry(e)
-    assert wm._entry_date_days(e, meta) == 0, "written_at=now → 0 天 (较新锚点)"
-    # 老 written_at + 老内嵌日期 → 取 min (仍老)
-    old = datetime.now(timezone.utc) - timedelta(days=60)
+    assert wm._entry_date_days(e, meta) == 0, "written_at=冻结 now → 0 天 (较新锚点)"
+    # 老 written_at + 老内嵌日期 → 取 min (仍老); days_ago_str 按本地朴素时钟
+    # 生成、_entry_date_days 按 UTC 解析, 差值为 30±1 天 (时区相位) — 关系断言
+    old = frozen - timedelta(days=60)
     meta_for("memory").stamp(e, "state", written_at=old)
     meta = meta_for("memory").get_entry(e)
-    assert wm._entry_date_days(e, meta) == 30, "两锚点均老 → 取较新者 (30d)"
+    days = wm._entry_date_days(e, meta)
+    assert days in (29, 30, 31), f"两锚点均老 → 取较新者 (30±1d), 实际 {days}"
     # 均无 → None
     assert wm._entry_date_days("没有日期的普通条目", {}) is None
 

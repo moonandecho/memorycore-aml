@@ -3,7 +3,7 @@
 
 差异化路线：记忆治理在线化（ActiveMemoryIndex 式路线，MemoryCore 自己的治理机制）。
 
-HTTP endpoints (plain REST, mounted on FastMCP streamable-http app):
+HTTP endpoints (plain REST, mounted on the MCP server streamable-http app):
   POST /add     AML write: messages → fact fragments → stale filter →
                 semantic dedup/merge → cold tier (author_id = user_id)
   POST /search  AML recall: author-scoped recall → decay ranking → AML format
@@ -32,7 +32,24 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 
-from mcp.server.fastmcp import FastMCP  # noqa: E402
+try:
+    from mcp.server.mcpserver import MCPServer  # noqa: E402  # mcp 2.x 官方高级 API (替代第三方 fastmcp)
+except ImportError as _e:
+    # 依赖前置检查: 把 mcp 大版本变更变成可读中文提示, 不裸抛 traceback (任务 E)
+    import importlib.metadata as _imd
+    import sys as _sys
+    try:
+        _mcp_ver = _imd.version("mcp")
+    except Exception:
+        _mcp_ver = "未知"
+    _sys.stderr.write(
+        f"[memorycore] 启动失败: 当前 mcp 版本 {_mcp_ver} 不含 MCPServer (属 mcp 大版本变更)。\n"
+        "[memorycore] 建议: 用独立 venv 安装 memorycore; 或 pip install \"mcp>=2,<3\"; "
+        "不要与其它工具 (如 Hermes) 共用同一个环境。\n"
+        f"[memorycore] 原始错误: {_e}\n"
+    )
+    _sys.exit(1)
+
 from starlette.requests import Request  # noqa: E402
 from starlette.responses import JSONResponse  # noqa: E402
 
@@ -52,7 +69,7 @@ _MAX_TOP_K = 100           # AML 协议固定 top_k 上限
 
 AML_API_KEY = os.environ.get("AML_API_KEY", "").strip()
 
-mcp = FastMCP("memorycore-aml")
+mcp = MCPServer("memorycore-aml")
 
 # Lazy singleton: LocalBackend init probes the embedding API and can be
 # slow/failing at import time — /health must answer even when the embedding

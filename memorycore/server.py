@@ -1,34 +1,53 @@
 #!/usr/bin/env python3
-"""MemoryCore MCP server — memory tiering for LLM agents
+"""MemoryCore MCP server — 完整溢流层记忆系统
 
-Provides: cold/hot routing (store_fact) / capacity control / six-step
-overflow (trigger_overflow) / cold-tier maintenance
-(run_cold_storage_maintenance) / health status (get_memory_usage).
+承载: 冷热分流 (store_fact) / 容量管控 / 六步溢流 (trigger_overflow) /
+冷层治理 (run_cold_storage_maintenance) / 健康状态 (get_memory_usage)。
 
-Internals: reads local MEMORY.md/USER.md (local_store), talks to a remote
-MCP memory service via ColdStoreClient (cold tier).
+内部: 读本地 MEMORY.md/USER.md (local_store), 经 ColdStoreClient 双后端
+访问冷层 (默认进程内 mnemosyne-memory, 可切 MCP 远程后端)。
 """
 import json
 from datetime import datetime, timezone
 
-from mcp.server.fastmcp import FastMCP  # noqa: E402
+try:
+    from mcp.server.mcpserver import MCPServer  # noqa: E402  # mcp 2.x 官方高级 API (替代第三方 fastmcp)
+except ImportError as _e:
+    # 依赖前置检查: 把 mcp 大版本变更变成可读中文提示, 不裸抛 traceback (任务 E)
+    import importlib.metadata as _imd
+    import sys as _sys
+    try:
+        _mcp_ver = _imd.version("mcp")
+    except Exception:
+        _mcp_ver = "未知"
+    _sys.stderr.write(
+        f"[memorycore] 启动失败: 当前 mcp 版本 {_mcp_ver} 不含 MCPServer (属 mcp 大版本变更)。\n"
+        "[memorycore] 建议: 用独立 venv 安装 memorycore; 或 pip install \"mcp>=2,<3\"; "
+        "不要与其它工具 (如 Hermes) 共用同一个环境。\n"
+        f"[memorycore] 原始错误: {_e}\n"
+    )
+    _sys.exit(1)
+
 
 from .local_store import LocalStore  # noqa: E402
 from .cold_store_client import ColdStoreClient  # noqa: E402
 from .core.config import (SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOFT_LIMIT, COLD_HARD_LIMIT,  # noqa: E402
-                         STATE_TTL_DAYS, RULE_COMPRESS_DAYS)
+                         STATE_TTL_DAYS, RULE_COMPRESS_DAYS,
+                         RULE_MIN_RESIDENCY_DAYS, RULE_BUDGET_CHARS,
+                         AUDIT_SINK_WEIGHT_THRESHOLD, AUDIT_SINK_INACTIVE_DAYS,
+                         MAX_EVICT_PER_RUN)
 from .core.classifier import (classify, classify_user_pref, should_keep_local,  # noqa: E402
                              classify_entry_type, COLD, STALE)
-from .core.metadata import MetaStore, entry_age_days, log_activity_query, _parse_iso  # noqa: E402  # Phase 3 S4
+from .core.metadata import (MetaStore, entry_age_days, log_activity_query,  # noqa: E402  # Phase 3 S4 采集
+                           _parse_iso)
 from .core.overflow import (run_overflow, _recall_safe, _find_best_match,  # noqa: E402
                            _merge_two_entries, _is_protected_rule,
                            enforce_rule_budget, apply_activity_hits,
                            restore_stubs_from_results, _rule_weight_eff)
-from .core.config import RULE_MIN_RESIDENCY_DAYS, RULE_BUDGET_CHARS, AUDIT_SINK_WEIGHT_THRESHOLD, AUDIT_SINK_INACTIVE_DAYS, MAX_EVICT_PER_RUN  # noqa: E402
 from .core.maintenance import run_maintenance  # noqa: E402
-from .core.decay import _apply_decay  # noqa: E402  # shared by recall + prefetch
+from .core.decay import _apply_decay  # noqa: E402  # 小项1: 提取到独立模块
 
-mcp = FastMCP("memorycore")
+mcp = MCPServer("memorycore")
 
 _store = LocalStore()
 _client = ColdStoreClient()
@@ -42,7 +61,7 @@ def _targets(target: str):
 
 
 def _metastore_for(target: str) -> MetaStore:
-    """Build a sidecar MetaStore following _store paths (tests can inject)."""
+    """按 target 构造 sidecar 元数据存储 (跟随 _store 的路径, 测试可注入)。"""
     return MetaStore(target, memory_path=_store.memory_path,
                      user_path=_store.user_path)
 
@@ -62,22 +81,24 @@ def _force_overflow_to_target(t: str) -> None:
             return
 
 
-def _check_cold_capacity() -> None:
-    """Cold-tier capacity hard gate: check total entries before writing (Task C).
+# ---------------------------------------------------------------------------
 
-    - > HARD_LIMIT: force maintenance in a loop until under SOFT_LIMIT (max 5)
-    - > SOFT_LIMIT: run one maintenance pass before continuing
-    - cold tier unreachable: skip (never block the write)
+def _check_cold_capacity() -> None:
+    """冷层容量硬闸: 写入前检查冷层条数, 超阈值触发治理 (Task C)。
+
+    - > HARD_LIMIT: 强制循环 maintenance 至回落 (上限 5 轮)
+    - > SOFT_LIMIT: 先跑一轮 maintenance 再继续
+    - 冷层不可达: 跳过 (不阻塞写入)
     """
     try:
         stats = _client.stats()
     except Exception:
-        return  # cold tier unreachable → degrade, skip
+        return  # 冷层不可达 → 降级跳过
 
     cold_total = stats.get("total", 0)
 
     if cold_total > COLD_HARD_LIMIT:
-        # force maintenance to shrink, max 5 rounds
+        # 强制清理至回落, 上限 5 轮
         for _ in range(5):
             run_maintenance(_client)
             try:
@@ -88,11 +109,9 @@ def _check_cold_capacity() -> None:
             if cold_total <= COLD_SOFT_LIMIT:
                 break
     elif cold_total > COLD_SOFT_LIMIT:
-        # one maintenance pass before continuing
+        # 跑一轮 maintenance 再继续
         run_maintenance(_client)
 
-
-# ---------------------------------------------------------------------------
 # 工具 1: store_fact — 写入统一入口
 # ---------------------------------------------------------------------------
 
@@ -109,44 +128,44 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
         JSON: {"status": "stored"|"cold_stored"|"stale"|"error", "detail": "..."}
     """
     try:
-        # A write routing: target="user" uses classify_user_pref (USER.md governance)
+        # ---- A 写入分流: target="user" 用 classify_user_pref ----
         is_user = (target == "user")
         if is_user:
             d = classify_user_pref(content, importance=importance,
                                    sentence_level=False)
-            stale_reason = None  # classify_user_pref returns no reason dict
+            stale_reason = None  # classify_user_pref 不返回 reason dict
         else:
             decision = classify(content, importance=importance)
             d = decision["decision"]
             stale_reason = decision.get("reason", "")
 
+        # Task C: 容量硬闸 — 写入前检查冷层条数
+        _check_cold_capacity()
+
+        # STALE 处理
         if d == STALE or d == "stale":
             if is_user:
                 return json.dumps({"status": "stale",
-                                   "detail": "stale status record (USER.md), not written"},
+                                   "detail": "过时状态记录 (USER.md), 不写入"},
                                   ensure_ascii=False)
             return json.dumps({"status": "stale", "detail": stale_reason,
                                "note": "过时状态记录, 不迁移不写入"}, ensure_ascii=False)
 
+        # COLD / sink 处理
         go_cold = (is_user and d == "sink") or (not is_user and d == COLD)
         if not go_cold and classify_entry_type(content) == "state":
-            # Phase 2 (2026-08-16): write-entry linkage — content judged
-            # hot/core but typed as a historical decision/status record
-            # (date + completion marker, no behavior instructions) is forced
-            # to the cold path so pollution never enters the hot tier.
-            # This overrides the default importance=0.8 hot shortcut without
-            # touching classify itself.
+            # Phase 2 (2026-08-16): 写入口联动 — 判 hot/core 但属历史决策/
+            # 状态记录 (日期+完成态词, 无行为指令词) → 强制走冷层路径,
+            # 污染从源头不进热层。默认 importance=0.8 会把几乎所有内容判热,
+            # 此判定在其后覆盖, 不修改 classify 本身 (兼容)。
             go_cold = True
         if go_cold:
-            # Task C: capacity hard gate — check cold-tier size before writing
-            _check_cold_capacity()
-
-            # Task A: cold data → dedup-check first, avoid cross-layer duplicates
+            # Task A: 冷数据 → 先查重再写, 防止重复双写
             try:
                 existing = _recall_safe(_client, content)
             except Exception as e:
                 return json.dumps({"status": "error",
-                                   "detail": f"cold tier unreachable, write failed: {e}"},
+                                   "detail": f"冷层不可达, 写入失败: {e}"},
                                   ensure_ascii=False)
 
             if existing:
@@ -154,7 +173,7 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
                 if matched:
                     if matched["level"] == "same":
                         return json.dumps({"status": "cold_duplicate",
-                                           "detail": "cold tier already has this fact, skip"},
+                                           "detail": "冷层已有相同事实, 跳过写入"},
                                           ensure_ascii=False)
                     elif matched["level"] == "similar":
                         merged = _merge_two_entries(content, matched["content"])
@@ -163,23 +182,24 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
                             if r.get("status") == "updated":
                                 return json.dumps({"status": "cold_updated",
                                                    "memory_id": matched["id"],
-                                                   "detail": "merged into existing cold entry"},
+                                                   "detail": "已合并到冷层已有记录"},
                                                   ensure_ascii=False)
                             return json.dumps({"status": "error",
-                                               "detail": f"update merge failed: {r}"},
+                                               "detail": f"更新合并失败: {r}"},
                                               ensure_ascii=False)
                         except Exception as e:
                             return json.dumps({"status": "error",
-                                               "detail": f"update merge exception: {e}"},
+                                               "detail": f"更新合并异常: {e}"},
                                               ensure_ascii=False)
 
-            # no match → remember (original logic)
+            # 无匹配 → remember (原逻辑)
             r = _client.remember(content, importance=importance, scope=scope)
             if r.get("status") == "stored":
-                cold_detail = "USER.md long-tail fact stored to cold tier" if is_user else "低频事实已下沉冷层"
-                return json.dumps({"status": "cold_stored", "memory_id": r.get("memory_id"),
+                cold_detail = "USER.md 长尾事实已进冷层" if is_user else "低频事实已下沉冷层"
+                return json.dumps({"status": "cold_stored",
+                                   "memory_id": r.get("memory_id"),
                                    "detail": cold_detail}, ensure_ascii=False)
-            return json.dumps({"status": "error", "detail": f"cold tier write failed: {r}"},
+            return json.dumps({"status": "error", "detail": f"冷层写入失败: {r}"},
                               ensure_ascii=False)
 
         # HOT: 先查容量再写本地
@@ -193,21 +213,19 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
             run_overflow(_store, _client, t)
         r = _store.add(t, content)
         if r.get("success"):
-            # Phase 2: stamp sidecar metadata after a successful hot write
-            # Phase 3 S6: importance passes through (protection line;
-            # missing field defaults to 0.8, backward compatible)
+            # Phase 2: 热层写入成功后盖元数据 (rule 型, written_at=now)
+            # Phase 3 S6: importance 透传 (保护线, 缺失默认 0.8 向后兼容)
             try:
                 _metastore_for(t).stamp(content, "rule",
                                         importance=importance,
                                         origin="store_fact")
             except Exception:
-                pass  # metadata failure never blocks the write (reconcile re-stamps)
-            # Phase 4: post-write rule budget check (LRU eviction; new rules
-            # have 7-day residency so they are never evicted immediately)
+                pass  # 元数据失败不影响写入, 下次 reconcile 兜底
+            # Phase 4: 写后规则预算检查 (LRU 挤权; 新规则有 7 天驻留不会被立刻挤)
             try:
                 enforce_rule_budget(_store, _client, t, _metastore_for(t), {})
             except Exception:
-                pass  # budget enforcement failure never blocks the write
+                pass  # 预算挤权失败不阻塞写入 (下轮溢流兜底)
             return json.dumps({"status": "stored", "target": t,
                                "usage_after": f"{_store.usage_pct(t)}%",
                                "detail": "热数据已写本地"}, ensure_ascii=False)
@@ -287,17 +305,11 @@ def memorycore_get_memory_usage() -> str:
     }, ensure_ascii=False)
 
 
-# ---------------------------------------------------------------------------
-# Tool 5: memorycore_memory_audit — hot-tier health check (read-only)
-# ---------------------------------------------------------------------------
-
 @mcp.tool()
 def memorycore_memory_audit(target: str = "both") -> str:
-    """Hot-tier health check (read-only, never modifies): list every entry
-    with its keep/sink classification, char count, and Phase 2 metadata
-    (type / written_at / age_days / retirement plan). Used to diagnose
-    overflow no-ops — when the hot tier is full of historical records,
-    sink_candidates > 0 means overflow has something to sink."""
+    """热层体检 (只读, 不修改): 列出热层每条的分类 (keep=留热层 / sink=可下沉)、
+    字数与占用统计。用于排查溢流空转 — 热层被历史决策/状态记录占满时 sink_candidates>0,
+    溢流才有东西可沉; 全 keep 说明内容本身都是准则 (溢流降不动属正常)。"""
     result = {}
     for t in _targets(target):
         usage = _store.usage_pct(t)
@@ -306,12 +318,12 @@ def memorycore_memory_audit(target: str = "both") -> str:
         rows = []
         sink_total = 0
         sink_chars = 0
-        lru_sink = 0  # 2026-08-28: activity-dimension sink candidates (new field, keeps legacy counters intact)
+        lru_sink = 0  # 缺口2: 活性维度可沉候选计数 (新字段, 不改现有计数口径)
         for e in entries:
-            keep = should_keep_local(e)  # keyword view (legacy fallback)
+            keep = should_keep_local(e)  # 关键词视图 (legacy 回退用)
             m = meta.get_entry(e)
             row = {"keep": keep, "chars": len(e), "text": e[:40]}
-            # Phase 2: metadata columns (type / written_at / age / plan)
+            # Phase 2: 元数据列 (type/written_at/age/退役计划), 只读体检
             if m:
                 row["type"] = m.get("type")
                 row["written_at"] = m.get("written_at")
@@ -323,16 +335,14 @@ def memorycore_memory_audit(target: str = "both") -> str:
                         keep = False
                     else:
                         row["plan"] = f"sink_in_{STATE_TTL_DAYS - (age or 0)}d"
-                        keep = True  # not expired: still kept for now
+                        keep = True  # 未到期, 当前仍留
                 elif m.get("type") == "stub":
-                    # Phase 3 S4: pointer stays; oldest-first GC under hard
-                    # pressure (full text lives in the cold tier)
+                    # Phase 3 S4: 指针驻留, 高压时最老优先 GC (全文在冷层)
                     row["plan"] = "stub_pointer (gc_oldest_on_hard_pressure)"
                     keep = True
                 else:
-                    # rule type: keep aligned with actual overflow behaviour
-                    # (S0 immediate exit, 2026-08-26) — keyword view sinkable
-                    # + unprotected → overflow will actually sink it
+                    # rule 型: keep 与溢流行为对齐 (S0 即时出口, 2026-08-26 修复) —
+                    # 关键词视图判可沉 + 非保护 → 溢流会实际下沉, 审计如实标 sink
                     protected = _is_protected_rule(e, m)
                     kw_sink = not should_keep_local(e)
                     if kw_sink and not protected:
@@ -343,7 +353,7 @@ def memorycore_memory_audit(target: str = "both") -> str:
                         keep = True
                     row["protected"] = protected
                     row["kw_sink"] = kw_sink
-                    # Phase 4 LRU observability (M2)
+                    # Phase 4 LRU 观测字段 (M2, 2026-08-26 Pi 检查建议)
                     row["weight"] = m.get("weight")
                     row["w_eff"] = round(_rule_weight_eff(m), 4)
                     row["last_active_at"] = m.get("last_active_at")
@@ -352,10 +362,10 @@ def memorycore_memory_audit(target: str = "both") -> str:
                     row["next_gate"] = {
                         "compress_in_d": max(0, RULE_COMPRESS_DAYS - (age or 0)),
                     }
-                    # 2026-08-28 activity dimension: low weight + long-inactive +
-                    # unprotected → sink_candidate. Same data source as the
-                    # weight/w_eff/last_active_at columns; visibility only,
-                    # does NOT change overflow execution.
+                    # 缺口2 (2026-08-28): 活性维度可沉判定 — weight 低 +
+                    # last_active_at 久远 + 非保护 → sink_candidate。
+                    # 复用与 weight/w_eff/last_active_at 列同一数据源
+                    # (m.get 原始 meta), 不另算一套; 仅可见性, 不改溢流逻辑。
                     w_raw = m.get("weight")
                     laa_dt = (_parse_iso(str(m.get("last_active_at")))
                               if m.get("last_active_at") else None)
@@ -369,7 +379,8 @@ def memorycore_memory_audit(target: str = "both") -> str:
                         row["sink_candidate"] = True
                         row["sink_reason"] = "low_weight+inactive"
                         lru_sink += 1
-                # keep and plan stay consistent for typed entries (final review)
+                # 附注1 修复 (终审): typed 条目 keep 与 plan 同源 —
+                # 消除 "keep=true + plan=sink_now" 矛盾视图
                 row["keep"] = keep
             else:
                 row["type"] = "legacy"
@@ -386,7 +397,7 @@ def memorycore_memory_audit(target: str = "both") -> str:
             "sink_chars": sink_chars,
             "rows": rows,
         }
-        # Phase 4 LRU summary: rule ecology chars vs budget
+        # Phase 4 LRU 汇总观测 (M2): 规则生态字符 vs 预算
         rule_chars = 0
         for e in entries:
             m = meta.get_entry(e)
@@ -395,29 +406,25 @@ def memorycore_memory_audit(target: str = "both") -> str:
         result[t]["rule_chars"] = rule_chars
         result[t]["rule_budget"] = RULE_BUDGET_CHARS
         result[t]["rule_chars_vs_budget"] = rule_chars - RULE_BUDGET_CHARS
-        result[t]["lru_sink_candidates"] = lru_sink  # 2026-08-28: activity-dimension sink candidates
+        result[t]["lru_sink_candidates"] = lru_sink  # 缺口2: 活性可沉候选数
     return json.dumps(result, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
-# Tool 5b: memorycore_get_rule_weight — rule weight distribution (read-only LRU monitor)
+# 工具 4.5: get_rule_weight — 规则权重分布 (只读, LRU 监控)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 def memorycore_get_rule_weight(target: str = "memory") -> str:
-    """View hot-tier rule weight distribution (read-only, never modifies) —
-    LRU retirement monitor.
+    """查看热层 rule 型条目权重分布 (只读, 不修改) — LRU 退役机制监控。
 
-    w_eff = weight × 0.5^(days since last_active_at / 30) (lazy discount,
-    same formula as retirement ordering); rules sorted by w_eff ascending =
-    eviction order when the budget is exceeded.
-    next_eviction_candidates = up to MAX_EVICT_PER_RUN rules that would be
-    evicted first if the budget were exceeded right now (observation only —
-    actual eviction is also gated by residency/lexical-activity protection,
-    see enforce_rule_budget).
+    w_eff = weight × 0.5^(距 last_active_at 天数 / 30) (惰性折现, 与退役排序
+    同一口径); 列表按 w_eff 升序 = 超预算时最先被挤的退役顺序。
+    next_eviction_candidates = 若此刻超预算, 最先退役的至多 MAX_EVICT_PER_RUN 条
+    (仅供观测 — 实际挤权还受驻留期/词法活跃保护过滤, 以 enforce_rule_budget 为准)。
 
     Args:
-        target: 'memory' | 'user' | 'both' (default memory)
+        target: 'memory' | 'user' | 'both' (默认 memory)
     Returns:
         JSON: {summary: {rule_count, rule_chars, rule_budget, over_budget,
                w_eff_min/avg/max, next_eviction_candidates}, rules: [...]}
@@ -463,36 +470,38 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 6: memorycore_recall — active cold-tier recall (read-only)
+# 工具 5: memorycore_recall — 主动召回冷层 (只读, 冷层降权重排)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 def memorycore_recall(query: str, top_k: int = 3) -> str:
-    """Actively recall cold-tier memories (read-only; complements the
-    per-turn top-3 prefetch with on-demand manual queries).
+    """主动召回冷层记忆 (只读, 补足 prefetch 每轮 top-3 之外的手动查询能力)。
+
+    结果经冷层降权重排: final_score = base_score × 0.5^(days/90),
+    importance≥0.8 不降权。
 
     Args:
-        query: natural-language semantic query
-        top_k: number of results (default 3, max 10)
+        query: 查询内容 (自然语言, 语义召回)
+        top_k: 返回条数 (默认 3, 最大 10)
     Returns:
-        JSON: {"results": [{"id": ..., "content": ..., "score": ...}]}
-              or {"error": "..."} when the cold tier is unreachable.
+        JSON: {"results": [{"id": ..., "content": ..., "final_score": ...}]}
+              冷层不可达时 {"error": "..."}
     """
     try:
         k = max(1, min(int(top_k), 10))
-        log_activity_query(query)  # Phase 3 S4: topic-activity collection
+        log_activity_query(query)  # Phase 3 S4: 主题活性采集 (失败静默, 可配置关)
         results = _client.recall_results(query, top_k=k)
         results = _apply_decay(results)
-        # Phase 4: recall hit on a stub cold_id -> restore full text to hot tier
+        # Phase 4: 召回结果命中 stub 的 cold_id → 自动恢复全文到热层
         try:
             results = restore_stubs_from_results(
                 _store, {t: _metastore_for(t) for t in ("memory", "user")}, results)
         except Exception:
-            pass  # restore failure never blocks the recall response
+            pass  # 恢复失败不影响召回返回
         return json.dumps({"results": results}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio", show_banner=False)  # FastMCP 3.x banner pollutes stdio stdout
+    mcp.run(transport="stdio")

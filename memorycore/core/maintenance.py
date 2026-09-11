@@ -20,6 +20,7 @@ log = logging.getLogger("memorycore.maintenance")
 from .classifier import STALE, classify
 from .overflow import _norm_sentence, _bigram_coverage
 from . import llm_config  # noqa: E402  LLM single source of truth
+from . import llm_rot  # noqa: E402  LLM candidate rotation (final-audit low-risk D2 tail-starvation fix)
 
 # ---- 阈值 ----------------------------------------------------------------
 
@@ -174,7 +175,7 @@ def run_maintenance(client) -> dict:
     }
 
     # ---- Step 0: 回收站巡检 (召回恢复 + 到期清空) ----------------------
-    trash_revived, trash_cleared = _trash_cycle(client)
+    trash_revived, trash_cleared = _trash_cycle(client, stat)
     stat["trash_revived"] = trash_revived
     stat["trash_cleared"] = trash_cleared
 
@@ -234,7 +235,7 @@ def _run_maintenance(client, stat: Dict[str, Any]) -> dict:
     stat["pending_stale"] = trash.count()  # 更新回收站计数
 
     # ---- Step 4: 冲突事实取舍 --------------------------------------------
-    stat["conflicts_resolved"], conf_rev, step4_forgotten = _resolve_conflicts(client, all_entries, fuzzy_reversal_candidates)
+    stat["conflicts_resolved"], conf_rev, step4_forgotten = _resolve_conflicts(client, all_entries, fuzzy_reversal_candidates, stat)
     stat["reversals_resolved"] += conf_rev
 
     # ---- Step 4b: LLM 语义反转兜底 (模糊候选) ------------------------
@@ -248,7 +249,11 @@ def _run_maintenance(client, stat: Dict[str, Any]) -> dict:
         if key not in seen_pairs:
             seen_pairs.add(key)
             deduped_candidates.append(pair)
-    fuzzy_reversal_candidates = deduped_candidates
+    # L2 low-risk closure (2026-09-12): rotation cursor — each round starts
+    # from a different head; tail pairs no longer starve permanently when
+    # head candidates keep failing to resolve (measured pre-fix).
+    fuzzy_reversal_candidates = llm_rot.rotate(
+        "cold:reversal", deduped_candidates)
 
     # Fix1: 汇总已处理 id (Step 2/2b/3/4 的 forget/merge victim),
     # Step 4b 跳过幽灵对, Step 4c decay 不再重复评估
@@ -355,7 +360,7 @@ def _run_maintenance(client, stat: Dict[str, Any]) -> dict:
 
 # ---- Step 0: 回收站巡检 ----------------------------------------------------
 
-def _trash_cycle(client) -> Tuple[int, int]:
+def _trash_cycle(client, stat: dict) -> Tuple[int, int]:
     """回收站巡检: 召回恢复 + 到期清空。
 
     恢复机制 (P1-7 明确):
@@ -365,6 +370,20 @@ def _trash_cycle(client) -> Tuple[int, int]:
       冷层已删除, recall 不可能命中; 30 天到期 → trash-empty 直接清空。
       设计意图: 已 forget 条目恢复需重新 remember (含重新 embedding),
       复杂度高于收益; 30 天窗口已足够长, 真重要的会被重新写入。
+
+    L1 low-risk closure (2026-09-12): trash.remove write failures no longer
+    propagate (fail-loud aborts the whole maintenance round, worse than a
+    counter) → counted into stat["trash_fail"] + warning. Consistency
+    semantics (remove mutates in-memory list first, then _save atomic write):
+    - _save raising = on-disk file untouched = bin record still present →
+      retried next round;
+    - revive path: cold entry was never forgotten, record kept → next round
+      recall re-checks; no "record gone but memory kept" window;
+    - expiry path: forget ran first (idempotent), remove failure → record
+      kept → next round retries forget+remove; no "memory gone but record
+      lost" window;
+    - remove returning False (entry absent, concurrently removed) → counter
+      + warning (L3: return value no longer ignored), equally consistent.
 
     返回 (revived, cleared)。
     """
@@ -384,8 +403,19 @@ def _trash_cycle(client) -> Tuple[int, int]:
             results = client.recall_results(content[:200], top_k=_VEC_NEIGHBOR_K, bump=False)  # 只读召回, 不污染 last_recalled
             for r in results:
                 if r.get("id") == mid:
-                    trash.remove(mid)
-                    revived += 1
+                    try:
+                        if not trash.remove(mid):
+                            stat["trash_fail"] = stat.get("trash_fail", 0) + 1
+                            log.warning("TRASH: revive remove failed (entry absent: %s) → counted",
+                                        mid)
+                        else:
+                            revived += 1
+                    except Exception as e:
+                        # L1: visible instead of fail-loud — record kept (atomic
+                        # write failure = file untouched), retried next round.
+                        stat["trash_fail"] = stat.get("trash_fail", 0) + 1
+                        log.warning("TRASH: revive remove write failure (%s: %s) → record kept, retry next round",
+                                    mid, e)
                     break
         except Exception:
             continue
@@ -401,8 +431,20 @@ def _trash_cycle(client) -> Tuple[int, int]:
             # E3 可见化: 到期清空 forget 失败不再静默 (可能已被遗忘, 不影响清理)
             log.warning("TRASH: expiry purge forget failed (%s: %s) → still removed from bin",
                         mid, e)
-        trash.remove(mid)
-        cleared += 1
+        try:
+            if not trash.remove(mid):
+                stat["trash_fail"] = stat.get("trash_fail", 0) + 1
+                log.warning("TRASH: expiry purge remove failed (entry absent: %s) → counted",
+                            mid)
+            else:
+                cleared += 1
+        except Exception as e:
+            # L1: visible instead of fail-loud — forget already ran (idempotent),
+            # record kept (atomic write failure = file untouched) → retried next
+            # round; no inconsistency window.
+            stat["trash_fail"] = stat.get("trash_fail", 0) + 1
+            log.warning("TRASH: expiry purge remove write failure (%s: %s) → record kept, retry next round",
+                        mid, e)
 
     return revived, cleared
 
@@ -673,6 +715,11 @@ def _llm_dedup_confirm(client, fuzzy_groups: List[List[Dict]],
     """
     from .llm_judge import judge_dedup
     from ..trash_store import TrashStore, add_observed
+
+    # L2 low-risk closure (2026-09-12): rotation cursor — head groups stuck
+    # on "not_duplicate" every round no longer starve tail groups forever
+    # (measured pre-fix starvation).
+    fuzzy_groups = llm_rot.rotate("cold:dedup", fuzzy_groups)
 
     merged = 0
     forgotten: Set[str] = set()

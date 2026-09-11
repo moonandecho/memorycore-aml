@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .classifier import classify, classify_user_pref, should_keep_local, HOT, COLD, STALE
 from . import llm_config  # noqa: E402  LLM single source of truth (lazy+observable+guards)
+from . import llm_rot  # noqa: E402  LLM candidate rotation (final-audit low-risk D2 tail-starvation fix)
 from .config import (
     STATE_TTL_DAYS, RULE_COMPRESS_DAYS,
     SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO,
@@ -603,6 +604,14 @@ def _run_overflow(store, client, target: str, stat: Dict[str, Any]) -> dict:
             stub_candidates = set()  # 规划失败 → 保守不 stub (机制降级)
 
     # ---- Step 2+3+5: 逐条处理 --------------------------------------------
+    # L2 low-risk closure (2026-09-12): rotation cursor — per-round LLM cap
+    # truncation leaves no persistent marker; when head candidates stay
+    # "success-but-unresolvable" (compress validation fails), the next round
+    # rebuilt from stable file order would re-consume the budget from the
+    # same head and starve the tail permanently (measured pre-fix). Rotation
+    # guarantees every candidate is attempted at least once per ceil(N/C)
+    # rounds.
+    entries = llm_rot.rotate(f"overflow:{target}", entries)
     for entry in entries:
         # Phase 2 (2026-08-16): 元数据优先 — 有元数据按"年龄+类型"退役,
         # 关键词表不参与 (根治词表两周一复发); 无元数据回退 legacy 关键词路径。

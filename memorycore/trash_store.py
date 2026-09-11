@@ -59,9 +59,12 @@ def add_observed(trash: "TrashStore", memory_id: str, content: str,
 class TrashStore:
     """Recycle bin (single JSON file, atomic writes)."""
 
-    def __init__(self, path: Path = TRASH_PATH, ttl_days: int = TRASH_TTL_DAYS):
-        self.path = path
-        self.ttl_days = ttl_days
+    def __init__(self, path: Path = None, ttl_days: int = None):
+        # 与本地版对齐 (2026-09-12): 默认参数在 import 时绑定会冻结 TRASH_PATH /
+        # TRASH_TTL_DAYS, 测试隔离 (monkeypatch 模块常量) 失效且误写生产文件;
+        # None 后置解析在调用时读模块常量, 行为不变。
+        self.path = path if path is not None else TRASH_PATH
+        self.ttl_days = ttl_days if ttl_days is not None else TRASH_TTL_DAYS
 
     # -- read ----------------------------------------------------
 

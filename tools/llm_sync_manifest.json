@@ -14,12 +14,16 @@
       "found_at": "tests/test_llm_config.py"
     },
     "test_e_visible.py": {
-      "sha256": "040e0ebf261c115f309711a19d7f6b20c1e35e2a6c92bc19ebbbbe37413a7478",
+      "sha256": "cee91c3e25e7ece611723eadeb78c70c5466342e77628266445db47c11c6e8e8",
       "found_at": "tests/test_e_visible.py"
     },
     "test_weekly_tidy.py": {
       "sha256": "a360b1ec8d2bf0511301ed34a88f7bdd2f98d3f6a2a3f16c094ebddd123796ec",
       "found_at": "tests/test_weekly_tidy.py"
+    },
+    "llm_rot.py": {
+      "sha256": "e48a47b02fa0c3965760c87238fe6f4f551f4375f764b01195b20ba8c3716171",
+      "found_at": "core/llm_rot.py"
     }
   },
   "unprotected": [

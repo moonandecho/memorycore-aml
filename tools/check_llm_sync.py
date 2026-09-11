@@ -9,9 +9,10 @@
 归一化规则 (仅替换"布局/发行"差异, 不替换实现):
   - llm_config.py: FILE_SOURCES_DEFAULT 行 (True/False = 本地/发布)
   - llm_check.py:  llm_config import 行 + 用法/示例命令行 (布局差异)
+  - llm_rot.py:    轮转状态路径行 (~/.hermes/memorycore 本地 / ~/.memorycore 发布)
   - 测试文件:      import 行 (core / memorycore.core 布局差异)
 
-受检范围边界 (终审低危, 2026-09-12): 仅上述 5 个文件做同源哈希校验。
+受检范围边界 (终审低危, 2026-09-12): 仅上述 6 个文件做同源哈希校验。
 消费者文件 (overflow/maintenance/weekly/server 等) 是"仓库特有"的 — 布局
 (core/ vs memorycore.core/)、发行差异 (本地中文注释/发布英文注释、本地邮件
 通知节)、后端差异 (MnemosyneClient vs ColdStoreClient) 各有不同, 不做同源
@@ -90,12 +91,20 @@ FILES = {
     "test_e_visible.py": {
         "paths": ["tests/test_e_visible.py"],
         "rules": [
-            (re.compile(r"^from (core|memorycore\.core) import (config as config_mod|overflow as ov_mod|metadata as meta_mod).*$", re.M),
+            (re.compile(r"^(?:    )?from (core|memorycore\.core) import (config as config_mod|overflow as ov_mod|metadata as meta_mod).*$", re.M),
              "from <core|memorycore.core> import <...>"),
             (re.compile(r"^    from (core|memorycore\.core) import maintenance as maint$", re.M),
              "    from <core|memorycore.core> import maintenance as maint"),
+            (re.compile(r"^    from (core|memorycore\.core) import llm_rot$", re.M),
+             "    from <core|memorycore.core> import llm_rot"),
+            (re.compile(r"^    from (core|memorycore\.core) import llm_config$", re.M),
+             "    from <core|memorycore.core> import llm_config"),
             (re.compile(r"^    from (trash_store|memorycore\.trash_store) import TrashStore, add_observed$", re.M),
              "    from <trash_store|memorycore.trash_store> import TrashStore, add_observed"),
+            (re.compile(r"^    from (trash_store|memorycore\.trash_store) import TrashStore$", re.M),
+             "    from <trash_store|memorycore.trash_store> import TrashStore"),
+            (re.compile(r"^    import (trash_store|memorycore\.trash_store) as ts_mod$", re.M),
+             "    import <trash_store|memorycore.trash_store> as ts_mod"),
         ],
     },
     "test_weekly_tidy.py": {
@@ -107,6 +116,13 @@ FILES = {
              "from <core|memorycore.core> import metadata as meta_mod"),
             (re.compile(r"^(import weekly_maintenance as wm|from memorycore import weekly_maintenance as wm)$", re.M),
              "import <weekly_maintenance as wm>"),
+        ],
+    },
+    "llm_rot.py": {
+        "paths": ["core/llm_rot.py", "memorycore/core/llm_rot.py"],
+        "rules": [
+            (re.compile(r'^        os\.path\.expanduser\("~/(\.hermes/memorycore|\.memorycore)/llm_rot\.json"\),$', re.M),
+             'os.path.expanduser(<仓库特有 llm_rot 状态路径>),'),
         ],
     },
 }

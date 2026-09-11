@@ -215,6 +215,58 @@ def test_ttl_cache(monkeypatch):
     assert c3.key == "sk-second"
 
 
+def test_invalidate_cache_is_production_entry(monkeypatch):
+    """TTL 有意设计 (终审低危): 进程级 30s 缓存防 .env 抖动; 生产失效入口 =
+    invalidate_cache (MCP 工具入口调用) / llm_check force。锁定入口语义:
+    失效后立即重解析, 长驻进程中配置变更至多 30s 生效。"""
+    monkeypatch.setattr(llm_config, "TTL_SECONDS", 30.0)
+    llm_config.invalidate_cache()
+    monkeypatch.setenv("LLM_API_KEY", "sk-first")
+    c1 = llm_config.resolve()
+    monkeypatch.setenv("LLM_API_KEY", "sk-second")
+    c2 = llm_config.resolve()  # TTL 未过期 → 旧值 (有意设计)
+    assert c2.key == "sk-first"
+    llm_config.invalidate_cache()  # 生产失效入口 (server.py MCP 工具入口调用)
+    c3 = llm_config.resolve()
+    assert c3.key == "sk-second"
+    assert c3.source == "env:LLM_API_KEY"
+
+
+def test_fallback_backoff_expires(monkeypatch, caplog):
+    """兜底护栏退避过期 (终审低危): 会话外直调 (max_calls=None) 失败 → 退避;
+    超过 BACKOFF_EXPIRE_SECONDS → 新轮复位, 不再进程级永续退避。会话内
+    guard (start_session 总带上限) 不受过期影响, 退避持续到 close()。"""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setenv("LLM_API_KEY", SECRET)
+    llm_config.invalidate_cache()
+    monkeypatch.setattr(llm_config, "_fallback_guard", None)
+    monkeypatch.setattr(llm_config, "BACKOFF_EXPIRE_SECONDS", 1.0)
+
+    # 会话外直调 → 兜底 guard; 失败 → 立即退避
+    assert llm_config.acquire("直调") is not None
+    llm_config.note_failure("auth_failed", "HTTP 401")
+    assert llm_config.acquire("直调2") is None
+    assert llm_config.block_kind() == "backoff"
+
+    # 会话内 guard: 即使过期也持续退避 (不触发过期复位)
+    g = llm_config.start_session(stat={}, max_calls=8)
+    assert llm_config.acquire("会话") is not None
+    llm_config.note_failure("auth_failed", "HTTP 401")
+    assert llm_config.acquire("会话2") is None
+    assert llm_config.block_kind() == "backoff"
+    snap = g.close()
+    assert snap["backoff"] is True
+
+    # 兜底 guard 退避过期 → 新轮复位, 恢复尝试
+    time.sleep(1.1)
+    assert llm_config.acquire("新轮") is not None
+    assert llm_config.block_kind() == ""
+    assert "新轮复位" in caplog.text
+    llm_config._fallback_guard = None  # 清理全局状态, 防污染后续测试
+
+
 # ---- ④ 防泄漏硬断言 (必改项 4) ----------------------------------------------
 
 def test_no_key_leak_in_outputs(monkeypatch, capsys, caplog):

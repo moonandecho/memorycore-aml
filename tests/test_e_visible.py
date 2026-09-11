@@ -46,7 +46,9 @@ def test_e3_trash_add_failure_blocks_forget():
     assert stat["trash_fail"] == 1
 
 
-def test_e3_add_observed_helper():
+def test_e3_add_observed_helper(tmp_path):
+    from pathlib import Path
+
     from memorycore.trash_store import TrashStore, add_observed
 
     class FailingTrash(TrashStore):
@@ -57,9 +59,14 @@ def test_e3_add_observed_helper():
     assert add_observed(FailingTrash(), "m1", "content", "r", "s", stat) is False
     assert stat["trash_fail"] == 1
 
+    # 真实写失败场景 (终审低危修复): 原断言传 str 路径, 靠 str 无 with_suffix
+    # 的 AttributeError 巧合通过 — 触发方式非预期且语义失真 (并在 /tmp 留垃圾)。
+    # 现改为: 父路径是普通文件 → lock 文件 mkdir 抛 FileExistsError (真 OSError),
+    # 触发"回收站磁盘写失败"预期语义; tmp_path 自动清理。
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir")
     ok_stat = {}
-    assert add_observed(TrashStore(path="/tmp/pi-test-trash-nonexistent-dir-xyz"
-                                    "/trash.json"),
+    assert add_observed(TrashStore(path=Path(blocker) / "trash.json"),
                         "m2", "content", "r", "s", ok_stat) is False
     assert ok_stat["trash_fail"] == 1
 

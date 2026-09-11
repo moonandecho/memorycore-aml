@@ -45,6 +45,7 @@ from .core.overflow import (run_overflow, _recall_safe, _find_best_match,  # noq
                            enforce_rule_budget, apply_activity_hits,
                            restore_stubs_from_results, _rule_weight_eff)
 from .core.maintenance import run_maintenance  # noqa: E402
+from .core import llm_config  # noqa: E402  # TTL 失效入口 (终审低危)
 from .core.decay import _apply_decay  # noqa: E402  # 小项1: 提取到独立模块
 
 mcp = MCPServer("memorycore")
@@ -253,6 +254,9 @@ def memorycore_trigger_overflow(target: str = "both") -> str:
     Returns:
         JSON: 溢流统计 {overflowed, updated, deleted, merged, usage_after}
     """
+    # TTL invalidation entry (final audit low-risk): long-lived MCP server
+    # picks up ~/.hermes/.env changes immediately at the next tool call
+    llm_config.invalidate_cache()
     try:
         results = {}
         for t in _targets(target):
@@ -269,6 +273,8 @@ def memorycore_trigger_overflow(target: str = "both") -> str:
 @mcp.tool()
 def memorycore_run_cold_storage_maintenance() -> str:
     """冷层全量治理: 合并/清理/冲突取舍/向量校验。"""
+    # TTL invalidation entry (final audit low-risk): see trigger_overflow
+    llm_config.invalidate_cache()
     try:
         result = run_maintenance(_client)
         return json.dumps(result, ensure_ascii=False)

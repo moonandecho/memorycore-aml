@@ -24,6 +24,12 @@
   - 安全阀 (评审 C2): MEMCORE_LLM_ENABLED=0 总开关; 每轮调用上限
     (MEMCORE_LLM_MAX_CALLS 默认 8; 冷层治理 MEMCORE_LLM_COLD_MAX_CALLS
     独立上限); 连续失败退避 (本轮任一调用失败后剩余候选全部跳过)。
+  - TTL 有意设计 (终审低危): 30s 进程级缓存防 .env 并发修改抖动; 生产失效
+    入口 = llm_check 的 force 重解析 + MCP 工具入口 invalidate_cache() (长驻
+    server 进程中改 .env 至多 30s 生效; weekly 为短命进程不受影响)。
+  - 兜底护栏退避过期 (终审低危): 会话外直调 (max_calls=None 的兜底 guard)
+    退避超过 BACKOFF_EXPIRE_SECONDS 后自动复位为新轮, 防进程级永续退避;
+    会话内 guard (start_session 总带上限) 退避持续到 close()。
 
 用法:
   from core import llm_config            # 本地运行版
@@ -86,6 +92,12 @@ TTL_SECONDS = float(os.environ.get("MEMCORE_LLM_CONFIG_TTL", "30") or 30)
 # 每轮调用上限缺省 (评审 C2): 溢流/周整理共用 MEMCORE_LLM_MAX_CALLS=8,
 # 冷层治理独立上限 MEMCORE_LLM_COLD_MAX_CALLS=8
 DEFAULT_MAX_CALLS = 8
+
+# 兜底护栏 (会话外直调 judge_* 等, max_calls=None) 的退避有效期 (秒):
+# 终审低危修复 — 会话外无轮边界, 失败一次后若永续退避, 进程生命周期内
+# 所有后续直调会被永久拦截。过期后视为新轮: 退避复位、计数器清零。
+BACKOFF_EXPIRE_SECONDS = float(
+    os.environ.get("MEMCORE_LLM_BACKOFF_EXPIRE", "60") or 60)
 
 
 # ---- 配置对象与解析 --------------------------------------------------------
@@ -335,7 +347,9 @@ def resolve(force: bool = False) -> LLMConfig:
 
 
 def invalidate_cache() -> None:
-    """清 TTL 缓存 (测试/显式失效用)。"""
+    """清 TTL 缓存 — 生产失效入口: MCP 工具入口 (server.py 两个治理工具)
+    每次调用前执行, 保证长驻进程中配置变更即时生效; llm_check 用
+    force=True 等效。测试也用它隔离状态。"""
     _cache["cfg"] = None
     _cache["expires"] = 0.0
 
@@ -402,7 +416,8 @@ _fallback_guard: Optional["LLMGuard"] = None
 
 
 def _fallback() -> "LLMGuard":
-    """无会话时 (如 e2e 脚本直调 judge_*) 的兜底护栏: 有退避无上限。"""
+    """无会话时 (如 e2e 脚本直调 judge_*) 的兜底护栏: 无调用上限,
+    退避按 BACKOFF_EXPIRE_SECONDS 过期后自动复位 (进程级永续退避修复)。"""
     global _fallback_guard
     if _fallback_guard is None:
         _fallback_guard = LLMGuard(stat=None, max_calls=None)
@@ -430,6 +445,7 @@ class LLMGuard:
         self.skipped_backoff = 0
         self.backoff = False
         self.last_error = ""
+        self._backoff_since = 0.0
         self.last_block = ""
         self._token = None
         self._unconfigured_logged = False
@@ -460,11 +476,22 @@ class LLMGuard:
                 self._unconfigured_logged = True
             return None
         if self.backoff:
-            self.last_block = "backoff"
-            self.skipped_backoff += 1
-            log.warning("LLM: 本轮已失败退避（last: %s）→ %s已跳过",
-                        self.last_error, consumer)
-            return None
+            if (self.max_calls is None
+                    and time.time() - self._backoff_since >= BACKOFF_EXPIRE_SECONDS):
+                # 兜底护栏 (会话外直调, max_calls=None): 退避过期 → 视为新轮,
+                # 复位退避与计数 (进程级永续退避修复, 终审低危)。会话内 guard
+                # (start_session 总带上限) 不触发, 退避持续到 close()。
+                log.info("LLM: 兜底护栏退避已过期 (%.0fs) → 新轮复位, 恢复尝试",
+                         BACKOFF_EXPIRE_SECONDS)
+                self.backoff = False
+                self._backoff_since = 0.0
+                self.calls = self.success = self.failures = 0
+            else:
+                self.last_block = "backoff"
+                self.skipped_backoff += 1
+                log.warning("LLM: 本轮已失败退避（last: %s）→ %s已跳过",
+                            self.last_error, consumer)
+                return None
         if self.max_calls is not None and self.calls >= self.max_calls:
             self.last_block = "cap"
             self.skipped_cap += 1
@@ -490,6 +517,7 @@ class LLMGuard:
         self.failures += 1
         self.last_error = category + (f": {detail}" if detail else "")
         self.backoff = True
+        self._backoff_since = time.time()
         log.warning("LLM: 调用失败（%s）→ 本轮退避, 剩余候选全部跳过",
                     self.last_error)
 

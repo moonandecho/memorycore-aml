@@ -375,55 +375,57 @@ def main() -> None:
         "overflowed": 0, "updated": 0, "deleted": 0, "merged": 0, "kept": 0, "errors": 0,
         "sunk": 0, "sink_dry": [], "merge_dry": [], "merge_skipped": 0,
     }
-    # LLM guard session (review C2) — covers smart_tidy sink-confirm/merge calls;
-    # close() writes stat["llm"].
+    # Low-risk fix (final audit): close in finally — exception paths also
+    # write stat["llm"] and reset the contextvar.
     llm_guard = llm_config.start_session(stat=stat, name="weekly")
     lines = [f"# MemoryCore weekly maintenance {datetime.now():%Y-%m-%d %H:%M}",
              f"mode: {'DRY-RUN' if dry else 'exec'} | cold tier: {'OK' if cold_ok else 'unreachable (degraded)'}"]
 
-    for target in ("memory", "user"):
-        before_pct = store.usage_pct(target)
-        r = run_overflow(store, client, target)
-        for k in stat:
-            if k in r:
-                stat[k] += r[k]
-        after_pct = store.usage_pct(target)
-        lines.append(f"\n## {target}  overflow: {before_pct}% -> {after_pct}%")
-        # LLM three states (review mandatory-change 5): compress/merge/dormancy
-        # channel status inside this overflow run
-        if r.get("llm"):
-            lines.append(f"  LLM: {llm_config.format_status(r['llm'])}")
-
-        # smart tidy when hot tier still above soft threshold
-        if after_pct > SOFT_THRESHOLD * 100 and cold_ok:
-            t_stat = {"sunk": 0, "merged": 0, "errors": 0, "sink_dry": [], "merge_dry": [], "merge_skipped": 0}
-            smart_tidy(store, client, target, t_stat, dry)
-            stat["sunk"] += t_stat["sunk"]
-            stat["merged"] += t_stat["merged"]
-            stat["errors"] += t_stat["errors"]
-            post = store.usage_pct(target)
-            lines.append(f"  smart tidy: sunk={t_stat['sunk']} merged={t_stat['merged']} merge_skipped={t_stat['merge_skipped']} -> {post}%")
-            if t_stat["sink_dry"]:
-                lines.append("  [dry] would sink: " + "; ".join(t_stat["sink_dry"]))
-            if t_stat["merge_dry"]:
-                for x in t_stat["merge_dry"]:
-                    lines.append(f"  [dry] would merge: {x[0]} + {x[1]} -> {x[2]}")
-        else:
-            lines.append(f"  smart tidy: skipped (usage {after_pct}% <= {SOFT_THRESHOLD*100:.0f}% or cold tier unreachable)")
-
-    # cold-tier maintenance
     try:
-        m = run_maintenance(client)
-        lines.append(f"\n## cold-tier maintenance\n{m}")
-        if m.get("llm"):
-            lines.append(f"  cold LLM: {llm_config.format_status(m['llm'])}")
-    except Exception as e:
-        lines.append(f"\n## cold-tier maintenance\nerror: {e}")
-        stat["errors"] += 1
+        for target in ("memory", "user"):
+            before_pct = store.usage_pct(target)
+            r = run_overflow(store, client, target)
+            for k in stat:
+                if k in r:
+                    stat[k] += r[k]
+            after_pct = store.usage_pct(target)
+            lines.append(f"\n## {target}  overflow: {before_pct}% -> {after_pct}%")
+            # LLM three states (review mandatory-change 5): compress/merge/dormancy
+            # channel status inside this overflow run
+            if r.get("llm"):
+                lines.append(f"  LLM: {llm_config.format_status(r['llm'])}")
+
+            # smart tidy when hot tier still above soft threshold
+            if after_pct > SOFT_THRESHOLD * 100 and cold_ok:
+                t_stat = {"sunk": 0, "merged": 0, "errors": 0, "sink_dry": [], "merge_dry": [], "merge_skipped": 0}
+                smart_tidy(store, client, target, t_stat, dry)
+                stat["sunk"] += t_stat["sunk"]
+                stat["merged"] += t_stat["merged"]
+                stat["errors"] += t_stat["errors"]
+                post = store.usage_pct(target)
+                lines.append(f"  smart tidy: sunk={t_stat['sunk']} merged={t_stat['merged']} merge_skipped={t_stat['merge_skipped']} -> {post}%")
+                if t_stat["sink_dry"]:
+                    lines.append("  [dry] would sink: " + "; ".join(t_stat["sink_dry"]))
+                if t_stat["merge_dry"]:
+                    for x in t_stat["merge_dry"]:
+                        lines.append(f"  [dry] would merge: {x[0]} + {x[1]} -> {x[2]}")
+            else:
+                lines.append(f"  smart tidy: skipped (usage {after_pct}% <= {SOFT_THRESHOLD*100:.0f}% or cold tier unreachable)")
+
+        # cold-tier maintenance
+        try:
+            m = run_maintenance(client)
+            lines.append(f"\n## cold-tier maintenance\n{m}")
+            if m.get("llm"):
+                lines.append(f"  cold LLM: {llm_config.format_status(m['llm'])}")
+        except Exception as e:
+            lines.append(f"\n## cold-tier maintenance\nerror: {e}")
+            stat["errors"] += 1
+    finally:
+        llm_guard.close()
 
     # LLM channel summary (mandatory-change 5): three states + per-run
     # calls/cap/backoff — the weekly session covers smart_tidy calls
-    llm_guard.close()
     lines.append(f"\n## LLM channel (weekly)\n{llm_config.format_status(stat['llm'])}")
 
     lines.append(f"\n## summary\noverflowed={stat['overflowed']} sunk={stat['sunk']} merged={stat['merged']} errors={stat['errors']}")

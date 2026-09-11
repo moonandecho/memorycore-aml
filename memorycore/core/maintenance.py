@@ -180,8 +180,18 @@ def run_maintenance(client) -> dict:
 
     # LLM guard session (review C2): separate cold-tier call cap + fail
     # backoff; close() writes stat["llm"] (MCP tool output / weekly report).
+    # Low-risk fix (final audit): close in finally — exception paths also
+    # write stat["llm"] and reset the contextvar (no leak to a dead guard).
     llm_guard = llm_config.start_session(
         stat=stat, max_calls=llm_config.cold_max_calls(), name="cold")
+    try:
+        return _run_maintenance(client, stat)
+    finally:
+        llm_guard.close()
+
+
+def _run_maintenance(client, stat: Dict[str, Any]) -> dict:
+    """run_maintenance body (guard-session lifecycle owned by run_maintenance)."""
 
     from ..trash_store import TrashStore
     trash = TrashStore()
@@ -205,7 +215,6 @@ def run_maintenance(client) -> dict:
         except Exception:
             pass
         stat["note"] = "no entries enumerated (cold layer may be empty or list_all unavailable)"
-        llm_guard.close()
         return stat
 
     # ---- Step 2: 向量预筛去重 (B2 重写 + 反转消解) ---------------
@@ -341,7 +350,6 @@ def run_maintenance(client) -> dict:
         stat["vector_ok"] = None
         stat["vector_error"] = str(e)
 
-    llm_guard.close()
     return stat
 
 
@@ -515,11 +523,17 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]],
             )
             try:
                 client.update(keeper_id, merged_content)
-                # P1-5: victim 进回收站再 forget
-                TrashStore().add(
-                    victim_id, victim.get("content", ""),
-                    reason="merge_obsolete",
-                    source_decision="rule_merge")
+                # P1-5 + E3 observability (final audit R2): the bare
+                # TrashStore().add wrote failures with zero count/alert —
+                # switch to add_observed (count stat["trash_fail"] + warning).
+                # Order was already safe (add raising skips forget); semantics:
+                # trash write failure -> False -> continue blocks deletion
+                # (victim kept, retried next round — same conservative
+                # semantics as the existing except->continue).
+                if not add_observed(
+                        TrashStore(), victim_id, victim.get("content", ""),
+                        "merge_obsolete", "rule_merge", stat):
+                    continue
                 client.forget(victim_id)
                 to_forget.add(victim_id)
                 merged += 1
@@ -584,17 +598,28 @@ def _merge_duplicates(client, entries: List[Dict[str, Any]],
                         else (entry_b, entry_a)
                     )
                     if older["id"] not in to_forget:
+                        # E3 order fix (final audit R1): the original forgot
+                        # first and wrote the trash store after — a trash
+                        # write failure deleted the source with no snapshot,
+                        # swallowed by the outer except. Now: trash must be
+                        # written first (add_observed); failure -> count
+                        # stat["trash_fail"] + warning + skip deletion.
+                        if not add_observed(
+                                TrashStore(), older["id"], older.get("content", ""),
+                                "reversal_obsolete", "rule_reversal", stat):
+                            continue
                         try:
                             client.forget(older["id"])
-                            from ..trash_store import TrashStore
-                            TrashStore().add(
-                                older["id"], older.get("content", ""),
-                                reason="reversal_obsolete",
-                                source_decision="rule_reversal")
-                            to_forget.add(older["id"])
-                            reversal_count += 1
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # E3 observability: forget failure is no longer
+                            # silent (entry already in trash, kept in cold tier)
+                            stat["errors"] = stat.get("errors", 0) + 1
+                            log.warning(
+                                "MERGE: reversal forget failed (%s: %s) -> kept in cold tier",
+                                older["id"], e)
+                            continue
+                        to_forget.add(older["id"])
+                        reversal_count += 1
                     continue
 
                 # 规则反转未命中 + 同主题 + 有时间 → LLM 模糊候选

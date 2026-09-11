@@ -462,7 +462,17 @@ def run_overflow(store, client, target: str) -> dict:
     # LLM guard session (review C2): per-run call cap + fail backoff +
     # observable three states; close() writes stat["llm"] (MCP tool output /
     # weekly report readable).
+    # Low-risk fix (final audit): close in finally — exception paths also
+    # write stat["llm"] and reset the contextvar (no leak to a dead guard).
     llm_guard = llm_config.start_session(stat=stat, name="overflow")
+    try:
+        return _run_overflow(store, client, target, stat)
+    finally:
+        llm_guard.close()
+
+
+def _run_overflow(store, client, target: str, stat: Dict[str, Any]) -> dict:
+    """run_overflow body (guard-session lifecycle owned by run_overflow)."""
 
     # P4: 收集本次下沉的用户偏好内容, 溢流末统一更新冷层摘要锚点
     anchor_parts: List[str] = []
@@ -474,7 +484,6 @@ def run_overflow(store, client, target: str) -> dict:
         stat["usage_after"] = f"{store.usage_pct(target)}%"
         stat["chars_before"] = 0
         stat["chars_after"] = 0
-        llm_guard.close()
         return stat
 
     stat["chars_before"] = store.char_count(target)
@@ -670,7 +679,6 @@ def run_overflow(store, client, target: str) -> dict:
     stat["chars_after"] = store.char_count(target)
     stat["usage_after"] = f"{store.usage_pct(target)}%"
     stat["target"] = target
-    llm_guard.close()
     return stat
 
 

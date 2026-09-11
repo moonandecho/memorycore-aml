@@ -11,6 +11,13 @@
   - llm_check.py:  llm_config import 行 + 用法/示例命令行 (布局差异)
   - 测试文件:      import 行 (core / memorycore.core 布局差异)
 
+受检范围边界 (终审低危, 2026-09-12): 仅上述 5 个文件做同源哈希校验。
+消费者文件 (overflow/maintenance/weekly/server 等) 是"仓库特有"的 — 布局
+(core/ vs memorycore.core/)、发行差异 (本地中文注释/发布英文注释、本地邮件
+通知节)、后端差异 (MnemosyneClient vs ColdStoreClient) 各有不同, 不做同源
+承诺。它们列入下方 UNPROTECTED 清单, 校验输出显式提示"不受同源保护",
+漂移防线 = 人工对照 + 三仓本脚本/清单自身 md5 核对。
+
 用法:
   python3 tools/check_llm_sync.py           # 校验当前仓库 (按 manifest)
   python3 tools/check_llm_sync.py --update  # 写入/更新 tools/llm_sync_manifest.json
@@ -26,6 +33,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "tools/llm_sync_manifest.json"
+
+# 不受同源保护的文件 (仓库特有, 允许漂移 — 终审低危修复):
+# 本地 weekly 曾出现旧 _load_env (lstrip bug) 而发布版没有, 校验未检出;
+# 现显式列出, 校验输出提示人工对照。此清单与 manifest["unprotected"]
+# 必须一致 (校验脚本会比对), 漂移防护靠三仓本脚本/清单 md5 一致。
+UNPROTECTED = [
+    "core/maintenance.py",      # 本地 MnemosyneClient / 发布 ColdStoreClient 后端
+    "core/overflow.py",
+    "core/llm_judge.py",
+    "core/decay.py",
+    "core/config.py",
+    "core/classifier.py",
+    "core/metadata.py",
+    "weekly_maintenance.py",    # 本地有邮件通知节; 发布版无 _load_env
+    "server.py",
+    "trash_store.py",
+    "local_store.py",
+    "mnemosyne_client.py",     # 仅本地; 发布版对应 cold_store_client.py
+    "cold_store_client.py",    # 仅发布版
+    "tests/conftest.py",       # 其余测试文件仓库特有
+    "tests/",                  # (除受检 3 个测试文件外)
+    "README.md", "README.zh-CN.md",
+]
 
 # 逻辑文件 → (候选路径列表, 归一化规则)
 FILES = {
@@ -113,8 +143,10 @@ def compute() -> dict:
 def main() -> int:
     if "--update" in sys.argv:
         data = {"note": "三仓 LLM 共享文件归一化哈希清单 (归一化规则见 check_llm_sync.py)。"
-                        "三家仓库此文件必须完全一致; 不一致 = 同步漂移, 立即修。",
-                "files": compute()}
+                        "三家仓库此文件必须完全一致; 不一致 = 同步漂移, 立即修。"
+                        "unprotected = 不受同源保护的消费者文件 (仓库特有, 允许漂移, 人工对照)。",
+                "files": compute(),
+                "unprotected": list(UNPROTECTED)}
         MANIFEST.parent.mkdir(exist_ok=True)
         MANIFEST.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
                             encoding="utf-8")
@@ -139,6 +171,17 @@ def main() -> int:
         else:
             print(f"[FAIL] {name}:\n  manifest={e}\n  actual ={a}")
             rc = 1
+
+    # 终审低危: 显式提示不受同源保护的文件 (仓库特有, 允许漂移 — 人工对照)。
+    # 清单漂移防护: manifest["unprotected"] 必须与脚本内 UNPROTECTED 一致。
+    m_unprotected = json.loads(MANIFEST.read_text(encoding="utf-8")).get(
+        "unprotected", [])
+    if m_unprotected != UNPROTECTED:
+        print("[FAIL] manifest.unprotected 与脚本 UNPROTECTED 不一致 — 重新 --update")
+        rc = 1
+    print("\n以下文件不受同源保护 (仓库特有, 允许漂移 — 漂移防线为人工对照):")
+    for rel in UNPROTECTED:
+        print(f"  [UNPROTECTED] {rel}")
     return rc
 
 

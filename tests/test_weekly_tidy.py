@@ -248,6 +248,48 @@ def test_no_llm_key_skips_sink_path(tmp_store, mock_client, meta_for,
     assert mock_client.stored == [], "无 LLM → 零冷层调用"
 
 
+# ---- ④b mandatory change 2: weekly hard gate now resolves via llm_config -----
+
+def test_weekly_gate_respects_file_source_key(tmp_store, mock_client, meta_for,
+                                              tmp_path, monkeypatch):
+    """env has no LLM_API_KEY but a file source (~/.hermes/.env whitelist) has
+    a key -> the b) merge path must proceed (the old os.environ.get hard gate
+    blocked every file-source key)."""
+    from memorycore.core import llm_config
+    f = tmp_path / "hermes.env"
+    f.write_text("DEEPSEEK_API_KEY=sk-file-key\n", encoding="utf-8")
+    monkeypatch.setenv("MEMCORE_LLM_FILE_SOURCES", "1")
+    monkeypatch.setattr(llm_config, "ENV_FILE", f)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    llm_config.invalidate_cache()
+
+    a = (f"{days_ago_str(30)} 已删: 打印机驱动冲突处理记录。最终方案: 卸载旧驱动后"
+         f"重装官方驱动, 双面打印恢复正常, 故障消除, 相关命令与日志均已归档。")
+    b = (f"{days_ago_str(29)} 已删: 打印机驱动冲突处理记录。最终方案: 卸载旧驱动后"
+         f"重装官方驱动, 双面打印恢复正常, 故障消除。")
+    _add_fillers(tmp_store)
+    for t in (a, b):
+        _add_candidate(tmp_store, meta_for, text=t, last_active_days=30)
+
+    merge_calls = []
+    monkeypatch.setattr(wm, "_llm_confirm_sink", lambda e: False)
+    monkeypatch.setattr(wm, "_llm_merge_text",
+                        lambda x, y: (merge_calls.append((x, y)), None)[1])
+
+    stat = _run_tidy(tmp_store, mock_client)
+    assert merge_calls, ("file-source key must pass the b) merge path "
+                         "(mandatory change 2); an env-only hard gate blocks here")
+    assert stat["merge_skipped"] == 1
+
+    # control: file sources off + no env key -> merge path skipped entirely
+    merge_calls.clear()
+    monkeypatch.setenv("MEMCORE_LLM_FILE_SOURCES", "0")
+    llm_config.invalidate_cache()
+    stat = _run_tidy(tmp_store, mock_client)
+    assert merge_calls == [], "no key from any source -> b) merge path skipped"
+    assert stat["merge_skipped"] == 0
+
+
 # ---- ⑤ 保护面 ------------------------------------------------------------
 
 def test_protected_redline_not_sunk(tmp_store, mock_client, meta_for,

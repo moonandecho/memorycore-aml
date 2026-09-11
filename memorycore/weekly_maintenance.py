@@ -63,6 +63,7 @@ from .core.config import (ACTIVITY_LOG_ENABLED, CHAR_LIMIT_MEMORY,  # noqa: E402
                           TIDY_MAX_MERGE_PER_RUN, TIDY_MAX_SINK_PER_RUN,
                           TIDY_MERGE_RATIO)
 from .core.metadata import MetaStore, _parse_iso, load_recent_queries  # noqa: E402
+from .core import llm_config  # noqa: E402
 from .core.overflow import (run_overflow, _is_protected_rule, _topic_overlap,  # noqa: E402
                             _lex_evidence, _find_best_match, _merge_two_entries,
                             _recall_safe)
@@ -81,15 +82,17 @@ _DATE_RE = re.compile(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})")
 
 
 def _llm_call(system: str, user: str, max_tokens: int = 900) -> str | None:
-    """Call the configured LLM (OpenAI-compatible chat/completions). None on failure."""
-    api_key = os.environ.get("LLM_API_KEY", "")
-    base = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    model = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
-    if not api_key:
+    """Call via llm_config (lazy resolve + guard); None on failure (conservative skip).
+
+    Observable three states go through llm_config into the current session
+    stat["llm"] + logs (review mandatory-change 5); unconfigured / per-run
+    cap / fail backoff -> None, no longer silent.
+    """
+    cfg = llm_config.acquire("下沉确认/合并")
+    if cfg is None:
         return None
-    import urllib.request
     payload = {
-        "model": model,
+        "model": cfg.model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -97,17 +100,18 @@ def _llm_call(system: str, user: str, max_tokens: int = 900) -> str | None:
         "temperature": 0.2,
         "max_tokens": max_tokens,
     }
-    req = urllib.request.Request(
-        base + "/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=float(os.environ.get("LLM_TIMEOUT", "20"))) as resp:
-            data = json.loads(resp.read().decode())
-        return data["choices"][0]["message"]["content"].strip()
+        data = llm_config.chat(
+            cfg, payload,
+            timeout=float(os.environ.get("LLM_TIMEOUT", "20")))
+        content = data["choices"][0]["message"]["content"].strip()
+        llm_config.note_success()
+        return content
+    except llm_config.LLMError as e:
+        llm_config.note_failure(e.category, e.detail)
+        return None
     except Exception:
+        llm_config.note_failure("bad_response")
         return None
 
 
@@ -317,8 +321,11 @@ def smart_tidy(store, client, target: str, stat: dict, dry: bool) -> None:
         _sink_entry(store, client, target, e, meta, stat, dry)
         processed += 1
 
-    # --- b) merge overlapping rules (needs LLM semantics; skip without key) ---
-    if not os.environ.get("LLM_API_KEY", ""):
+    # --- b) merge overlapping rules (needs LLM semantics; skip when unconfigured) ---
+    # Mandatory change 2: the old hard gate (os.environ.get("LLM_API_KEY"))
+    # only saw env keys and blocked file-source keys (~/.hermes/.env whitelist
+    # / config.yaml) — now resolved via llm_config so all sources count.
+    if not llm_config.resolve().configured:
         return
     entries = store.entries(target)
     merged_any = True
@@ -368,6 +375,9 @@ def main() -> None:
         "overflowed": 0, "updated": 0, "deleted": 0, "merged": 0, "kept": 0, "errors": 0,
         "sunk": 0, "sink_dry": [], "merge_dry": [], "merge_skipped": 0,
     }
+    # LLM guard session (review C2) — covers smart_tidy sink-confirm/merge calls;
+    # close() writes stat["llm"].
+    llm_guard = llm_config.start_session(stat=stat, name="weekly")
     lines = [f"# MemoryCore weekly maintenance {datetime.now():%Y-%m-%d %H:%M}",
              f"mode: {'DRY-RUN' if dry else 'exec'} | cold tier: {'OK' if cold_ok else 'unreachable (degraded)'}"]
 
@@ -379,6 +389,10 @@ def main() -> None:
                 stat[k] += r[k]
         after_pct = store.usage_pct(target)
         lines.append(f"\n## {target}  overflow: {before_pct}% -> {after_pct}%")
+        # LLM three states (review mandatory-change 5): compress/merge/dormancy
+        # channel status inside this overflow run
+        if r.get("llm"):
+            lines.append(f"  LLM: {llm_config.format_status(r['llm'])}")
 
         # smart tidy when hot tier still above soft threshold
         if after_pct > SOFT_THRESHOLD * 100 and cold_ok:
@@ -401,9 +415,16 @@ def main() -> None:
     try:
         m = run_maintenance(client)
         lines.append(f"\n## cold-tier maintenance\n{m}")
+        if m.get("llm"):
+            lines.append(f"  cold LLM: {llm_config.format_status(m['llm'])}")
     except Exception as e:
         lines.append(f"\n## cold-tier maintenance\nerror: {e}")
         stat["errors"] += 1
+
+    # LLM channel summary (mandatory-change 5): three states + per-run
+    # calls/cap/backoff — the weekly session covers smart_tidy calls
+    llm_guard.close()
+    lines.append(f"\n## LLM channel (weekly)\n{llm_config.format_status(stat['llm'])}")
 
     lines.append(f"\n## summary\noverflowed={stat['overflowed']} sunk={stat['sunk']} merged={stat['merged']} errors={stat['errors']}")
     for target in ("memory", "user"):

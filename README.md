@@ -76,6 +76,21 @@ Error-code semantics:
 | `MNEMOSYNE_DATA_DIR` | `~/.memorycore/data` | SQLite data directory (point evaluations at a dedicated dir) |
 | `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | embedding API (ollama or any OpenAI-compatible server) |
 | `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding model (1024-dim) |
+| `LLM_API_KEY` | empty (LLM off) | optional LLM enhancement key (empty = pure rules, safe) |
+| `LLM_BASE_URL` / `LLM_MODEL` | `https://api.deepseek.com` / `deepseek-v4-flash` | optional LLM endpoint/model |
+
+> **LLM enhancement is optional and off by default.** At evaluation time this
+> submission makes **no external API calls** (embeddings are local ollama;
+> LLM features never run on the `/add` / `/search` paths). The optional LLM
+> (hot-tier compression / dormancy judgement / merge confirmation) is
+> **env-only**: file sources (`~/.hermes/.env` / `~/.hermes/config.yaml`)
+> stay disabled unless `MEMCORE_LLM_FILE_SOURCES=1` is set explicitly, so a
+> key belonging to another tool (e.g. Hermes) is never picked up silently.
+> Safety valves: `MEMCORE_LLM_ENABLED=0`, per-run call caps
+> (`MEMCORE_LLM_MAX_CALLS` / `MEMCORE_LLM_COLD_MAX_CALLS`, default 8) and
+> fail-backoff. LLM state is always visible in stats/reports/logs.
+> Self-check: `python -m memorycore.llm_check [--live]` (live check bills at
+> most one max_tokens=1 completion, ~1e-5 yuan).
 
 ## Architecture
 

@@ -76,6 +76,19 @@ MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # 默认 0.0.0.0:8000
 | `MNEMOSYNE_DATA_DIR` | `~/.memorycore/data` | SQLite 数据目录(评测请指向独立目录) |
 | `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | embedding API(ollama 或任何 OpenAI 兼容服务) |
 | `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型(1024 维) |
+| `LLM_API_KEY` | 空(LLM 关闭) | 可选 LLM 增强 key(空 = 纯规则, 始终安全) |
+| `LLM_BASE_URL` / `LLM_MODEL` | `https://api.deepseek.com` / `deepseek-v4-flash` | 可选 LLM 端点/模型 |
+
+> **LLM 增强为可选项, 默认关闭。** 评测期间本参赛版**不产生任何外部 API
+> 调用**(embedding 为本地 ollama; LLM 特性不运行在 `/add` / `/search`
+> 路径上)。可选 LLM(热层压缩 / 休眠判定 / 下沉确认与合并)**仅读环境变量**:
+> 文件来源(`~/.hermes/.env` / `~/.hermes/config.yaml`)默认关闭, 需显式
+> `MEMCORE_LLM_FILE_SOURCES=1` 才读取, 因此绝不会静默捡起属于其它工具
+> (如 Hermes)的 key 开始计费外呼。安全阀: `MEMCORE_LLM_ENABLED=0` 总开关、
+> 每轮调用上限(`MEMCORE_LLM_MAX_CALLS` / `MEMCORE_LLM_COLD_MAX_CALLS`,
+> 默认 8)与失败退避。LLM 状态始终可见于统计/报告/日志。
+> 自检: `python -m memorycore.llm_check [--live]`(--live 至多计费一次
+> max_tokens=1 的 completion, ~1e-5 元级)。
 
 ## 架构
 

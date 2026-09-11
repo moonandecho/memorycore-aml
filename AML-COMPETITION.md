@@ -35,7 +35,7 @@ MemoryCore 是一个面向 LLM Agent 的记忆治理层（MIT 开源）。
 ## 二、架构
 
 ```
-AML HTTP (FastMCP custom routes: /add /search /health, 可选 Bearer/Token/X-Api-Key)
+AML HTTP (MCP server custom routes: /add /search /health, 可选 Bearer/Token/X-Api-Key)
    │
    ├─ Add: 事实切分 → 过时过滤 → 语义去重/合并 → 冷层写入 (author_id=user_id)
    ├─ Search: 样本内召回 (author_id 过滤, top_k≤100) → 时间衰减排序 → AML 格式
@@ -89,8 +89,9 @@ curl -X POST http://localhost:8000/search -H "Content-Type: application/json" -d
 ### 裸机
 
 ```bash
-# 国内网络建议加镜像: pip install -i https://mirrors.aliyun.com/pypi/simple/ .
-pip install .
+# 推荐独立 venv (依赖 mcp>=2,<3); 国内网络建议加镜像
+python3 -m venv .venv && source .venv/bin/activate
+pip install -i https://mirrors.aliyun.com/pypi/simple/ .
 ollama serve &
 ollama pull qwen3-embedding:0.6b
 MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # 默认 0.0.0.0:8000

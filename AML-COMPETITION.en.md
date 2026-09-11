@@ -45,7 +45,7 @@ verbatim memory evidence.
 ## 2. Architecture
 
 ```
-AML HTTP (FastMCP custom routes: /add /search /health, optional Bearer/Token/X-Api-Key)
+AML HTTP (MCP server custom routes: /add /search /health, optional Bearer/Token/X-Api-Key)
    │
    ├─ Add:    fact fragmentation → stale filter → semantic dedup/merge → cold-tier write (author_id=user_id)
    ├─ Search: in-sample recall (author_id filter, top_k≤100) → time-decay ranking → AML format
@@ -99,8 +99,9 @@ the `/data` volume persists the SQLite memory store.
 ### Bare metal
 
 ```bash
-# For CN networks, add a mirror: pip install -i https://mirrors.aliyun.com/pypi/simple/ .
-pip install .
+# Recommend a dedicated venv (deps: mcp>=2,<3); for CN networks add a mirror
+python3 -m venv .venv && source .venv/bin/activate
+pip install -i https://mirrors.aliyun.com/pypi/simple/ .
 ollama serve &
 ollama pull qwen3-embedding:0.6b
 MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # defaults to 0.0.0.0:8000

@@ -214,7 +214,7 @@ HIT_CAP_PER_SCAN = 1                # per-rule per-scan cap (saturation math: un
 HIT_WEAK_MODE = os.environ.get("MEMORYCORE_HIT_WEAK_MODE", "degraded")  # degraded/off/grey
 LEX_EVIDENCE_BIGRAMS = 2            # lexical weak hit: shared bigrams >= 2 (measured FP case has 2)
 FRESH_QUERY_SCAN_CAP = 50           # fresh queries per scan (≈1 day of queries, embed cost cap ~2.5s)
-EMBED_BATCH_MAX = 32                # server batch cap (32 ≈2s, keeps FastMCP responsive)
+EMBED_BATCH_MAX = 32                # server batch cap (32 ≈2s, keeps the MCP server responsive)
 EMBED_TIMEOUT = 30                  # embed timeout (cold model load measured 15s + margin)
 EMBED_BACKEND = os.environ.get("MEMORYCORE_EMBED_BACKEND", "mnemosyne")  # mnemosyne/ollama/off
 EMBED_MODEL = "qwen3-embedding-ctx256"  # same model as Mnemosyne recall (same score space)

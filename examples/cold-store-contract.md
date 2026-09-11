@@ -34,9 +34,9 @@ A tiny reference service that satisfies the contract (stdlib only):
 ```python
 # cold_store.py — minimal in-memory MCP memory service
 import json
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("cold-store")
+mcp = MCPServer("cold-store")
 db = {}          # memory_id -> content
 id_counter = 0
 

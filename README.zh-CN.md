@@ -44,6 +44,7 @@ curl -X POST http://localhost:8000/search -H "Content-Type: application/json" -d
 ### 裸机
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate   # 推荐: 独立 venv, 依赖 mcp>=2,<3 (已知兼容 2.0.0/2.2.0)
 pip install .
 ollama serve &
 ollama pull qwen3-embedding:0.6b
@@ -52,7 +53,7 @@ MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # 默认 0.0.0.0:8000
 
 ## HTTP API
 
-全部为纯 REST 端点, 挂载在 FastMCP streamable-http 应用上(uvicorn)。可选鉴权: 设置 `AML_API_KEY` 后支持 Bearer / Token / X-Api-Key。
+全部为纯 REST 端点, 挂载在 MCP server streamable-http 应用上(uvicorn)。可选鉴权: 设置 `AML_API_KEY` 后支持 Bearer / Token / X-Api-Key。
 
 | 端点 | 说明 |
 |---|---|
@@ -79,7 +80,7 @@ MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # 默认 0.0.0.0:8000
 ## 架构
 
 ```
-AML HTTP (FastMCP custom routes: /add /search /health, 可选 Bearer/Token/X-Api-Key)
+AML HTTP (MCP server custom routes: /add /search /health, 可选 Bearer/Token/X-Api-Key)
    │
    ├─ Add: 事实切分 → 过时过滤 → 语义去重/合并 → 冷层写入 (author_id=user_id)
    ├─ Search: 样本内召回 (author_id 过滤, top_k≤100) → 时间衰减排序 → AML 格式

@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from memorycore import server  # noqa: E402  (venv: mcp + fastmcp 可用, 装饰器返回原函数)
+from memorycore import server  # noqa: E402  (venv: mcp 2.x 可用, 装饰器返回原函数)
 
 from conftest import MockMnemosyneClient  # noqa: E402
 

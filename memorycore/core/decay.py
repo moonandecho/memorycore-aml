@@ -2,7 +2,7 @@
 """core/decay.py — cold-tier decay helper (shared by recall + prefetch)
 
 Extracted from server.py so prefetch does not import server.py (which would
-trigger FastMCP side effects). Mirrors the production implementation.
+trigger MCP server side effects). Mirrors the production implementation.
 """
 from datetime import datetime, timezone as _tz
 

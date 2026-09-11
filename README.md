@@ -44,6 +44,7 @@ curl -X POST http://localhost:8000/search -H "Content-Type: application/json" -d
 ### Bare metal
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate   # 推荐: 独立 venv, 依赖 mcp>=2,<3 (已知兼容 2.0.0/2.2.0)
 pip install .
 ollama serve &
 ollama pull qwen3-embedding:0.6b
@@ -52,7 +53,7 @@ MNEMOSYNE_DATA_DIR=/data python -m memorycore.aml_server   # 0.0.0.0:8000 by def
 
 ## HTTP API
 
-All endpoints are plain REST, served on the FastMCP streamable-http app (uvicorn). Optional auth via `AML_API_KEY` (Bearer / Token / X-Api-Key).
+All endpoints are plain REST, served on the MCP server streamable-http app (uvicorn). Optional auth via `AML_API_KEY` (Bearer / Token / X-Api-Key).
 
 | Endpoint | Description |
 |---|---|
@@ -79,7 +80,7 @@ Error-code semantics:
 ## Architecture
 
 ```
-AML HTTP (FastMCP custom routes: /add /search /health, optional Bearer/Token/X-Api-Key)
+AML HTTP (MCP server custom routes: /add /search /health, optional Bearer/Token/X-Api-Key)
    │
    ├─ Add: fact splitting → stale filter → semantic dedup/merge → cold-tier write (author_id=user_id)
    ├─ Search: in-sample recall (author_id filter, top_k≤100) → time-decay ranking → AML format

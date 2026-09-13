@@ -36,7 +36,11 @@ def _fill_to(tmp_store, target, pct):
 
 def _stamp_rule(meta_for, entry, days, importance=0.8, target="memory",
                 weight=None):
-    kw = {"updated_at": datetime.now(timezone.utc) - timedelta(days=days),
+    # FIX5: 软驻留认 written_at; 测试夹具的"N 天前旧条目"必须同时盖
+    # written_at/updated_at, 否则 written_at 被 stamp 默认成 now,
+    # 会被误当成当天新写入 (与测试意图相悖)。
+    anchor = datetime.now(timezone.utc) - timedelta(days=days)
+    kw = {"written_at": anchor, "updated_at": anchor,
           "importance": importance}
     if weight is not None:
         kw["weight"] = weight
@@ -59,6 +63,15 @@ def _setup_activity(monkeypatch, tmp_path, queries):
 def _judge_all_dormant(monkeypatch):
     monkeypatch.setattr(ov, "_llm_judge_dormant",
                         lambda entries, queries: {e: True for e in entries})
+
+
+def _disable_unified_budget(monkeypatch):
+    """隔离旧 S2/S4/S5 阶梯单测, 避免统一预算换出叠加 (V2 统一路径另测)。
+
+    2026-09-13 CACHE-POLICY-V2: run_overflow 末尾统一 enforce_rule_budget 会
+    在所有超预算场景介入; 本组用例只验证旧阶梯自身语义, 故显式 no-op。
+    """
+    monkeypatch.setattr(ov, "enforce_rule_budget", lambda *a, **k: None)
 
 
 # ---- §8.1 L0: 低占用不动 rule, 零冷层调用 -----------------------------------
@@ -127,7 +140,9 @@ def test_s2_retype_sinks_old_completed_rule(tmp_store, mock_client, meta_for):
     f"{days_ago_str(65)} 用户偏好: 已修两处漏洞, 已禁 rpcbind",    # 行为词
     f"{days_ago_str(20)} 安全审计已修漏洞, 已禁服务",              # 日期 < 60 天
 ])
-def test_s2_retype_negative(tmp_store, mock_client, meta_for, entry):
+def test_s2_retype_negative(tmp_store, mock_client, meta_for, entry,
+                           monkeypatch):
+    _disable_unified_budget(monkeypatch)
     tmp_store.add("memory", entry)
     meta_for("memory").stamp(entry, "rule", origin="legacy")
     _fill_to(tmp_store, "memory", 0.62)
@@ -155,6 +170,7 @@ def test_s2_retype_cold_fail_restores_rule(tmp_store, meta_for):
 
 def test_s4_stub_sink_dormant_b_rule(tmp_store, mock_client, meta_for,
                                      tmp_path, monkeypatch):
+    _disable_unified_budget(monkeypatch)
     entry = "自托管选型偏好: 极轻极简, Go/Rust 单二进制, 几十MB, 一行部署。"
     tmp_store.add("memory", entry)
     _stamp_rule(meta_for, entry, days=50)
@@ -194,7 +210,7 @@ def test_s4_stub_cold_fail_keeps_original(tmp_store, meta_for, tmp_path,
 
 @pytest.mark.parametrize("entry", [
     "行为准则: 汇报系统状态必须结论先行, 给 available/swap 而非 used。",
-    "红线: 删除强制走回收站, 绝不能用 rm。",
+    "红线: 删除强制走回收队列, 绝不能用 rm。",
 ])
 def test_s4_protected_harder_to_evict(tmp_store, mock_client, meta_for,
                                      entry):
@@ -242,19 +258,38 @@ def test_s4_importance_protected_harder_to_evict(tmp_store, mock_client, meta_fo
     assert other not in ents
 
 
-def test_protected_only_can_be_evicted(tmp_store, mock_client, meta_for,
-                                       tmp_path, monkeypatch):
-    """无永久保留铁律: 只有 protected 规则超预算时, 它也可被挤 (×3.0 只是更难)。"""
-    entry = "红线: 删除强制走回收站, 绝不能用 rm。"
+def test_protected_only_evicted_with_report(tmp_store, mock_client, meta_for,
+                                           tmp_path, monkeypatch):
+    """CACHE-POLICY-V2: 全 protected 撑爆预算 → 仍统一排序换出, 无零候选平台期。
+
+    protected 只是 ×WEIGHT_PROTECT_MULT=3.0 乘数; 冷层写成功才换出;
+    protected_evicted 审计 >0, errors==0, cold_backstop 不出现。
+    """
+    from memorycore.core.overflow import enforce_rule_budget
+    from memorycore.core.config import RULE_BUDGET_CHARS
+    entry = "红线: 删除强制走回收队列, 绝不能用 rm。"
     tmp_store.add("memory", entry)
-    _stamp_rule(meta_for, entry, days=200, weight=0.1)  # 权重极低 (长期失活)
-    _fill_to(tmp_store, "memory", 0.82)
-    _setup_activity(monkeypatch, tmp_path, ["无关查询"])
-    _judge_all_dormant(monkeypatch)
-    stat = run_overflow(tmp_store, mock_client, "memory")
+    _stamp_rule(meta_for, entry, days=200, weight=0.1)
+    fill = "用户偏好: 填充说明" + "乙" * (RULE_BUDGET_CHARS + 100)
+    tmp_store.add("memory", fill)
+    _stamp_rule(meta_for, fill, days=200)
+    stat = {}
+    enforce_rule_budget(tmp_store, mock_client, "memory", meta_for("memory"), stat)
     ents = tmp_store.entries("memory")
-    # 无其他候选 (filler 非 rule) → protected 也可退役 (权重 ×3.0 后仍最低)
-    assert any(e.startswith(STUB_PREFIX) for e in ents) or entry not in ents
+    assert stat.get("protected_evicted", 0) >= 1, stat
+    assert stat.get("errors", 0) == 0, stat
+    # 被换出的 protected 原文已不在热层, 冷层保有全文。
+    for original in (entry, fill):
+        if original not in ents:
+            assert original in mock_client.stored, "换出前必须先冷写成功"
+    assert not any(_is_protected_full(e, meta_for("memory"))
+                   for e in ents), "全 protected 超预算不得零候选/永不沉"
+
+
+def _is_protected_full(entry, ms):
+    from memorycore.core.overflow import _is_protected_rule
+    m = ms.get_entry(entry) or {}
+    return m.get("type") == "rule" and _is_protected_rule(entry, m)
 
 
 # ---- §8.7 S4 降级: 日志关闭 / LLM 失败 / 词法活跃 → 不 stub ------------------
@@ -295,10 +330,15 @@ def test_s4_llm_fail_no_stub(tmp_store, mock_client, meta_for, tmp_path,
 
 def test_s4_lexical_active_no_llm_call(tmp_store, mock_client, meta_for,
                                        tmp_path, monkeypatch):
+    _disable_unified_budget(monkeypatch)
     entry = "自托管选型偏好: 极轻极简, Go/Rust 单二进制。"
     tmp_store.add("memory", entry)
     _stamp_rule(meta_for, entry, days=50)
     _fill_to(tmp_store, "memory", 0.82)
+    # v2: filler 盖 state 章 (不占规则预算) — 否则预算挤权路径会介入,
+    # 干扰本测试对 S4 休眠判定的孤立观测 (2026-09-12 测试口径同步)
+    filler = max(tmp_store.entries("memory"), key=len)
+    meta_for("memory").stamp(filler, "state", origin="test_filler")
     _setup_activity(monkeypatch, tmp_path, ["自托管选型偏好是什么"])
     called = []
     monkeypatch.setattr(
@@ -312,7 +352,9 @@ def test_s4_lexical_active_no_llm_call(tmp_store, mock_client, meta_for,
 
 # ---- §8.8 S5: 跨层冗余清除 --------------------------------------------------
 
-def test_s5_cross_layer_dedup_removes_hot_copy(tmp_store, meta_for):
+def test_s5_cross_layer_dedup_removes_hot_copy(tmp_store, meta_for,
+                                              monkeypatch):
+    _disable_unified_budget(monkeypatch)
     entry = "服务器事实: /tmp 是 tmpfs 重启即清空。"
     tmp_store.add("memory", entry)
     _stamp_rule(meta_for, entry, days=40)
@@ -324,9 +366,14 @@ def test_s5_cross_layer_dedup_removes_hot_copy(tmp_store, meta_for):
     assert cold.stored == [], "冷层已有 → 不重复写"
 
 
-def test_s5_skips_recent_rule(tmp_store, meta_for):
-    """闲置 < 30 天不查冷层 (历史冗余面向, 省 recall 开销)。"""
-    entry = "服务器事实: /tmp 是 tmpfs 重启即清空。"
+def test_s5_skips_recent_rule(tmp_store, meta_for, monkeypatch):
+    """闲置 < 30 天不查冷层 (历史冗余面向, 省 recall 开销)。
+
+    v2 (2026-09-12): S0 kw-sink 门槛已 HARD→SOFT — 用 should_keep_local=True
+    的非 kw-sink 规则测 S5 闲置门槛 (否则 S0 会先冷迁移, 测试意图漂移)。
+    """
+    _disable_unified_budget(monkeypatch)
+    entry = "选型偏好: 技术栈优先稳定版本与成熟生态, 不追新。"
     tmp_store.add("memory", entry)
     _stamp_rule(meta_for, entry, days=5)
     _fill_to(tmp_store, "memory", 0.62)
@@ -341,6 +388,7 @@ def test_s5_skips_recent_rule(tmp_store, meta_for):
 def test_l2_greedy_stops_below_hard(tmp_store, mock_client, meta_for,
                                     tmp_path, monkeypatch):
     """阶梯渐进: 每轮 stub ≤ MAX_STUB_PER_RUN, 且预算制收敛 (不单轮抽空)。"""
+    _disable_unified_budget(monkeypatch)
     e1 = ("自托管选型偏好: 极轻极简单二进制, 几十MB一行部署。"
           + "部署在服务器上的应用保持单二进制形态, 一行命令启动和维护, "
             "不引入额外依赖与守护进程。")
@@ -370,7 +418,9 @@ def test_l2_greedy_stops_below_hard(tmp_store, mock_client, meta_for,
 
 # ---- §8.10 stub GC: 最老优先, 冷层零调用 -------------------------------------
 
-def test_stub_gc_removes_oldest_pointers(tmp_store, mock_client, meta_for):
+def test_stub_gc_removes_oldest_pointers(tmp_store, mock_client, meta_for,
+                                        monkeypatch):
+    _disable_unified_budget(monkeypatch)
     topics = ["自托管选型", "服务器运维", "写作风格", "安全审计", "硬件采购"]
     stubs = []
     for i, kw in enumerate(topics):
@@ -379,6 +429,10 @@ def test_stub_gc_removes_oldest_pointers(tmp_store, mock_client, meta_for):
         _stamp_stub(meta_for, s, days=10 + i)  # 年龄 10..14 天
         stubs.append(s)
     _fill_to(tmp_store, "memory", 0.82)
+    # v2: filler 盖 state 章 (不占规则预算) — 隔离 Step 5.5 stub GC 的
+    # 单次执行语义 (≤MAX_STUB_PER_RUN), 排除预算驱动 GC 的叠加 (2026-09-12)
+    filler = max(tmp_store.entries("memory"), key=len)
+    meta_for("memory").stamp(filler, "state", origin="test_filler")
     stat = run_overflow(tmp_store, mock_client, "memory")
     ents = tmp_store.entries("memory")
     assert 1 <= stat["stub_gc"] <= MAX_STUB_PER_RUN, stat
@@ -416,6 +470,7 @@ def test_rule_ladder_cold_fail_keeps_all(tmp_store, meta_for):
 
 def test_idempotent_second_run_no_side_effects(tmp_store, mock_client, meta_for,
                                                tmp_path, monkeypatch):
+    _disable_unified_budget(monkeypatch)
     entry = "自托管选型偏好: 极轻极简, Go/Rust 单二进制。"
     tmp_store.add("memory", entry)
     _stamp_rule(meta_for, entry, days=50)
@@ -425,7 +480,11 @@ def test_idempotent_second_run_no_side_effects(tmp_store, mock_client, meta_for,
     stat1 = run_overflow(tmp_store, mock_client, "memory")
     assert stat1["stubbed"] == 1
     stat2 = run_overflow(tmp_store, mock_client, "memory")
-    assert stat2["stubbed"] == 0 and stat2["stub_gc"] == 0, "第二次无副作用"
+    # CACHE-POLICY-V2: stub 继承原 updated_at, 第二轮可在硬压力下被 LRU GC
+    # (≤MAX_STUB_PER_RUN); 不得重复 stub 同一内容或产生新冷层全文。
+    assert stat2["stubbed"] == 0, stat2
+    assert stat2["stub_gc"] <= MAX_STUB_PER_RUN, stat2
+    assert len(mock_client.stored) == 1, "第二次不得重复写冷层全文"
 
 
 # ---- 采集面: activity 日志 (metadata 单元) -----------------------------------
@@ -458,15 +517,14 @@ def test_activity_log_compaction(tmp_path, monkeypatch):
 def test_prefetch_logs_activity(tmp_path, monkeypatch):
     """插件烟测: prefetch 每轮写 activity 日志 (模块级替换, 零生产副作用)。"""
     import importlib.util
-    plugin_path = (Path(__file__).resolve().parent.parent
-               / "hermes-plugin" / "memorycore-prefetch" / "__init__.py")
+    from conftest import PLUGIN_PATH as plugin_path  # release layout: hermes-plugin/memorycore-prefetch
     spec = importlib.util.spec_from_file_location("memorycore_prefetch_log_smoke",
                                                   plugin_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "act.jsonl")
     monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
-    mod.MnemosyneClient = lambda **k: MockMnemosyneClient()
+    mod.ColdStoreClient = lambda **k: MockMnemosyneClient()
     provider = mod.MemoryCorePrefetchProvider()
     provider._recall_sync("自托管选型调查")
     qs = meta_mod.load_recent_queries(days=1)
@@ -479,7 +537,7 @@ def test_store_fact_stamps_importance(tmp_store, mock_client, meta_for):
     from memorycore import server
     server._store = tmp_store
     server._client = mock_client
-    r = json.loads(server.memorycore_store_fact("用户偏好: 极简选型", importance=0.95))
+    r = json.loads(server.memorycore_store_entry("用户偏好: 极简选型", importance=0.95))
     assert r["status"] == "stored", r
     m = meta_for("memory").get_entry("用户偏好: 极简选型")
     assert m and m["importance"] == 0.95

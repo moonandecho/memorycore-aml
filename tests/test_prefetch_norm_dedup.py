@@ -11,9 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _load_plugin():
-    plugin_path = (Path(__file__).resolve().parent.parent
-                   / "hermes-plugin" / "memorycore-prefetch" / "__init__.py")
-    spec = importlib.util.spec_from_file_location("memorycore_prefetch_norm",
+    from conftest import PLUGIN_PATH as plugin_path  # release layout: hermes-plugin/memorycore-prefetch
+    spec = importlib.util.spec_from_file_location("memorycore_prefetch_norm_dedup",
                                                   plugin_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

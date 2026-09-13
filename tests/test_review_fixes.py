@@ -42,6 +42,86 @@ def test_f4_genuine_completion_still_state():
         f"{days_ago_str(2)} 方案已定稿, 不再更换") == "state"
 
 
+# ---- v2 结果/决定模式 + 名词消歧 (2026-09-12, DESIGN §Q1) ----------------
+
+@pytest.mark.parametrize("content", [
+    f"{days_ago_str(3)} 事故恢复记录: 回收队列文件复制恢复, 游戏启动成功",
+    f"{days_ago_str(5)} demo-host 已部署 巡检脚本 每周自动更新, 四轮闭环交付",
+    f"{days_ago_str(2)} 调研结论: 无现成方案, 决定不做",
+    f"{days_ago_str(6)} demo-host 定位再确认: 服务器已彻底用起来",
+    f"{days_ago_str(4)} 上线完成: 新服务已上线",
+])
+def test_v2_result_decision_patterns_state(content):
+    """v2 新完成态模式 (恢复/已部署/闭环交付/决定不做/再确认) → state。"""
+    assert classify_entry_type(content) == "state", content
+
+
+@pytest.mark.parametrize("content", [
+    f"{days_ago_str(3)} 用户偏好: 决定不再用 X 方案",
+    f"{days_ago_str(3)} 需求未交付, 待上线",
+    "恢复.xsession 的完整步骤: 卸 egfx 包后重装 xrdp",  # 无日期 → rule
+    f"{days_ago_str(3)} 行为准则: 每次先确认再执行",
+])
+def test_v2_no_misfire_rule(content):
+    """v2 防误伤: 带强行为词的完成态语言 / 待交付 / 无日期 / 准则 → rule。"""
+    assert classify_entry_type(content) == "rule", content
+
+
+@pytest.mark.parametrize("content, expected", [
+    (f"{days_ago_str(4)} 拍板: 智能整理按重叠准则相似度≥0.62 合并, "
+     "退役词触发 LLM 确认", "state"),   # 准则被技术语境消歧
+    (f"{days_ago_str(4)} 准则: 每次先确认再动手", "rule"),  # 真行为准则
+    (f"{days_ago_str(4)} 拍板: 方案定稿, 不再更换", "state"),
+])
+def test_v2_noun_disambiguation(content, expected):
+    """名词"准则/偏好"技术语境消歧: 该次出现不计, 其余照旧。"""
+    assert classify_entry_type(content) == expected, content
+
+
+def test_v2_type_hint_priority():
+    """type_override 优先于词法 (Q1 第二判据)。"""
+    assert classify_entry_type(
+        f"{days_ago_str(4)} 拍板: 方案定稿, 不再更换", type_hint="rule") == "rule"
+    assert classify_entry_type(
+        "行为准则: 每次先确认再执行", type_hint="state") == "state"
+    # 无 hint 时词法照常
+    assert classify_entry_type(
+        f"{days_ago_str(4)} 拍板: 方案定稿, 不再更换") == "state"
+
+
+def test_classifier_v2_rollback_switch(monkeypatch):
+    """CLASSIFIER_V2_ENABLED=0 → 回滚旧词法 (v1 语义)。"""
+    from memorycore.core import config as config_mod
+    content = (f"{days_ago_str(4)} 拍板: 智能整理按重叠准则相似度≥0.62 合并, "
+               "退役词触发 LLM 确认")
+    assert classify_entry_type(content) == "state"  # v2: 消歧后 state
+    monkeypatch.setattr(config_mod, "CLASSIFIER_V2_ENABLED", False)
+    assert classify_entry_type(content) == "rule"  # v1: 准则一票否决 → rule
+    # v2 新完成态词在 v1 下不生效 (回滚完全)
+    assert classify_entry_type(
+        f"{days_ago_str(3)} demo-host 已部署 巡检脚本") == "rule"
+
+
+def test_classify_detail_returns_signals():
+    """classify_entry_type_detail v3 signals schema (F-3 同步改造)。"""
+    from memorycore.core.classifier import classify_entry_type_detail
+    d = classify_entry_type_detail(
+        f"{days_ago_str(4)} 拍板: 智能整理按重叠准则相似度≥0.62 合并, 退役词")
+    assert d["type"] == "state" and d["decision"] == "state"
+    s = d["signals"]
+    assert s["has_date"] is True
+    assert s["state"] and s["pending"] == []
+    assert s["norm"] == []
+    d2 = classify_entry_type_detail(
+        f"{days_ago_str(4)} 拍板: 智能整理按重叠准则相似度≥0.62 合并, 退役词",
+        type_hint="rule")
+    assert d2["type"] == "rule" and d2["signals"]["type_hint"] == "rule"
+    # 模糊带 detail 暴露第三值 decision, 但公开 type 仍兼容二值 rule
+    d3 = classify_entry_type_detail("已通知用户验收结果")
+    assert d3["type"] == "rule" and d3["decision"] == "ambiguous"
+    assert d3["band"] == "ambiguous" and d3["reason"]
+
+
 # ---- F1: sidecar 故障不阻塞溢流 ----
 
 def test_f1_reconcile_failure_degrades_to_legacy(tmp_store, mock_client, monkeypatch):

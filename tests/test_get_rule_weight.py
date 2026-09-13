@@ -29,11 +29,15 @@ def test_get_rule_weight_sorted_and_scoped(tmp_store, mock_client, meta_for):
     now = datetime.now(timezone.utc)
     ms = meta_for("memory")
     # 3 条 rule 不同权重 + 1 条 stub + 1 条 state (应只列 rule)
+    # FIX6: 用 30 天前 written_at/updated_at 让 fixture 全部落普通档,
+    # next_eviction_candidates 才按纯 _rule_rank 展示 (与测试意图一致)。
+    old_anchor = now - timedelta(days=30)
     for e, w in [("规则A: 高权重准则。", 5.0),
                  ("规则B: 中权重准则。", 2.0),
                  ("规则C: 低权重准则。", 0.3)]:
         tmp_store.add("memory", e)
-        ms.stamp(e, "rule", weight=w, last_active_at=now)
+        ms.stamp(e, "rule", weight=w, last_active_at=now,
+                 written_at=old_anchor, updated_at=old_anchor)
     tmp_store.add("memory", "[规则指针]主题X→recall(\"主题X\")")
     ms.stamp(tmp_store.entries("memory")[-1], "stub", origin="stub_sink")
     tmp_store.add("memory", "2026-08-01 已配置: 历史状态记录")

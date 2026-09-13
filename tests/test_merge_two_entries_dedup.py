@@ -199,6 +199,8 @@ def test_stub_sink_cold_same_integration(tmp_store, meta_for, tmp_path,
     """run_overflow 全链: 冷层已有等价全文时 S5 (闲置≥30d) 先于 S4 拦截,
     本地直接删 (信息零丢失), 不 remember 不 stub — S4 的 same 分支是防御性
     兑底 (S5 未命中时的第二道保险), 两路径均不重复写冷层。"""
+    # CACHE-POLICY-V2: 本用例隔离 S5/S4 冷层去重语义; 统一预算路径另测。
+    monkeypatch.setattr(ov, "enforce_rule_budget", lambda *a, **k: None)
     entry = "自托管选型偏好: 极轻极简, Go/Rust 单二进制, 几十MB, 一行部署。"
     tmp_store.add("memory", entry)
     _stamp_rule(meta_for, entry, days=50)

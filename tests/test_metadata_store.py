@@ -41,3 +41,30 @@ def test_meta_roundtrip_and_corruption(tmp_store, meta_for):
     ms.meta_path.write_text("{not json", encoding="utf-8")
     assert ms.get_entry("条目X") is None
     assert ms.reconcile(["条目X"])["stamped"] == 1  # 损坏后重建
+
+
+def test_reconcile_writes_ambiguous_hold_fields(tmp_store, meta_for):
+    """SAFE-JUDGE v3: 新条目 ambiguous → type=rule + review_at, 不冷迁。"""
+    ms = meta_for("memory")
+    tmp_store.add("memory", "已通知用户验收结果")
+    st = ms.reconcile(tmp_store.entries("memory"))
+    assert st["stamped"] == 1
+    m = ms.get_entry("已通知用户验收结果")
+    assert m["type"] == "rule"
+    assert m["judge_decision"] == "ambiguous"
+    assert m["judge_review_at"]
+    assert m["type_source"] == "judge_v3_ambiguous"
+
+
+def test_reconcile_existing_keys_not_rejudged(tmp_store, meta_for):
+    """已有键不重判: 人工/旧章保留, 不因 v3 重新判型或写放大。"""
+    ms = meta_for("memory")
+    e = "2026-09-01 已完成部署。已通知用户验收结果"
+    ms.stamp(e, "rule", origin="manual", type_source="manual_override",
+             type_override="rule")
+    st = ms.reconcile([e])
+    assert st["stamped"] == 0
+    m = ms.get_entry(e)
+    assert m["type"] == "rule" and m["origin"] == "manual"
+    assert m["type_source"] == "manual_override"
+    assert "judge_decision" not in m

@@ -34,16 +34,28 @@ from .cold_store_client import ColdStoreClient  # noqa: E402
 from .core.config import (SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOFT_LIMIT, COLD_HARD_LIMIT,  # noqa: E402
                          STATE_TTL_DAYS, RULE_COMPRESS_DAYS,
                          RULE_MIN_RESIDENCY_DAYS, RULE_BUDGET_CHARS,
+                         RULE_MIN_RESIDENCY_IDLE_DAYS,
+                         RULE_MIN_RESIDENCY_WARM_DAYS,
+                         RULE_MIN_RESIDENCY_ACTIVE_DAYS,
                          AUDIT_SINK_WEIGHT_THRESHOLD, AUDIT_SINK_INACTIVE_DAYS,
-                         MAX_EVICT_PER_RUN)
+                         MAX_EVICT_PER_RUN, JUDGE_RESOLVED_RULE_GRACE_DAYS,
+                         WEIGHT_PROTECT_MULT)
 from .core.classifier import (classify, classify_user_pref, should_keep_local,  # noqa: E402
-                             classify_entry_type, COLD, STALE)
+                             classify_entry_type, judge_engine_enabled, COLD, STALE)
+from .core.judge import judge_entry  # noqa: E402  SAFE-JUDGE v3
 from .core.metadata import (MetaStore, entry_age_days, log_activity_query,  # noqa: E402  # Phase 3 S4 采集
-                           _parse_iso)
+                           _ts_anchor, _ts_anomaly_snapshot,
+                           load_recent_queries,
+                           _judge_hold_kwargs as _judge_kwargs)
 from .core.overflow import (run_overflow, _recall_safe, _find_best_match,  # noqa: E402
-                           _merge_two_entries, _is_protected_rule,
+                           _merge_two_entries, _is_protected_rule, _entry_sha,
                            enforce_rule_budget, apply_activity_hits,
-                           restore_stubs_from_results, _rule_weight_eff)
+                           restore_stubs_from_results, _rule_weight_eff,
+                           _rule_rank, _select_retirement_candidates,
+                           _soft_residency_grace_ts,
+                           _cache_policy_v2, _stub_topic, _rule_activity_tier,
+                           _ambiguous_a1_eligible,
+                           _ambiguous_hold_valid)
 from .core.maintenance import run_maintenance  # noqa: E402
 from .core import llm_config  # noqa: E402  # TTL 失效入口 (终审低危)
 from .core.decay import _apply_decay  # noqa: E402  # 小项1: 提取到独立模块
@@ -76,9 +88,12 @@ def _force_overflow_to_target(t: str) -> None:
     """
     for _ in range(3):
         before = _store.usage_pct(t)
-        run_overflow(_store, _client, t)
+        stat = run_overflow(_store, _client, t)
         after = _store.usage_pct(t)
-        if after <= TARGET_RATIO * 100 or after >= before:
+        # CACHE-POLICY-V2: plateau_reason 非空 = 真实数据安全暂停
+        # (cold_backstop 等), 继续空转也不会降占用 → 停止。
+        if (after <= TARGET_RATIO * 100 or after >= before
+                or stat.get("plateau_reason")):
             return
 
 
@@ -116,8 +131,10 @@ def _check_cold_capacity() -> None:
 # 工具 1: store_fact — 写入统一入口
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "global", target: str = "memory") -> str:
+_STORE_FACT_LEGACY_TOOL = "memorycore_" + "store_fact"
+
+@mcp.tool(name=_STORE_FACT_LEGACY_TOOL)
+def memorycore_store_entry(content: str, importance: float = 0.8, scope: str = "global", target: str = "memory", type_hint: str = "") -> str:
     """记忆写入统一入口: 冷热分流 + 容量校验。
 
     Args:
@@ -125,13 +142,40 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
         importance: 0.0-1.0 重要度 (>=0.8 倾向热数据留本地)
         scope: 'global' 或 'session'
         target: 热数据写入本地哪个文件 ('memory' 或 'user')
+        type_hint: 可选人工判型标注 'state'|'rule' (v2, 优先于词法; 留空=自动)
     Returns:
         JSON: {"status": "stored"|"cold_stored"|"stale"|"error", "detail": "..."}
     """
     try:
         # ---- A 写入分流: target="user" 用 classify_user_pref ----
         is_user = (target == "user")
-        if is_user:
+        t = target if target in ("memory", "user") else "memory"
+        _hint = type_hint if type_hint in ("state", "rule") else None
+
+        # SAFE-JUDGE v3: 判型一次成型; 不再 classify + should_keep_local 双判。
+        # ambiguous → 强制 hot (永不冷迁); strong rule → 不因 classify COLD 被送走;
+        # state → 强制冷层路径 (冷层写成功才删本地, 当前入口不写本地故无需删)。
+        jr = (judge_entry(content, type_hint=_hint)
+              if judge_engine_enabled() else None)
+        _jkw = _judge_kwargs(jr) if jr is not None else {}
+        # §6.2 审计: store_fact 热路径落 type_source=judge_v3* / manual_override.
+        if _hint is not None:
+            _type_source = "manual_override"
+        elif jr is not None:
+            _type_source = ("judge_v3_ambiguous"
+                            if jr.decision == "ambiguous" else "judge_v3")
+        else:
+            _type_source = "lexical_v2"
+        _force_hot_amb = bool(jr is not None and jr.decision == "ambiguous")
+        _force_hot_rule = bool(jr is not None and jr.decision == "rule"
+                               and jr.band == "strong")
+        _force_hot = _force_hot_amb or _force_hot_rule
+        _judge_state = bool(jr is not None and jr.decision == "state")
+
+        if _force_hot:
+            d = "hot"
+            stale_reason = "judge_v3_force_hot"
+        elif is_user:
             d = classify_user_pref(content, importance=importance,
                                    sentence_level=False)
             stale_reason = None  # classify_user_pref 不返回 reason dict
@@ -143,8 +187,8 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
         # Task C: 容量硬闸 — 写入前检查冷层条数
         _check_cold_capacity()
 
-        # STALE 处理
-        if d == STALE or d == "stale":
+        # STALE 处理 (v3 state 优先走冷迁移: 有完成态但属历史事实, 不 forget)
+        if not _force_hot and not _judge_state and (d == STALE or d == "stale"):
             if is_user:
                 return json.dumps({"status": "stale",
                                    "detail": "过时状态记录 (USER.md), 不写入"},
@@ -153,13 +197,19 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
                                "note": "过时状态记录, 不迁移不写入"}, ensure_ascii=False)
 
         # COLD / sink 处理
-        go_cold = (is_user and d == "sink") or (not is_user and d == COLD)
-        if not go_cold and classify_entry_type(content) == "state":
-            # Phase 2 (2026-08-16): 写入口联动 — 判 hot/core 但属历史决策/
-            # 状态记录 (日期+完成态词, 无行为指令词) → 强制走冷层路径,
-            # 污染从源头不进热层。默认 importance=0.8 会把几乎所有内容判热,
-            # 此判定在其后覆盖, 不修改 classify 本身 (兼容)。
+        if _force_hot:
+            go_cold = False
+        elif _judge_state:
             go_cold = True
+        else:
+            go_cold = (is_user and d == "sink") or (not is_user and d == COLD)
+            if jr is None:
+                # legacy 回滚路径 (JUDGE_V3_ENABLED=0): 保留旧写入口联动
+                if not go_cold and classify_entry_type(
+                        content, type_hint=_hint) == "state":
+                    if (_hint == "state"
+                            or not should_keep_local(content)):
+                        go_cold = True
         if go_cold:
             # Task A: 冷数据 → 先查重再写, 防止重复双写
             try:
@@ -200,13 +250,12 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
                 return json.dumps({"status": "cold_stored",
                                    "memory_id": r.get("memory_id"),
                                    "detail": cold_detail}, ensure_ascii=False)
-            return json.dumps({"status": "error", "detail": f"冷层写入失败: {r}"},
+            return json.dumps({"status": "error", "detail": f"Mnemosyne write failed: {r}"},
                               ensure_ascii=False)
 
         # HOT: 先查容量再写本地
         #   软阈值 (>=60%): 先溢流一次降压再写
         #   硬阈值 (>=80%): 强制全量溢流至 ≤40% (循环, 有上限保护) 再写
-        t = target if target in ("memory", "user") else "memory"
         usage = _store.usage_pct(t)
         if usage >= HARD_THRESHOLD * 100:
             _force_overflow_to_target(t)
@@ -219,17 +268,31 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
             try:
                 _metastore_for(t).stamp(content, "rule",
                                         importance=importance,
-                                        origin="store_fact")
+                                        origin="store_fact",
+                                        type_source=_type_source,
+                                        **_jkw)
             except Exception:
                 pass  # 元数据失败不影响写入, 下次 reconcile 兜底
-            # Phase 4: 写后规则预算检查 (LRU 挤权; 新规则有 7 天驻留不会被立刻挤)
-            try:
-                enforce_rule_budget(_store, _client, t, _metastore_for(t), {})
-            except Exception:
-                pass  # 预算挤权失败不阻塞写入 (下轮溢流兜底)
+            # Phase 4: 写后规则预算检查; ambiguous(A0) 不触发全文挤权。
+            if not _force_hot_amb:
+                try:
+                    enforce_rule_budget(_store, _client, t,
+                                        _metastore_for(t), {})
+                except Exception:
+                    pass  # 预算挤权失败不阻塞写入 (下轮溢流兜底)
+            detail = "热数据已写本地"
+            if _force_hot_amb:
+                detail = "判型模糊: 留热层并标记周治理终审 (不同步 LLM/不冷迁)"
             return json.dumps({"status": "stored", "target": t,
                                "usage_after": f"{_store.usage_pct(t)}%",
-                               "detail": "热数据已写本地"}, ensure_ascii=False)
+                               "judge_decision": (jr.decision if jr else None),
+                               "detail": detail}, ensure_ascii=False)
+        # ambiguous 不允许冷迁兜底 (B-3 安全方向): 本地写失败 → 明确失败, 不丢判型语义
+        if _force_hot_amb:
+            return json.dumps({"status": "error",
+                               "detail": "ambiguous 条目本地写入失败; "
+                                         "按设计拒绝冷迁 (避免误沉)"},
+                              ensure_ascii=False)
         # 写本地失败 (超限等) → 降级写冷层, 不丢失
         rr = _client.remember(content, importance=importance, scope=scope)
         if rr.get("status") == "stored":
@@ -237,6 +300,7 @@ def memorycore_store_fact(content: str, importance: float = 0.8, scope: str = "g
                                "detail": f"本地写入失败({r.get('error')}), 降级写冷层"}, ensure_ascii=False)
         return json.dumps({"status": "error", "detail": f"本地写失败且冷层降级失败: {r}"},
                           ensure_ascii=False)
+
     except Exception as e:
         return json.dumps({"status": "error", "detail": str(e)}, ensure_ascii=False)
 
@@ -254,8 +318,7 @@ def memorycore_trigger_overflow(target: str = "both") -> str:
     Returns:
         JSON: 溢流统计 {overflowed, updated, deleted, merged, usage_after}
     """
-    # TTL invalidation entry (final audit low-risk): long-lived MCP server
-    # picks up ~/.hermes/.env changes immediately at the next tool call
+    # TTL 失效入口 (终审低危): 长驻 MCP server 中改 ~/.hermes/.env 即时生效
     llm_config.invalidate_cache()
     try:
         results = {}
@@ -273,7 +336,7 @@ def memorycore_trigger_overflow(target: str = "both") -> str:
 @mcp.tool()
 def memorycore_run_cold_storage_maintenance() -> str:
     """冷层全量治理: 合并/清理/冲突取舍/向量校验。"""
-    # TTL invalidation entry (final audit low-risk): see trigger_overflow
+    # TTL 失效入口 (终审低危): 长驻 MCP server 中改 ~/.hermes/.env 即时生效
     llm_config.invalidate_cache()
     try:
         result = run_maintenance(_client)
@@ -308,6 +371,8 @@ def memorycore_get_memory_usage() -> str:
         "thresholds": {
             "soft_60": 3000, "hard_80": 4000, "target_40": 2000,
         },
+        # FIX6 R2: 时间戳异常必须可见 (未来/不可解析 → ts_anomaly).
+        "timestamp_anomaly": _ts_anomaly_snapshot(),
     }, ensure_ascii=False)
 
 
@@ -325,6 +390,12 @@ def memorycore_memory_audit(target: str = "both") -> str:
         sink_total = 0
         sink_chars = 0
         lru_sink = 0  # 缺口2: 活性维度可沉候选计数 (新字段, 不改现有计数口径)
+        # v2: 近 7 天查询 (Q2 分级词法输入, 与 _select_retirement_candidates 同口径)
+        try:
+            queries_7d = load_recent_queries(days=7)
+        except Exception:
+            queries_7d = []
+        now = datetime.now(timezone.utc)
         for e in entries:
             keep = should_keep_local(e)  # 关键词视图 (legacy 回退用)
             m = meta.get_entry(e)
@@ -333,18 +404,80 @@ def memorycore_memory_audit(target: str = "both") -> str:
             if m:
                 row["type"] = m.get("type")
                 row["written_at"] = m.get("written_at")
-                age = entry_age_days(m)
+                age = entry_age_days(m, now=now, entry=e)
                 row["age_days"] = age
-                if m.get("type") == "state":
-                    if age is not None and age >= STATE_TTL_DAYS:
-                        row["plan"] = "sink_now"
-                        keep = False
+                # SAFE-JUDGE v3 审计字段 (只读; 旧 sidecar 缺失为 None)
+                row["judge_decision"] = m.get("judge_decision")
+                row["judge_band"] = m.get("judge_band")
+                row["judge_reason"] = m.get("judge_reason")
+                row["judge_review_at"] = m.get("judge_review_at")
+                row["judge_review_count"] = m.get("judge_review_count")
+                # B-2/C-3: A0/A1/R-grace plan 视图
+                if (m.get("judge_decision") == "ambiguous"
+                        and m.get("judge_resolution") != "rule"):
+                    if _cache_policy_v2():
+                        # CACHE-POLICY-V2: ambiguous 仅低先验审计, 无 hold/A1 资格。
+                        row["plan"] = ("evictable_by_budget "
+                                       "(ambiguous low prior; judge audit only)")
+                        row["lru_eligible"] = True
+                        row["priority"] = round(_rule_rank(e, m, now), 4)
+                        row["protected_mult"] = 1.0
+                        row["keep"] = True
+                        rows.append(row)
+                        continue
+                    now_j = datetime.now(timezone.utc)
+                    if (_ambiguous_hold_valid(m, now_j, entry=e)
+                            and not _ambiguous_a1_eligible(m, now_j, entry=e)):
+                        row["plan"] = ("hold_ambiguous (review due "
+                                       f"{m.get('judge_review_at')})")
                     else:
-                        row["plan"] = f"sink_in_{STATE_TTL_DAYS - (age or 0)}d"
-                        keep = True  # 未到期, 当前仍留
+                        row["plan"] = ("stub_eligible_ambiguous "
+                                       "(A1: cold full text + pointer)")
+                    row["keep"] = True
+                    rows.append(row)
+                    continue
+                if m.get("judge_resolution") == "rule":
+                    if _cache_policy_v2():
+                        # CACHE-POLICY-V2: R-grace 不再阻止统一预算换出。
+                        row["plan"] = ("evictable_by_budget "
+                                       "(resolved judge audit only)")
+                        row["lru_eligible"] = True
+                        row["priority"] = round(_rule_rank(e, m, now), 4)
+                        row["protected_mult"] = 1.0
+                        row["keep"] = True
+                        rows.append(row)
+                        continue
+                    row["plan"] = ("resolved_rule_grace (LRU in "
+                                   f"{JUDGE_RESOLVED_RULE_GRACE_DAYS}d)")
+                    row["keep"] = True
+                    rows.append(row)
+                    continue
+                if m.get("type") == "state":
+                    # CACHE-POLICY-V2: state 无 TTL 直接换出资格; 与 rule/stub 同池
+                    # 由活性+预算换出。类型只作低初始权重先验。
+                    row["plan"] = "evictable_by_budget (type_state low prior)"
+                    row["lru_eligible"] = True
+                    keep = True
                 elif m.get("type") == "stub":
                     # Phase 3 S4: 指针驻留, 高压时最老优先 GC (全文在冷层)
                     row["plan"] = "stub_pointer (gc_oldest_on_hard_pressure)"
+                    keep = True
+                elif m.get("type_override") == "state":
+                    # G-5 (2026-09-12 评审修复): type=rule 但被人工标为
+                    # type_override=state 的条目, 下次溢流 S0 会立即冷迁;
+                    # plan 视图与 _handle_typed_entry 实际行为对齐。
+                    protected = _is_protected_rule(e, m)
+                    # CACHE-POLICY-V2: type_override=state 不再 S0 直迁;
+                    # 热层中的 state 与 rule/stub 同池, 由预算+活性换出。
+                    row["plan"] = "evictable_by_budget (manual state override)"
+                    row["protected"] = protected
+                    row["weight"] = m.get("weight")
+                    row["w_eff"] = round(_rule_weight_eff(m, now=now, entry=e), 4)
+                    row["priority"] = round(_rule_rank(e, m, now), 4)
+                    row["protected_mult"] = (WEIGHT_PROTECT_MULT if protected else 1.0)
+                    row["last_active_at"] = m.get("last_active_at")
+                    row["type_source"] = m.get("type_source")
+                    row["lru_eligible"] = True
                     keep = True
                 else:
                     # rule 型: keep 与溢流行为对齐 (S0 即时出口, 2026-08-26 修复) —
@@ -361,27 +494,40 @@ def memorycore_memory_audit(target: str = "both") -> str:
                     row["kw_sink"] = kw_sink
                     # Phase 4 LRU 观测字段 (M2, 2026-08-26 Pi 检查建议)
                     row["weight"] = m.get("weight")
-                    row["w_eff"] = round(_rule_weight_eff(m), 4)
+                    row["w_eff"] = round(_rule_weight_eff(m, now=now, entry=e), 4)
                     row["last_active_at"] = m.get("last_active_at")
                     row["residency_days"] = max(
                         0, RULE_MIN_RESIDENCY_DAYS - (age or 0))
+                    # v2 (2026-09-12, DESIGN §Q3.5): 审计可见 — 被挤前可解释
+                    row["type_source"] = m.get("type_source")
+                    tier, min_age = _rule_activity_tier(m, e, queries_7d, now)
+                    row["activity_tier"] = tier
+                    row["min_retire_age"] = min_age  # 仅审计/tier 解释, 不再是资格门
+                    row["lru_eligible"] = True  # CACHE-POLICY-V2: protected 不再是资格豁免
+                    row["priority"] = round(_rule_rank(e, m, now), 4)
+                    row["protected_mult"] = (WEIGHT_PROTECT_MULT if protected else 1.0)
                     row["next_gate"] = {
                         "compress_in_d": max(0, RULE_COMPRESS_DAYS - (age or 0)),
+                        "lru_in_d": max(0, min_age - (age or 0)),
                     }
                     # 缺口2 (2026-08-28): 活性维度可沉判定 — weight 低 +
                     # last_active_at 久远 + 非保护 → sink_candidate。
                     # 复用与 weight/w_eff/last_active_at 列同一数据源
                     # (m.get 原始 meta), 不另算一套; 仅可见性, 不改溢流逻辑。
                     w_raw = m.get("weight")
-                    laa_dt = (_parse_iso(str(m.get("last_active_at")))
-                              if m.get("last_active_at") else None)
+                    laa_dt = _ts_anchor(m.get("last_active_at"),
+                                        datetime.now(timezone.utc),
+                                        field="last_active_at",
+                                        sha=_entry_sha(e))
                     inactive_days = (
                         (datetime.now(timezone.utc) - laa_dt).days
                         if laa_dt else None)
-                    if (not protected and w_raw is not None
+                    if (w_raw is not None
                             and float(w_raw) < AUDIT_SINK_WEIGHT_THRESHOLD
                             and (inactive_days is None
                                  or inactive_days > AUDIT_SINK_INACTIVE_DAYS)):
+                        # CACHE-POLICY-V2 Q5: protected 只是 ×3, 低活性下同样
+                        # 是可换出候选; 这里用 sink_candidate 暴露审计信号。
                         row["sink_candidate"] = True
                         row["sink_reason"] = "low_weight+inactive"
                         lru_sink += 1
@@ -413,7 +559,158 @@ def memorycore_memory_audit(target: str = "both") -> str:
         result[t]["rule_budget"] = RULE_BUDGET_CHARS
         result[t]["rule_chars_vs_budget"] = rule_chars - RULE_BUDGET_CHARS
         result[t]["lru_sink_candidates"] = lru_sink  # 缺口2: 活性可沉候选数
+        # CACHE-POLICY-V2: 统一候选池的 next_evict (只读; protected 不豁免)。
+        try:
+            _next = _select_retirement_candidates(
+                _store, meta, t, max(1, rule_chars - RULE_BUDGET_CHARS), {})
+            result[t]["next_evict"] = [e[:40] for e in _next]
+        except Exception:
+            result[t]["next_evict"] = []
+        _stub_chars = sum(len(e) for e in entries
+                          if (meta.get_entry(e) or {}).get("type") == "stub")
+        _warnings = []
+        if rule_chars > RULE_BUDGET_CHARS:
+            _warnings.append("rule_chars>RULE_BUDGET_CHARS")
+        if _stub_chars > RULE_BUDGET_CHARS:
+            _warnings.append("stub_chars>RULE_BUDGET_CHARS")
+        result[t]["audit_warning"] = ";".join(_warnings) if _warnings else None
     return json.dumps(result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# 工具 4.4: set_entry_type — 人工标注 (只写 sidecar, DESIGN §Q1 第二判据)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memorycore_set_entry_type(target: str = "memory", match_text: str = "",
+                              type_override: str = "",
+                              protect_override: str = "") -> str:
+    """人工标注热层条目判型/保护 (v2, 只写 sidecar 元数据, 永不修改 .md 内容)。
+
+    用途 (DESIGN §Q1 第二判据): 词法判型拿不准时人工强制 type_override
+    (优先于词法), 或对想保护/解除保护的条目写 protect_override。
+    - type_override=state → 下次溢流 S0 立即冷迁移 (冷层写成功才删本地);
+    - type_override=rule → 强制按 rule 处理 (不再被完成态词误判 state);
+    - protect_override=true → 不进入自动沉候选池 (Q4);
+    - protect_override=false → 仅降级文本类保护; 红线硬词与 importance≥0.9
+      不可解除 (DESIGN-DEVIATIONS 第 4 条口径)。
+
+    Args:
+        target: 'memory' | 'user'
+        match_text: 定位条目的唯一子串 (必须恰好命中一条; 取条目开头片段即可)
+        type_override: '' (不改) | 'state' | 'rule'
+        protect_override: '' (不改) | 'true' | 'false'
+    Returns:
+        JSON: {"status": "ok"|"not_found"|"ambiguous"|"noop"|"error", ...}
+    """
+    try:
+        ms = _metastore_for(target)
+        entries = _store.entries(target)
+        needle = (match_text or "").strip()
+        hits = [e for e in entries if needle and needle in e]
+        if not hits:
+            return json.dumps({"status": "not_found",
+                               "detail": "match_text 未命中任何条目"},
+                              ensure_ascii=False)
+        if len(hits) > 1:
+            return json.dumps({"status": "ambiguous",
+                               "detail": f"match_text 命中 {len(hits)} 条, "
+                                         "请提供更长唯一子串",
+                               "previews": [e[:40] for e in hits[:5]]},
+                              ensure_ascii=False)
+        entry = hits[0]
+        if not type_override and not protect_override:
+            return json.dumps({"status": "noop",
+                               "detail": "未提供任何标注 (type_override / "
+                                         "protect_override)"},
+                              ensure_ascii=False)
+        if type_override and type_override not in ("state", "rule"):
+            return json.dumps({"status": "error",
+                               "detail": f"type_override 仅支持 state|rule, "
+                                         f"got {type_override!r}"},
+                              ensure_ascii=False)
+        if protect_override and protect_override not in ("true", "false"):
+            return json.dumps({"status": "error",
+                               "detail": "protect_override 仅支持 true|false"},
+                              ensure_ascii=False)
+        old = ms.get_entry(entry) or {}
+        # 只写 sidecar: 保留全部既有字段, 覆盖标注键
+        ms.stamp(
+            entry, old.get("type", "rule"),
+            written_at=_ts_anchor(old.get("written_at"), field="written_at",
+                             sha=_entry_sha(entry)),
+            updated_at=_ts_anchor(old.get("updated_at"), field="updated_at",
+                             sha=_entry_sha(entry)),
+            origin=old.get("origin", "hermes"),
+            importance=float(old.get("importance") or 0.8),
+            weight=float(old.get("weight")) if old.get("weight") is not None else None,
+            last_active_at=_ts_anchor(old.get("last_active_at"), field="last_active_at",
+                        sha=_entry_sha(entry)),
+            last_scan_at=_ts_anchor(old.get("last_scan_at"), field="last_scan_at",
+                             sha=_entry_sha(entry)),
+            cold_id=old.get("cold_id"),
+            type_override=(type_override or old.get("type_override")),
+            type_source=("manual_override" if type_override
+                         else old.get("type_source")),
+            protect_override=({"true": True, "false": False}[protect_override]
+                              if protect_override else old.get("protect_override")),
+            last_strong_hit_at=_ts_anchor(old.get("last_strong_hit_at"), field="last_strong_hit_at",
+                        sha=_entry_sha(entry)),
+            last_weak_hit_at=_ts_anchor(old.get("last_weak_hit_at"), field="last_weak_hit_at",
+                        sha=_entry_sha(entry)),
+            # FIX6 #5: 条件透传全部审计/写回字段, 不因人工标注重建 meta.
+            last_recall_hit_at=_ts_anchor(old.get("last_recall_hit_at"), field="last_recall_hit_at",
+                        sha=_entry_sha(entry)),
+            last_injected_at=_ts_anchor(old.get("last_injected_at"), field="last_injected_at",
+                        sha=_entry_sha(entry)),
+            last_evicted_at=_ts_anchor(old.get("last_evicted_at"), field="last_evicted_at",
+                        sha=_entry_sha(entry)),
+            writeback_count=(int(old["writeback_count"])
+                             if old.get("writeback_count") is not None else None),
+            retire_count=(int(old["retire_count"])
+                          if old.get("retire_count") is not None else None),
+            handle=old.get("handle"),
+            # P4 (FIX8): type_override 改型时显式清 ambiguous 审计键,
+            # 不能让 judge_review_at/judge_reviewed_at/judge_resolved_at
+            # 残留在新判型上 (旧 bug: quick-path 只清 judge_decision).
+            judge_review_at=(None if type_override else _ts_anchor(
+                old.get("judge_review_at"), field="judge_review_at",
+                sha=_entry_sha(entry), allow_future=True)),
+            judge_reviewed_at=(None if type_override else _ts_anchor(
+                old.get("judge_reviewed_at"), field="judge_reviewed_at",
+                sha=_entry_sha(entry))),
+            judge_resolved_at=(None if type_override else _ts_anchor(
+                old.get("judge_resolved_at"), field="judge_resolved_at",
+                sha=_entry_sha(entry))),
+            reconcile_anchor_fallback=old.get("reconcile_anchor_fallback"),
+            schema=2,
+            # SAFE-JUDGE v3: 人工标注优先; 写 override 时同步判型字段并清复审
+            judge_decision=(type_override or old.get("judge_decision")),
+            judge_band=("strong" if type_override
+                        else old.get("judge_band")),
+            judge_confidence=(1.0 if type_override
+                              else old.get("judge_confidence")),
+            judge_signals=old.get("judge_signals"),
+            judge_reason=("manual_override" if type_override
+                          else old.get("judge_reason")),
+            judge_policy=old.get("judge_policy", "v3"),
+            judge_review_count=(0 if type_override
+                                else old.get("judge_review_count")),
+            judge_resolution=("manual_override" if type_override
+                              else old.get("judge_resolution")),
+        )
+        new = ms.get_entry(entry) or {}
+        return json.dumps({
+            "status": "ok",
+            "target": target,
+            "entry": entry[:60],
+            "type_override": new.get("type_override"),
+            "protect_override": new.get("protect_override"),
+            "note": "只写 sidecar, .md 未修改; 下次溢流按标注接管",
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"status": "error", "detail": str(e)},
+                          ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +723,11 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
 
     w_eff = weight × 0.5^(距 last_active_at 天数 / 30) (惰性折现, 与退役排序
     同一口径); 列表按 w_eff 升序 = 超预算时最先被挤的退役顺序。
-    next_eviction_candidates = 若此刻超预算, 最先退役的至多 MAX_EVICT_PER_RUN 条
-    (仅供观测 — 实际挤权还受驻留期/词法活跃保护过滤, 以 enforce_rule_budget 为准)。
+    next_eviction_candidates = 直接调用生产 _select_retirement_candidates
+    得到的至多 MAX_EVICT_PER_RUN 条 (FIX8 统一池单一 rank; protected
+    只乘 ×3; 实际换出以 enforce_rule_budget 的冷层写成功为准)。
+    rules[].in_grace/grace_ts 为新鲜窗口只读审计; 新鲜窗口只影响 priority
+    里的 ×GRACE_MULT 排序乘数, 不再是资格/分档.
 
     Args:
         target: 'memory' | 'user' | 'both' (默认 memory)
@@ -441,23 +741,48 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
         ms = _metastore_for(t)
         rules = []
         rule_chars = 0
+        now = datetime.now(timezone.utc)
         for e in entries:
             m = ms.get_entry(e)
             if not m or m.get("type") != "rule":
                 continue
             rule_chars += len(e)
+            protected = _is_protected_rule(e, m)
+            _grace_ts = _soft_residency_grace_ts(m, now, entry=e)
             rules.append({
                 "text": e[:60],
                 "chars": len(e),
                 "weight": m.get("weight"),
-                "w_eff": round(_rule_weight_eff(m), 4),
+                "w_eff": round(_rule_weight_eff(m, now=now, entry=e), 4),
+                "priority": round(_rule_rank(e, m, now), 4),
                 "last_active_at": m.get("last_active_at"),
-                "age_days": entry_age_days(m),
-                "protected": _is_protected_rule(e, m),
+                "last_strong_hit_at": m.get("last_strong_hit_at"),
+                "last_weak_hit_at": m.get("last_weak_hit_at"),
+                "last_recall_hit_at": m.get("last_recall_hit_at"),
+                "last_evicted_at": m.get("last_evicted_at"),
+                "writeback_count": int(m.get("writeback_count") or 0),
+                "retire_count": int(m.get("retire_count") or 0),
+                "age_days": entry_age_days(m, now=now, entry=e),
+                "protected": protected,
+                "protected_mult": (WEIGHT_PROTECT_MULT if protected else 1.0),
                 "kw_sink": not should_keep_local(e),
+                # FIX8: 新鲜窗口只读审计; priority/next_eviction_candidates
+                # 都来自含 ×GRACE_MULT 的统一 rank, 实际换出以 enforce 为准。
+                "in_grace": _grace_ts is not None,
+                "grace_ts": _grace_ts.isoformat() if _grace_ts else None,
+                "reconcile_anchor_fallback": bool(
+                    m.get("reconcile_anchor_fallback")),
             })
-        rules.sort(key=lambda r: r["w_eff"])
+        rules.sort(key=lambda r: (r["priority"], r["w_eff"], r["text"]))
         w_effs = [r["w_eff"] for r in rules]
+        prs = [r["priority"] for r in rules]
+        try:
+            _next_need = max(1, rule_chars - RULE_BUDGET_CHARS)
+            _next_evict = [
+                _e[:60] for _e in _select_retirement_candidates(
+                    _store, ms, t, _next_need, {})]
+        except Exception:
+            _next_evict = []
         out[t] = {
             "summary": {
                 "rule_count": len(rules),
@@ -467,8 +792,12 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
                 "w_eff_min": round(min(w_effs), 4) if w_effs else None,
                 "w_eff_avg": round(sum(w_effs) / len(w_effs), 4) if w_effs else None,
                 "w_eff_max": round(max(w_effs), 4) if w_effs else None,
-                "next_eviction_candidates":
-                    [r["text"] for r in rules[:MAX_EVICT_PER_RUN]],
+                "priority_min": round(min(prs), 4) if prs else None,
+                "in_grace_count": sum(1 for r in rules if r["in_grace"]),
+                "ts_anomaly": _ts_anomaly_snapshot(),
+                # FIX6 #7: 不再用 priority 前 N 冒充选择器; 直接复用生产
+                # 统一候选池单一 rank, 审计与实际淘汰顺序一致.
+                "next_eviction_candidates": _next_evict,
             },
             "rules": rules,
         }
@@ -480,33 +809,82 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def memorycore_recall(query: str, top_k: int = 3) -> str:
-    """主动召回冷层记忆 (只读, 补足 prefetch 每轮 top-3 之外的手动查询能力)。
+def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
+    """主动召回冷层记忆 (只读, 不写冷层/不 remember/update/forget)。
 
-    结果经冷层降权重排: final_score = base_score × 0.5^(days/90),
-    importance≥0.8 不降权。
+    支持 CACHE-POLICY-V2 的句柄直查: 传入 handle 时先用本地 stub 目录定位
+    cold_id, 再按 stub 主题召回并标注 page_fault/channel; 常规 query 保留冷层
+    降权重排。冷层读取统一 bump=False (只读)。
 
     Args:
         query: 查询内容 (自然语言, 语义召回)
         top_k: 返回条数 (默认 3, 最大 10)
+        handle: 可选本地 stub 句柄 (来自常驻目录 [#xxxx]); 提供时绕过 0.48
     Returns:
-        JSON: {"results": [{"id": ..., "content": ..., "final_score": ...}]}
+        JSON: {"results": [...], "handle": ..., "page_fault": bool}
               冷层不可达时 {"error": "..."}
     """
     try:
         k = max(1, min(int(top_k), 10))
-        log_activity_query(query)  # Phase 3 S4: 主题活性采集 (失败静默, 可配置关)
-        results = _client.recall_results(query, top_k=k)
+        handle = (handle or "").strip()
+        handle_map = {}
+        for _t in ("memory", "user"):
+            for _e in _store.entries(_t):
+                _m = _metastore_for(_t).get_entry(_e) or {}
+                if _m.get("type") == "stub" and _m.get("cold_id"):
+                    _h = _m.get("handle") or ""
+                    if _h:
+                        handle_map[_h] = {"target": _t, "stub": _e, "meta": _m}
+        q = (query or "").strip()
+        if handle:
+            hit = handle_map.get(handle)
+            if not hit:
+                return json.dumps({"error": f"handle not found: {handle}",
+                                   "handle": handle}, ensure_ascii=False)
+            q = _stub_topic(hit["stub"]) or q
+        if q:
+            log_activity_query(q)
+        if not q:
+            return json.dumps({"results": [], "handle": handle,
+                               "page_fault": False}, ensure_ascii=False)
+        results = _client.recall_results(q, top_k=k, bump=False)
         results = _apply_decay(results)
+        # page_fault 标注: 结果命中本地任一 stub 的 cold_id 即为缺页写回候选。
+        stub_ids = {}
+        for _t, _ms in (("memory", _metastore_for("memory")),
+                        ("user", _metastore_for("user"))):
+            for _e in _store.entries(_t):
+                _m = _ms.get_entry(_e) or {}
+                if _m.get("type") == "stub" and _m.get("cold_id"):
+                    stub_ids[_m["cold_id"]] = _m.get("handle") or ""
+        for _r in results:
+            _cid = _r.get("id")
+            _r["page_fault"] = bool(_cid in stub_ids)
+            _r["channel"] = "H" if (handle and hit and _cid == hit["meta"].get("cold_id")) else "S"
+            if _cid in stub_ids:
+                _r["handle"] = stub_ids[_cid]
         # Phase 4: 召回结果命中 stub 的 cold_id → 自动恢复全文到热层
         try:
             results = restore_stubs_from_results(
                 _store, {t: _metastore_for(t) for t in ("memory", "user")}, results)
         except Exception:
             pass  # 恢复失败不影响召回返回
-        return json.dumps({"results": results}, ensure_ascii=False)
+        return json.dumps({"results": results, "handle": handle,
+                           "page_fault": bool(handle),
+                           "mode": "handle" if handle else "semantic"},
+                          ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+def __getattr__(name: str):
+    """兼容旧 Python 属性名 (运行时拼装, 发布树不落地旧 token).
+
+    MCP 工具名同样由 _STORE_FACT_LEGACY_TOOL 显式保留, 调用方行为不变。
+    """
+    if name == _STORE_FACT_LEGACY_TOOL:
+        return memorycore_store_entry
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":

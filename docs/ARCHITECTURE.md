@@ -13,15 +13,46 @@ The value is in the *policing*: keeping hot memory small enough to stay inside t
 
 ```
 memorycore/
-├── server.py            # MCP server; 4 tools; routing + capacity gates
+├── server.py            # MCP server; routing + capacity gates + audit tools
 ├── local_store.py       # hot tier: char-counted sectioned file store, atomic lock
 ├── cold_store_client.py # cold tier: MCP streamable-http client (5 tools)
 └── core/
     ├── config.py        # thresholds, paths, URL, timeouts (env-overridable)
-    ├── classifier.py    # cold/hot/stale routing rules
-    ├── overflow.py      # six-step overflow pipeline
+    ├── classifier.py    # cold/hot/stale routing rules (+ SAFE-JUDGE wrappers)
+    ├── judge.py         # SAFE-JUDGE v3: deterministic rule/state/ambiguous
+    ├── overflow.py      # six-step overflow + unified cache-policy budget selector
+    ├── metadata.py      # sidecar metadata, judge audit fields, _ts_anchor
     └── maintenance.py   # cold-tier governance pass
 ```
+
+## Cache policy V2 and SAFE-JUDGE v3 (2026-09-13)
+
+The hot tier is modelled as a cache.  Typed content is not split into
+separate eviction ladders; `rule`, `state` and pointer `stub` entries share
+one candidate pool ordered by a single rank:
+
+```
+priority = w_eff × protected(×3.0) × kw_sink(×0.5) × freshness(×9.0)
+```
+
+where freshness applies when `written_at` / `last_recall_hit_at` is inside
+`RULE_MIN_RESIDENCY_DAYS=7` (timestamps go through `metadata._ts_anchor`).
+`RULE_BUDGET_CHARS=2000` equals the overflow target 40% of the 5000-char
+limit.  Eviction is cold-write-first and bounded by `MAX_EVICT_PER_RUN=3`.
+Normal eviction leaves a ≤40-char pointer stub with a `cold_id`; recall by
+`handle` performs a direct lookup and marks `page_fault=true`, feeding the
+write-back path.  With an explicit zero pointer budget the full text is
+written to the cold tier and the local text is removed without a pointer.
+
+SAFE-JUDGE v3 (`core/judge.py`) replaces lexical double-classification with
+a deterministic ternary verdict.  `rule` stays hot, `state` migrates cold
+(cold-write-first), and `ambiguous` is forced hot with a recorded review
+deadline (first review +7d, `JUDGE_AMBIGUOUS_LRU_DAYS=21` pointer fallback,
+max 2 reviews).  Synchronous typing uses zero LLM; only weekly maintenance
+may spend a recorded LLM finalisation.  Rollback switches are documented in
+`README.md` (`MEMORYCORE_CACHE_POLICY_V2=0`, `RULE_MIN_RESIDENCY_DAYS<=0`,
+`GRACE_MULT<=0`, `MEMORYCORE_JUDGE_V3_ENABLED=0`,
+`MEMORYCORE_JUDGE_AMBIGUOUS_HOLD=0`).
 
 ## Data Flow
 

@@ -2,7 +2,7 @@
 """tests/test_e_visible.py — E 节静默降级治理回归测试 (Phase 5)
 
 原则: 降级可以, 但必须可见 (计数 / 日志 / 报告字段 / 该失败就失败)。
-覆盖: E3 回收站写失败计数+阻断删除 / E4 活性扫描失败计数 /
+覆盖: E3 回收队列写失败计数+阻断删除 / E4 活性扫描失败计数 /
       E5 merge 路径嵌入失败对齐 embed_fail / E8 env 开关惰性解析。
 """
 import pytest
@@ -13,10 +13,10 @@ from memorycore.core import metadata as meta_mod  # noqa: E402
 from conftest import MockMnemosyneClient  # noqa: E402
 
 
-# ---- E3: 回收站写失败 → 计数 + 不许继续删源 --------------------------------
+# ---- E3: 回收队列写失败 → 计数 + 不许继续删源 --------------------------------
 
 def test_e3_trash_add_failure_blocks_forget():
-    """回收站写失败 → forget 不得执行 (可恢复性保护), stat["trash_fail"] 计数。"""
+    """回收队列写失败 → forget 不得执行 (可恢复性保护), stat["trash_fail"] 计数。"""
     from memorycore.core import maintenance as maint
 
     class FailingTrash:
@@ -42,7 +42,7 @@ def test_e3_trash_add_failure_blocks_forget():
     forgotten, errors = maint._forget_decayed(client, entries,
                                               trash=FailingTrash(), stat=stat)
     assert forgotten == 0
-    assert client.forgotten == [], "回收站写失败时不许 forget (删源被阻断)"
+    assert client.forgotten == [], "回收队列写失败时不许 forget (删源被阻断)"
     assert stat["trash_fail"] == 1
 
 
@@ -62,7 +62,7 @@ def test_e3_add_observed_helper(tmp_path):
     # 真实写失败场景 (终审低危修复): 原断言传 str 路径, 靠 str 无 with_suffix
     # 的 AttributeError 巧合通过 — 触发方式非预期且语义失真 (并在 /tmp 留垃圾)。
     # 现改为: 父路径是普通文件 → lock 文件 mkdir 抛 FileExistsError (真 OSError),
-    # 触发"回收站磁盘写失败"预期语义; tmp_path 自动清理。
+    # 触发"回收队列磁盘写失败"预期语义; tmp_path 自动清理。
     blocker = tmp_path / "blocker"
     blocker.write_text("not a dir")
     ok_stat = {}
@@ -72,7 +72,7 @@ def test_e3_add_observed_helper(tmp_path):
 
 
 def test_e3_merge_duplicates_reversal_trash_first(monkeypatch):
-    """终审 R1 回归: 规则反转分支必须回收站先写成功才许 forget — 写失败 →
+    """终审 R1 回归: 规则反转分支必须回收队列先写成功才许 forget — 写失败 →
     计数 stat["trash_fail"] + 阻断删除 (不再出现先删后备份)。"""
     from memorycore.core import maintenance as maint
     from memorycore.trash_store import TrashStore, add_observed
@@ -94,13 +94,13 @@ def test_e3_merge_duplicates_reversal_trash_first(monkeypatch):
     merged, _, rev, _, to_forget = maint._merge_duplicates(client, entries, stat)
     assert merged == 0
     assert rev == 0
-    assert client.forgotten == [], "回收站写失败时反转分支不许 forget (先删后备份禁止)"
+    assert client.forgotten == [], "回收队列写失败时反转分支不许 forget (先删后备份禁止)"
     assert not to_forget, "写失败时不得标记已删 (下轮应重试)"
     assert stat["trash_fail"] == 1
 
 
 def test_e3_merge_duplicates_hashdedup_trash_failure_blocks_forget(monkeypatch):
-    """终审 R2 回归: hash-dedup 分支回收站写失败 → add_observed 计数 + 阻断
+    """终审 R2 回归: hash-dedup 分支回收队列写失败 → add_observed 计数 + 阻断
     forget (victim 保留, 下轮重试; 原裸 add 零计数零告警)。"""
     from memorycore.core import maintenance as maint
     from memorycore.trash_store import TrashStore, add_observed
@@ -118,7 +118,7 @@ def test_e3_merge_duplicates_hashdedup_trash_failure_blocks_forget(monkeypatch):
                             OSError("disk full (mock)")))
     merged, _, rev, _, to_forget = maint._merge_duplicates(client, entries, stat)
     assert merged == 0
-    assert client.forgotten == [], "回收站写失败时 hash-dedup 不许 forget"
+    assert client.forgotten == [], "回收队列写失败时 hash-dedup 不许 forget"
     assert not to_forget, "写失败时不得标记已删 (下轮应重试)"
     assert stat["trash_fail"] == 1
 
@@ -192,7 +192,7 @@ def test_trash_cycle_expiry_remove_write_failure_counted(monkeypatch, tmp_path,
                                                          caplog):
     """L1: 到期清空 remove 写失败 → 计数 stat["trash_fail"] + 可见告警, 不上抛
     中断整轮治理; 记录保留 (原子写失败=文件未动), 下轮重试成功才计 cleared。"""
-    import memorycore.trash_store as ts_mod
+    from memorycore import trash_store as ts_mod
     from memorycore.trash_store import TrashStore
     from memorycore.core import maintenance as maint
 
@@ -246,7 +246,7 @@ def test_trash_cycle_revive_remove_write_failure_counted(monkeypatch, tmp_path,
                                                          caplog):
     """L1: 召回恢复路径 remove 写失败 → 计数 + 可见告警, 记录保留 (冷层条目
     本就未 forget, 零不一致), 下轮 recall 重判重试。"""
-    import memorycore.trash_store as ts_mod
+    from memorycore import trash_store as ts_mod
     from memorycore.trash_store import TrashStore
     from memorycore.core import maintenance as maint
 
@@ -279,7 +279,7 @@ def test_trash_cycle_revive_remove_write_failure_counted(monkeypatch, tmp_path,
 def test_trash_cycle_remove_false_counted(monkeypatch, tmp_path, caplog):
     """L3: remove 返回 False (条目不在站) → 计数 + 可见告警, 返回值不再被
     静默忽略 (同口径可见化)。"""
-    import memorycore.trash_store as ts_mod
+    from memorycore import trash_store as ts_mod
     from memorycore.trash_store import TrashStore
     from memorycore.core import maintenance as maint
 
@@ -294,7 +294,7 @@ def test_trash_cycle_remove_false_counted(monkeypatch, tmp_path, caplog):
             self.forgotten.append(mid)
 
     client = Client()
-    # 回收站为空 + get_expired 返回幽灵条目 → remove 必然 False
+    # 回收队列为空 + get_expired 返回幽灵条目 → remove 必然 False
     monkeypatch.setattr(TrashStore, "get_expired",
                         lambda self: [{"memory_id": "ghost"}])
     stat = {}
@@ -343,6 +343,8 @@ def test_overflow_rotation_no_starvation(tmp_store, mock_client, monkeypatch,
     llm_config.invalidate_cache()
     # 隔离环境嵌入服务 (有 ollama 时条目会被语义聚类合并, 场景失真)
     monkeypatch.setattr(ov_mod, "_embed_batch", lambda texts: None)
+    # CACHE-POLICY-V2: 本用例只测 LLM 轮转; 隔离统一预算换出, 防挤压候选数。
+    monkeypatch.setattr(ov_mod, "enforce_rule_budget", lambda *a, **k: None)
 
     attempted = []
 

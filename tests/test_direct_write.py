@@ -33,6 +33,33 @@ def test_direct_write_rule_stamped(tmp_store, mock_client, meta_for):
     assert mock_client.stored == [] and mock_client.recall_queries == []
 
 
+def test_direct_write_v2_completion_state_migrated(tmp_store, mock_client, meta_for):
+    """v2 (2026-09-12): 新完成态样例 (已部署/闭环交付) → state → migrated_new。"""
+    entry = f"{days_ago_str(1)} demo-host 已部署 巡检脚本 每周自动更新, 四轮闭环交付"
+    tmp_store.add("memory", entry)
+    r = direct_write_govern(tmp_store, mock_client, "memory", entry, action="add")
+    assert r["status"] == "migrated_new", r
+    assert entry not in tmp_store.entries("memory")
+    assert entry in mock_client.stored
+
+
+def test_direct_write_type_hint_passthrough(tmp_store, mock_client, meta_for):
+    """type_hint 透传: type_override=rule 强制留热层; =state 强制冷迁移。"""
+    like_state = f"{days_ago_str(1)} 拍板: 方案定稿"
+    tmp_store.add("memory", like_state)
+    r = direct_write_govern(tmp_store, mock_client, "memory", like_state,
+                            action="add", type_hint="rule")
+    assert r["status"] == "stamped_rule", r
+    assert like_state in tmp_store.entries("memory")
+    assert meta_for("memory").get_entry(like_state)["type"] == "rule"
+    like_rule = "行为准则: 每次先确认再执行"
+    tmp_store.add("memory", like_rule)
+    r2 = direct_write_govern(tmp_store, mock_client, "memory", like_rule,
+                             action="add", type_hint="state")
+    assert r2["status"] == "migrated_new", r2
+    assert like_rule not in tmp_store.entries("memory")
+
+
 def test_direct_write_cold_fail_keeps_hot(tmp_store, meta_for):
     """冷层失败 → 热层保留 + 盖章 state 兜底 (7 天到期由溢流退役)。"""
     entry = f"{days_ago_str(0)} 拍板: 方案定稿"
@@ -63,9 +90,8 @@ def test_on_memory_write_hook(tmp_store):
     _run_govern_bg stub 记录调用 (治理逻辑本身已由上面用例覆盖),
     验证: add/replace 触发治理, remove 不触发, 阈值检查用隔离 store。
     """
-    plugin_path = (Path(__file__).resolve().parent.parent
-               / "hermes-plugin" / "memorycore-prefetch" / "__init__.py")
-    spec = importlib.util.spec_from_file_location("memorycore_prefetch_smoke",
+    from conftest import PLUGIN_PATH as plugin_path  # release layout: hermes-plugin/memorycore-prefetch
+    spec = importlib.util.spec_from_file_location("memorycore_prefetch_direct_write",
                                                   plugin_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -74,7 +100,7 @@ def test_on_memory_write_hook(tmp_store):
         pass
 
     mod.LocalStore = lambda: tmp_store      # 阈值检查隔离 (0% 占用 → 不溢流)
-    mod.MnemosyneClient = lambda *a, **k: MockMnemosyneClient()
+    mod.ColdStoreClient = lambda *a, **k: MockMnemosyneClient()
 
     provider = mod.MemoryCorePrefetchProvider()
     govern_calls = []

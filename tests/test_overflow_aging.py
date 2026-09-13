@@ -18,17 +18,19 @@ def _run(store, client, target="memory"):
     return run_overflow(store, client, target)
 
 
-def test_state_entry_expires_and_sinks(tmp_store, mock_client, meta_for):
-    """state 条目 8 天前 → 溢流下沉冷层, 本地删除, aged_sunk 计数。"""
+def test_state_entry_not_sunk_by_age_without_budget(tmp_store, mock_client,
+                                                   meta_for):
+    """CACHE-POLICY-V2: state 无 TTL 直接换出分支; 低占用下保留热层。
+
+    必须能换出 ≠ 到龄自动换出; 换出统一由活性+预算决定 (预算测试另测)。
+    """
     entry = f"{days_ago_str(8)} 拍板: GPU 压测方案定稿, 不再更换方案"
     tmp_store.add("memory", entry)
     stat = _run(tmp_store, mock_client)
     ents = tmp_store.entries("memory")
-    assert entry not in ents, "8 天 state 条目应离开热层"
-    assert stat["aged_sunk"] == 1
-    assert stat["overflowed"] == 1
-    assert entry in mock_client.stored, "冷层必须先写成功"
-    assert meta_for("memory").get_entry(entry) is not None or True  # 孤儿键下次 GC
+    assert entry in ents, "无预算压力时 state 不再因 TTL 自动冷迁"
+    assert stat["aged_sunk"] == 0
+    assert mock_client.stored == []
 
 
 def test_state_entry_not_expired_stays(tmp_store, mock_client):
@@ -76,15 +78,39 @@ def test_legacy_migration(tmp_store, mock_client, meta_for):
     assert stat2["metadata_stamped"] == 0
 
 
-def test_cold_failure_keeps_source(tmp_store):
-    """冷层写入失败 → 源条目保留不删, errors 累计, 不丢数据。"""
+def test_legacy_v2_completion_words_stamped_state(tmp_store, mock_client, meta_for):
+    """v2 (2026-09-12): 新完成态词 (已部署/决定不做) 的 legacy 条目补盖为 state。"""
+    e1 = f"{days_ago_str(3)} demo-host 已部署 巡检脚本 每周自动更新"
+    e2 = f"{days_ago_str(3)} 调研: 无现成方案, 决定不做"
+    for e in (e1, e2):
+        tmp_store.add("memory", e)
+    stat = _run(tmp_store, mock_client)
+    assert stat["metadata_stamped"] == 2
+    m = meta_for("memory")
+    assert m.get_entry(e1)["type"] == "state", "已部署 → v2 补盖 state"
+    assert m.get_entry(e2)["type"] == "state", "决定不做 → v2 补盖 state"
+    assert m.get_entry(e1).get("type_source") == "judge_v3", \
+        "reconcile 标注判型来源: v3 生效时必须是 judge_v3 (不放宽断言)"
+    # 未到 TTL (3 天) → 仍留热层 (state TTL 路径不变)
+    assert e1 in tmp_store.entries("memory") and e2 in tmp_store.entries("memory")
+
+
+def test_cold_failure_keeps_source(tmp_store, meta_for):
+    """冷层写失败 → 统一预算路径源条目保留不删, errors/cold_errors 累计。"""
     from conftest import MockMnemosyneClient
+    from memorycore.core.config import RULE_BUDGET_CHARS
+    from datetime import datetime, timezone
     entry = f"{days_ago_str(8)} 拍板: GPU 压测方案定稿, 不再更换方案"
     tmp_store.add("memory", entry)
+    filler = "填充甲" + "乙" * (RULE_BUDGET_CHARS + 100)
+    tmp_store.add("memory", filler)
+    meta_for("memory").stamp(filler, "rule", weight=0.1,
+                             updated_at=datetime.now(timezone.utc))
     bad = MockMnemosyneClient(fail_remember=True)
     stat = _run(tmp_store, bad)
-    assert entry in tmp_store.entries("memory"), "冷层失败必须保留源"
-    assert stat["errors"] >= 1
+    ents = tmp_store.entries("memory")
+    assert entry in ents and filler in ents, "冷层失败必须保留源 (零删除)"
+    assert stat["errors"] >= 1 and stat["cold_errors"] >= 1
     assert stat["aged_sunk"] == 0
 
 
@@ -129,3 +155,18 @@ def test_rule_compress_cold_fail_keeps_original(tmp_store, mock_client, monkeypa
     stat = _run(tmp_store, bad)
     assert entry in tmp_store.entries("memory"), "冷层失败保留原条目"
     assert stat["errors"] >= 1
+
+
+def test_plateau_cold_backstop_reported(tmp_store, meta_for):
+    """Q6 (G-1): 冷层不可达且 usage>40% → plateau_reason=cold_backstop。"""
+    from conftest import MockMnemosyneClient
+    entry = "历史记录: " + "细节" * 1300
+    assert len(entry) > 2000, "需超过 40% 水位 (5000*0.4)"
+    tmp_store.add("memory", entry)
+    meta_for("memory").stamp(entry, "rule", type_override="state")
+    assert tmp_store.usage_pct("memory") > 40
+    bad = MockMnemosyneClient(fail_recall=True)
+    stat = _run(tmp_store, bad)
+    assert stat["cold_errors"] >= 1, stat
+    assert stat["plateau_reason"] == "cold_backstop", stat
+    assert entry in tmp_store.entries("memory"), "冷层失败必须保留源"

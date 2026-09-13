@@ -466,7 +466,7 @@ def test_chat_timeout():
 def _run_check(argv):
     import io
     from contextlib import redirect_stdout
-    from memorycore import llm_check
+    from memorycore.core import llm_check
     buf = io.StringIO()
     with redirect_stdout(buf):
         try:
@@ -477,7 +477,7 @@ def _run_check(argv):
 
 
 def test_llm_check_unconfigured_zero_network(monkeypatch, capsys):
-    from memorycore import llm_check
+    from memorycore.core import llm_check
     rc = llm_check.main(["--json"])
     out = capsys.readouterr().out
     assert rc == 1
@@ -526,7 +526,7 @@ def test_llm_check_live_auth_failed(monkeypatch):
 
 
 def test_llm_check_help_has_billing_note(capsys):
-    from memorycore import llm_check
+    from memorycore.core import llm_check
     with pytest.raises(SystemExit) as ei:
         llm_check.main(["--help"])
     assert ei.value.code == 0

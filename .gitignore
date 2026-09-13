@@ -18,3 +18,6 @@ trash.json.lock
 
 # macOS AppleDouble (samba 挂载写入产物)
 ._*
+
+# R2: generated residency report (source tree must stay clean)
+tools/residency_dryrun.json

@@ -41,8 +41,8 @@ def test_audit_marks_low_weight_inactive_rule(tmp_store, mock_client, meta_for):
     assert r["memory"]["lru_sink_candidates"] == 1
 
 
-def test_audit_protected_not_marked(tmp_store, mock_client, meta_for):
-    """protected (红线类) 低权重+久远 → 不标 sink_candidate (保护线不误伤)。"""
+def test_audit_protected_is_evictable_not_immune(tmp_store, mock_client, meta_for):
+    """CACHE-POLICY-V2 Q5: protected 低权重+久远 → 仍可作预算候选 (×3 非豁免)。"""
     _patch_server(tmp_store, mock_client)
     old = datetime.now(timezone.utc) - timedelta(days=45)
     e1 = "红线: 绝不向用户隐藏事实, 零容忍。"
@@ -51,8 +51,11 @@ def test_audit_protected_not_marked(tmp_store, mock_client, meta_for):
                              last_active_at=old)
     r = json.loads(server.memorycore_memory_audit("memory"))
     row = r["memory"]["rows"][0]
-    assert row.get("sink_candidate") is not True, row
-    assert r["memory"]["lru_sink_candidates"] == 0
+    assert row["protected"] is True
+    assert row["protected_mult"] == 3.0
+    assert row["lru_eligible"] is True
+    assert row.get("sink_candidate") is True
+    assert r["memory"]["lru_sink_candidates"] == 1
 
 
 def test_audit_high_weight_or_recent_not_marked(tmp_store, mock_client, meta_for):
@@ -84,3 +87,85 @@ def test_audit_existing_fields_intact(tmp_store, mock_client, meta_for):
     assert "keep" in row and "plan" in row
     assert "weight" in row and "w_eff" in row and "last_active_at" in row
     assert "rule_chars" in r["memory"] and "rule_budget" in r["memory"]
+
+
+def test_audit_v2_tier_fields(tmp_store, mock_client, meta_for):
+    """v2 (2026-09-12): audit 增补 type_source/activity_tier/min_retire_age/lru_eligible。"""
+    from datetime import datetime, timedelta, timezone
+    _patch_server(tmp_store, mock_client)
+    now = datetime.now(timezone.utc)
+    # idle 规则: 40 天无命中 → idle / min 7 / eligible
+    e1 = "规则甲: 早期技术方案记录。"
+    tmp_store.add("memory", e1)
+    meta_for("memory").stamp(e1, "rule",
+                             updated_at=now - timedelta(days=40),
+                             type_source="lexical_v2")
+    # active 规则: 昨天强命中 → active / min 30 / 40 天年龄 ≥ 30 eligible
+    e2 = "规则乙: 近期活跃规则。"
+    tmp_store.add("memory", e2)
+    meta_for("memory").stamp(e2, "rule",
+                             updated_at=now - timedelta(days=40),
+                             last_strong_hit_at=now - timedelta(days=1))
+    r = json.loads(server.memorycore_memory_audit("memory"))
+    rows = {row["text"]: row for row in r["memory"]["rows"]}
+    r1 = rows[e1[:40]]
+    assert r1["type_source"] == "lexical_v2"
+    assert r1["activity_tier"] == "idle" and r1["min_retire_age"] == 7
+    assert r1["lru_eligible"] is True
+    r2 = rows[e2[:40]]
+    assert r2["activity_tier"] == "active" and r2["min_retire_age"] == 30
+    assert r2["lru_eligible"] is True
+
+
+def test_audit_rule_with_override_state_is_evictable(tmp_store, mock_client,
+                                                    meta_for):
+    """CACHE-POLICY-V2: manual state override 不再 S0 直迁; 同池可由预算换出。"""
+    _patch_server(tmp_store, mock_client)
+    e = "规则甲: 早期技术方案记录。"
+    tmp_store.add("memory", e)
+    meta_for("memory").stamp(e, "rule", type_override="state",
+                             type_source="manual_override")
+    r = json.loads(server.memorycore_memory_audit("memory"))
+    row = r["memory"]["rows"][0]
+    assert row["keep"] is True, row
+    assert "evictable_by_budget" in row["plan"], row
+    assert row["lru_eligible"] is True, row
+    assert "priority" in row and "protected_mult" in row
+
+
+# ---- SAFE-JUDGE v3: audit 可见 ambiguous 字段与 A0 plan ----------------------
+
+def test_audit_shows_ambiguous_hold_fields(tmp_store, mock_client, meta_for):
+    """ambiguous: audit 行含 judge_decision/review_at, plan=hold_ambiguous。"""
+    _patch_server(tmp_store, mock_client)
+    from datetime import timedelta
+    e = "已通知用户验收结果"
+    tmp_store.add("memory", e)
+    meta_for("memory").stamp(
+        e, "rule", judge_decision="ambiguous", judge_band="ambiguous",
+        judge_confidence=0.5, judge_signals={"state": ["perfect"]},
+        judge_reason="completed_state_without_date_anchor",
+        judge_review_at=datetime.now(timezone.utc) + timedelta(days=7),
+        judge_review_count=0, judge_policy="v3")
+    r = json.loads(server.memorycore_memory_audit("memory"))
+    row = r["memory"]["rows"][0]
+    assert row["judge_decision"] == "ambiguous"
+    assert row["judge_review_at"]
+    assert row["plan"].startswith("evictable_by_budget"), row
+    assert row["lru_eligible"] is True
+    assert row["keep"] is True
+
+
+def test_audit_shows_a1_stub_eligible(tmp_store, mock_client, meta_for):
+    """A1 ambiguous: audit plan=stub_eligible_ambiguous, 仍留热层指针前态。"""
+    _patch_server(tmp_store, mock_client)
+    e = "已通知用户验收结果"
+    tmp_store.add("memory", e)
+    meta_for("memory").stamp(
+        e, "rule", judge_decision="ambiguous", judge_band="ambiguous",
+        judge_review_count=2, judge_policy="v3")
+    r = json.loads(server.memorycore_memory_audit("memory"))
+    row = r["memory"]["rows"][0]
+    assert row["plan"].startswith("evictable_by_budget"), row
+    assert row["lru_eligible"] is True
+    assert row["keep"] is True

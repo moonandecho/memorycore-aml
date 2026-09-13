@@ -156,7 +156,7 @@ A global statistical baseline is robust to per-query outliers.
 
 ### 交叉编码器 reranker 验证（调研记录; 生产版已退役）
 
-> ⚠️ 2026-08-04 用户拍板: reranker 路线不再启用（生产版与开源版均不采用），
+> ⚠️ 2026-08-04 设计定稿: reranker 路线不再启用（生产版与开源版均不采用），
 > llama-rerank.service 已退役归档。本节为当时调研与验证记录, 保留供参考。
 
 生产版曾采用 **reranker 二阶段**方案替代固定阈值（2026-08-04 退役）:

@@ -87,32 +87,57 @@ def _run_tidy(tmp_store, client, target="memory", dry=False):
     return stat
 
 
-# ---- ① 活性豁免 ----------------------------------------------------------
+# ---- ① 活性分级豁免 (Q2 口径, 2026-09-12) -----------------------------------
 
-def test_lexical_activity_exempt(tmp_store, mock_client, meta_for, tmp_path,
-                                 monkeypatch):
-    """近 7 天查询 sb≥2 词法命中 → 不沉 (与 LRU 挤权同口径), LLM 确认不被调用。"""
-    e = _add_candidate(tmp_store, meta_for)
+def test_lexical_activity_warm_tier_exempt(tmp_store, mock_client, meta_for,
+                                           tmp_path, monkeypatch):
+    """近 7 天查询 sb≥2 词法命中 → warm 级 (14 天门槛):
+    年龄 10 天 (<14) → 不沉; LLM 确认不被调用。"""
+    e = _add_candidate(tmp_store, meta_for, days_ago=10)
     _add_fillers(tmp_store)
     meta_mod.log_activity_query("打印机怎么设置双面打印")  # sb=2: 打印/印机
     calls = []
     _confirm_true(monkeypatch, calls)
     stat = _run_tidy(tmp_store, mock_client)
-    assert e in tmp_store.entries("memory"), "词法活跃条目不应被沉"
+    assert e in tmp_store.entries("memory"), "warm 级门槛内 (10d<14d) 不应被沉"
     assert stat["sunk"] == 0 and stat["errors"] == 0
-    assert calls == [], "词法豁免应在 LLM 确认之前生效"
+    assert calls == [], "活性豁免应在 LLM 确认之前生效"
     assert mock_client.stored == []
 
 
-def test_fresh_last_active_at_exempt(tmp_store, mock_client, meta_for,
-                                     monkeypatch):
-    """last_active_at 新鲜 (<7 天) → 不沉。"""
-    e = _add_candidate(tmp_store, meta_for, last_active_days=2)
+def test_lexical_activity_warm_over_threshold_sinks(tmp_store, mock_client,
+                                                    meta_for, tmp_path,
+                                                    monkeypatch):
+    """词法活跃不再一票豁免: warm 级年龄 30 天 (≥14) → 照常候选下沉。"""
+    e = _add_candidate(tmp_store, meta_for, days_ago=30)
+    _add_fillers(tmp_store)
+    meta_mod.log_activity_query("打印机怎么设置双面打印")
+    calls = []
+    _confirm_true(monkeypatch, calls)
+    stat = _run_tidy(tmp_store, mock_client)
+    assert e not in tmp_store.entries("memory"), "warm 级超门槛 (30d≥14d) 应下沉"
+    assert stat["sunk"] == 1
+
+
+def test_fresh_strong_hit_active_tier_exempt(tmp_store, mock_client, meta_for,
+                                             monkeypatch):
+    """近 7 天强语义命中 (last_strong_hit_at) → active 级 (30 天门槛) → 不沉。
+
+    v2: 旧 "last_active_at 新鲜 → 豁免" 语义已废弃 (弱活性不豁免),
+    分级输入改为 last_strong_hit_at。
+    """
+    from datetime import datetime, timedelta, timezone
+    e = _add_candidate(tmp_store, meta_for, days_ago=20)
+    meta_for("memory").stamp(e, "state",
+                             written_at=datetime.now(timezone.utc)
+                             - timedelta(days=20),
+                             last_strong_hit_at=datetime.now(timezone.utc)
+                             - timedelta(days=1))
     _add_fillers(tmp_store)
     calls = []
     _confirm_true(monkeypatch, calls)
     stat = _run_tidy(tmp_store, mock_client)
-    assert e in tmp_store.entries("memory"), "新鲜活性条目不应被沉"
+    assert e in tmp_store.entries("memory"), "active 级门槛内 (20d<30d) 不应被沉"
     assert stat["sunk"] == 0
     assert calls == [], "活性豁免应在 LLM 确认之前生效"
 
@@ -388,3 +413,92 @@ def test_hot_floor_entries_le3_not_drained(tmp_store, meta_for, monkeypatch):
     assert calls == [], "保底判定在 LLM 之前"
     assert len(tmp_store.entries("memory")) == 3, "热层保底不掏空"
     assert client.stored == []
+
+
+# ---- ⑨ SAFE-JUDGE v3 ambiguous 终审三分支 (B-4) ------------------------------
+
+def _add_ambiguous(tmp_store, meta_for, text=None, updated_days=0,
+                   review_count=0, review_due_days=-1, importance=0.8):
+    """加一条 judge_decision=ambiguous 的热层条目 + sidecar 字段。"""
+    if text is None:
+        text = "已通知用户验收结果"
+    tmp_store.add("memory", text)
+    now = datetime.now(timezone.utc)
+    meta_for("memory").stamp(
+        text, "rule",
+        updated_at=now - timedelta(days=updated_days),
+        last_active_at=now - timedelta(days=updated_days),
+        importance=importance,
+        judge_decision="ambiguous",
+        judge_band="ambiguous",
+        judge_confidence=0.5,
+        judge_signals={"has_date": False, "state": ["perfect"]},
+        judge_reason="test_ambiguous",
+        judge_review_at=now + timedelta(days=review_due_days),
+        judge_review_count=review_count,
+        judge_policy="v3",
+        schema=2,
+    )
+    return text
+
+
+def test_tidy_ambiguous_llm_state_sinks_hot(tmp_store, mock_client, meta_for,
+                                            monkeypatch):
+    """到期复审 + LLM 判 state → 冷层写成功才删本地。"""
+    e = _add_ambiguous(tmp_store, meta_for, text="已通知用户验收结果")
+    monkeypatch.setattr(wm, "_llm_review_ambiguous", lambda entry, meta: "state")
+    stat = _stat()
+    wm.smart_tidy(tmp_store, mock_client, "memory", stat, dry=False)
+    assert e not in tmp_store.entries("memory")
+    assert e in mock_client.stored and stat["sunk"] == 1
+    assert stat["ambiguous_sunk"] == 1
+
+
+def test_tidy_ambiguous_llm_rule_clears_hold_grace(tmp_store, mock_client,
+                                                   meta_for, monkeypatch):
+    """到期复审 + LLM 判 rule → 清 ambiguous + 14d grace, 条目留热层。"""
+    e = _add_ambiguous(tmp_store, meta_for, text="恢复.xsession 的完整步骤?")
+    monkeypatch.setattr(wm, "_llm_review_ambiguous", lambda entry, meta: "rule")
+    stat = _stat()
+    wm.smart_tidy(tmp_store, mock_client, "memory", stat, dry=False)
+    assert e in tmp_store.entries("memory")
+    m = meta_for("memory").get_entry(e)
+    assert m["judge_resolution"] == "rule" and "judge_review_at" not in m
+    assert m["judge_resolved_at"] and m["judge_review_count"] == 1
+    assert stat["ambiguous_resolved_rule"] == 1
+    assert mock_client.stored == []
+
+
+def test_tidy_ambiguous_llm_unavailable_21d_stub_fallback(
+        tmp_store, mock_client, meta_for, monkeypatch):
+    """LLM 不可用且已到 21d/review_count≥2 → 只 stub (全文冷层+指针)。"""
+    from memorycore.core.config import STUB_PREFIX
+    e = _add_ambiguous(tmp_store, meta_for, text="已通知用户验收结果",
+                       updated_days=25, review_count=2, review_due_days=-1)
+    monkeypatch.setattr(wm, "_llm_review_ambiguous", lambda entry, meta: None)
+    stat = _stat()
+    wm.smart_tidy(tmp_store, mock_client, "memory", stat, dry=False)
+    ents = tmp_store.entries("memory")
+    stubs = [x for x in ents if x.startswith(STUB_PREFIX)]
+    assert len(stubs) == 1, ents
+    assert e not in ents, "原全文必须离开热层"
+    assert e in mock_client.stored, "全文必须先写冷层"
+    sm = meta_for("memory").get_entry(stubs[0])
+    assert sm["type"] == "stub" and sm["origin"] == "stub_sink"
+    assert sm["judge_decision"] == "ambiguous"
+    assert sm["judge_resolution"] == "stubbed_ambiguous"
+    assert stat["ambiguous_stubbed"] == 1
+
+
+def test_tidy_ambiguous_llm_unavailable_before_due_backs_off(
+        tmp_store, mock_client, meta_for, monkeypatch):
+    """未到期 + review_count 未满, LLM 不可用 → 保留 + 退避 +14d, 不 stub。"""
+    e = _add_ambiguous(tmp_store, meta_for, text="已通知用户验收结果",
+                       updated_days=1, review_count=0, review_due_days=-1)
+    monkeypatch.setattr(wm, "_llm_review_ambiguous", lambda entry, meta: None)
+    stat = _stat()
+    wm.smart_tidy(tmp_store, mock_client, "memory", stat, dry=False)
+    assert e in tmp_store.entries("memory")
+    m = meta_for("memory").get_entry(e)
+    assert m["judge_review_count"] == 1 and m["judge_review_at"]
+    assert mock_client.stored == []

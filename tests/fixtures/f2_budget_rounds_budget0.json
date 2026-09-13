@@ -1,0 +1,199 @@
+{
+  "budget": 0,
+  "true_zero_budget": true,
+  "budget_semantics": "T3_cold_only_zero_pointer_budget",
+  "retype_stat": {
+    "migrated_new": 6
+  },
+  "rounds": [
+    {
+      "round": 0,
+      "hot_n": 16,
+      "orig_count": 19,
+      "orig_full_left": 16,
+      "stub_entries": 0,
+      "evicted_no_ptr": 3,
+      "evicted_no_ptr_samples": [
+        "2026-08-21 notehub缓存雪崩复盘",
+        "2026-08-28 notehub鉴权失效复盘",
+        "notehub数据库迁移规范: 大表变更必须在线"
+      ],
+      "content_chars": 2083,
+      "stub_chars": 0,
+      "round_stubbed": 0,
+      "round_stub_gc": 0,
+      "round_cold_only": 3,
+      "errors": 0,
+      "t3_cold_only_mode": true,
+      "cold_n": 9,
+      "usage_after": "42%"
+    },
+    {
+      "round": 1,
+      "hot_n": 13,
+      "orig_count": 19,
+      "orig_full_left": 13,
+      "stub_entries": 0,
+      "evicted_no_ptr": 6,
+      "evicted_no_ptr_samples": [
+        "notehub服务配置必须集中管理, 发布窗口内",
+        "notehub故障分级规则: P0 立即拉起战情",
+        "2026-08-21 notehub缓存雪崩复盘"
+      ],
+      "content_chars": 1629,
+      "stub_chars": 0,
+      "round_stubbed": 0,
+      "round_stub_gc": 0,
+      "round_cold_only": 3,
+      "errors": 0,
+      "t3_cold_only_mode": true,
+      "cold_n": 12,
+      "usage_after": "33%"
+    },
+    {
+      "round": 2,
+      "hot_n": 10,
+      "orig_count": 19,
+      "orig_full_left": 10,
+      "stub_entries": 0,
+      "evicted_no_ptr": 9,
+      "evicted_no_ptr_samples": [
+        "notehub服务配置必须集中管理, 发布窗口内",
+        "notehub服务配置界面统一读取设计系统令牌,",
+        "notehub开放平台的新增字段保持向后兼容, "
+      ],
+      "content_chars": 1289,
+      "stub_chars": 0,
+      "round_stubbed": 0,
+      "round_stub_gc": 0,
+      "round_cold_only": 3,
+      "errors": 0,
+      "t3_cold_only_mode": true,
+      "cold_n": 15,
+      "usage_after": "26%"
+    },
+    {
+      "round": 3,
+      "hot_n": 7,
+      "orig_count": 19,
+      "orig_full_left": 7,
+      "stub_entries": 0,
+      "evicted_no_ptr": 12,
+      "evicted_no_ptr_samples": [
+        "notehub服务配置必须集中管理, 发布窗口内",
+        "notehub服务配置界面统一读取设计系统令牌,",
+        "notehub日志规范: 服务日志统一输出结构化"
+      ],
+      "content_chars": 912,
+      "stub_chars": 0,
+      "round_stubbed": 0,
+      "round_stub_gc": 0,
+      "round_cold_only": 3,
+      "errors": 0,
+      "t3_cold_only_mode": true,
+      "cold_n": 18,
+      "usage_after": "18%"
+    },
+    {
+      "round": 4,
+      "hot_n": 4,
+      "orig_count": 19,
+      "orig_full_left": 4,
+      "stub_entries": 0,
+      "evicted_no_ptr": 15,
+      "evicted_no_ptr_samples": [
+        "notehub服务配置必须集中管理, 发布窗口内",
+        "notehub服务配置界面统一读取设计系统令牌,",
+        "notehub日志规范: 服务日志统一输出结构化"
+      ],
+      "content_chars": 506,
+      "stub_chars": 0,
+      "round_stubbed": 0,
+      "round_stub_gc": 0,
+      "round_cold_only": 3,
+      "errors": 0,
+      "t3_cold_only_mode": true,
+      "cold_n": 21,
+      "usage_after": "10%"
+    },
+    {
+      "round": 5,
+      "hot_n": 1,
+      "orig_count": 19,
+      "orig_full_left": 1,
+      "stub_entries": 0,
+      "evicted_no_ptr": 18,
+      "evicted_no_ptr_samples": [
+        "notehub服务配置必须集中管理, 发布窗口内",
+        "notehub服务配置界面统一读取设计系统令牌,",
+        "notehub日志规范: 服务日志统一输出结构化"
+      ],
+      "content_chars": 132,
+      "stub_chars": 0,
+      "round_stubbed": 0,
+      "round_stub_gc": 0,
+      "round_cold_only": 3,
+      "errors": 0,
+      "t3_cold_only_mode": true,
+      "cold_n": 24,
+      "usage_after": "2%"
+    },
+    {
+      "round": 6,
+      "hot_n": 0,
+      "orig_count": 19,
+      "orig_full_left": 0,
+      "stub_entries": 0,
+      "evicted_no_ptr": 19,
+      "evicted_no_ptr_samples": [
+        "notehub服务配置必须集中管理, 发布窗口内",
+        "notehub服务配置界面统一读取设计系统令牌,",
+        "notehub日志规范: 服务日志统一输出结构化"
+      ],
+      "content_chars": 0,
+      "stub_chars": 0,
+      "round_stubbed": 0,
+      "round_stub_gc": 0,
+      "round_cold_only": 1,
+      "errors": 0,
+      "t3_cold_only_mode": true,
+      "cold_n": 25,
+      "usage_after": "0%"
+    }
+  ],
+  "final": {
+    "content_chars": 0,
+    "stub_chars": 0,
+    "hot_n": 0,
+    "full_left_count": 0,
+    "stub_count": 0,
+    "evicted_no_ptr_count": 19,
+    "all_pointer_stub_chars": 758,
+    "unique_stubs_created": 19,
+    "created_total": 19,
+    "all_pointers_retained": false,
+    "evicted_stub_count": 19,
+    "missing_pointers": [
+      "[规则指针]notehub服务配→recall:4dc0869c38f0b8f8",
+      "[规则指针]notehub服务配→recall:8f54922e476ff2fc",
+      "[规则指针]notehub日志规→recall:6b5be62b43df6804",
+      "[规则指针]notehub开放平→recall:d83b6409484e2110",
+      "[规则指针]notehub故障分→recall:78db5f78c0b493a6",
+      "[规则指针]2026-08-21→recall:c076c5975ca038ef",
+      "[规则指针]2026-08-28→recall:b0990570a7930835",
+      "[规则指针]notehub容量规→recall:396624bf12091d99",
+      "[规则指针]用户明确:note→recall:6d35a201ac550371",
+      "[规则指针]用户偏好:note→recall:69a40b351e6a7920",
+      "[规则指针]notehub数据库→recall:41c7b52b2f9b251c",
+      "[规则指针]notehub用户手→recall:3a6285cd69eb6f97",
+      "[规则指针]notehub网络边→recall:27497be415aa655e",
+      "[规则指针]notehub归档策→recall:73579683c1aec634",
+      "[规则指针]notehub索引重→recall:70efde0451020954",
+      "[规则指针]notehub告警降→recall:b8e2ddeec7fce2a3",
+      "[规则指针]notehub性能预→recall:3a8ce9d94c68c9e5",
+      "[规则指针]notehub依赖更→recall:635e52e58e357db5",
+      "[规则指针]notehub提交规→recall:bdfc8cd59e34b36e"
+    ],
+    "cold_id_non_null": true
+  }
+}

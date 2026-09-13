@@ -1,0 +1,52 @@
+{
+ "45c3b8edeca55e26de38a421f2cef6d46d6fb1f99b9b77900ccf80c7abf82c3f": {
+  "type": "preference",
+  "written_at": "2026-09-02T09:00:00+00:00",
+  "updated_at": "2026-09-10T09:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.0,
+  "last_active_at": "2026-09-12T09:00:00+00:00",
+  "last_scan_at": "2026-09-12T09:00:00+00:00"
+ },
+ "9279344168c728823705ac4b997a7e7f1b5ba4cd452a61360a45303ab51c2e57": {
+  "type": "preference",
+  "written_at": "2026-09-02T09:00:00+00:00",
+  "updated_at": "2026-09-10T09:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.0,
+  "last_active_at": "2026-09-12T09:00:00+00:00",
+  "last_scan_at": "2026-09-12T09:00:00+00:00"
+ },
+ "569eb748b0e56557fb0cf3a435ef5305cd6e8b84255db7367389dfc6b62d30b0": {
+  "type": "rule",
+  "written_at": "2026-09-03T09:00:00+00:00",
+  "updated_at": "2026-09-10T09:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.0,
+  "last_active_at": "2026-09-12T09:00:00+00:00",
+  "last_scan_at": "2026-09-12T09:00:00+00:00"
+ },
+ "1c1d692cfe0a176da57ae0924ec96fe32f2cd3049a3c19e1eb69787dd691dd11": {
+  "type": "rule",
+  "written_at": "2026-09-03T09:00:00+00:00",
+  "updated_at": "2026-09-10T09:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.0,
+  "last_active_at": "2026-09-12T09:00:00+00:00",
+  "last_scan_at": "2026-09-12T09:00:00+00:00"
+ },
+ "21d7256b527b8008f693b49cdd054c81b1737c231f525099e5f49b19367f495f": {
+  "type": "rule",
+  "written_at": "2026-09-03T09:00:00+00:00",
+  "updated_at": "2026-09-10T09:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.0,
+  "last_active_at": "2026-09-12T09:00:00+00:00",
+  "last_scan_at": "2026-09-12T09:00:00+00:00"
+ }
+}

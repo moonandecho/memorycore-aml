@@ -1,0 +1,252 @@
+{
+ "4dc0869c38f0b8f83ebbd48f7e13a59d3ebfe23944442370f5c5fc268c264eb7": {
+  "type": "rule",
+  "written_at": "2026-08-30T09:00:00+00:00",
+  "updated_at": "2026-09-02T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 4.2,
+  "last_active_at": "2026-09-02T10:00:00+00:00",
+  "last_scan_at": "2026-09-02T10:00:00+00:00"
+ },
+ "8f54922e476ff2fc78e6dad687ef0c50273a5372b6312a46c5efc8cf4ac258c2": {
+  "type": "rule",
+  "written_at": "2026-08-31T09:00:00+00:00",
+  "updated_at": "2026-09-02T11:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 5.0,
+  "last_active_at": "2026-09-02T11:00:00+00:00",
+  "last_scan_at": "2026-09-02T11:00:00+00:00"
+ },
+ "6b5be62b43df6804c5f42b8f2496d6dc2504329b088830a9c805f1f15466cad6": {
+  "type": "rule",
+  "written_at": "2026-09-01T09:00:00+00:00",
+  "updated_at": "2026-09-03T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.6,
+  "last_active_at": "2026-09-03T10:00:00+00:00",
+  "last_scan_at": "2026-09-03T10:00:00+00:00"
+ },
+ "d83b6409484e2110a03ae6fc48a5d34f262e0ef7b08ce9e124fb839127f736b3": {
+  "type": "rule",
+  "written_at": "2026-09-01T10:00:00+00:00",
+  "updated_at": "2026-09-03T11:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 4.4,
+  "last_active_at": "2026-09-03T11:00:00+00:00",
+  "last_scan_at": "2026-09-03T11:00:00+00:00"
+ },
+ "78db5f78c0b493a678cc5121eb52e2ae6c810651094bd49fd864f93b03bff96d": {
+  "type": "rule",
+  "written_at": "2026-09-02T09:00:00+00:00",
+  "updated_at": "2026-09-04T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.9,
+  "last_active_at": "2026-09-04T10:00:00+00:00",
+  "last_scan_at": "2026-09-04T10:00:00+00:00"
+ },
+ "c076c5975ca038eff08f84350e855015ba66bd6f3d4db2e24fe34abc26127765": {
+  "type": "rule",
+  "written_at": "2026-09-03T09:00:00+00:00",
+  "updated_at": "2026-09-05T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 2.6,
+  "last_active_at": "2026-09-05T10:00:00+00:00",
+  "last_scan_at": "2026-09-05T10:00:00+00:00"
+ },
+ "b0990570a79308358900a66ce9e56e0153306da422dca6ca385ba867833d5cb5": {
+  "type": "rule",
+  "written_at": "2026-09-03T10:00:00+00:00",
+  "updated_at": "2026-09-05T11:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 2.8,
+  "last_active_at": "2026-09-05T11:00:00+00:00",
+  "last_scan_at": "2026-09-05T11:00:00+00:00"
+ },
+ "396624bf12091d99fcc1e737d1811729d8300fc9bcbc13762f77df652357c867": {
+  "type": "rule",
+  "written_at": "2026-09-04T09:00:00+00:00",
+  "updated_at": "2026-09-06T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 4.0,
+  "last_active_at": "2026-09-06T10:00:00+00:00",
+  "last_scan_at": "2026-09-06T10:00:00+00:00"
+ },
+ "6d35a201ac5503719bb271c15cc57b59ae61eed7478923f0348d8e6b2476272e": {
+  "type": "rule",
+  "written_at": "2026-09-04T10:00:00+00:00",
+  "updated_at": "2026-09-06T11:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.2,
+  "last_active_at": "2026-09-06T11:00:00+00:00",
+  "last_scan_at": "2026-09-06T11:00:00+00:00"
+ },
+ "69a40b351e6a7920b10bddfb6ef317b82b32b5f601fe646c052b6c7daf39e98a": {
+  "type": "rule",
+  "written_at": "2026-09-05T09:00:00+00:00",
+  "updated_at": "2026-09-07T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.1,
+  "last_active_at": "2026-09-07T10:00:00+00:00",
+  "last_scan_at": "2026-09-07T10:00:00+00:00"
+ },
+ "41c7b52b2f9b251c33a1fdd7e3fd2331ca9ed88bf01c39a9bd3fd6c97135140e": {
+  "type": "rule",
+  "written_at": "2026-09-05T10:00:00+00:00",
+  "updated_at": "2026-09-07T11:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.0,
+  "last_active_at": "2026-09-07T11:00:00+00:00",
+  "last_scan_at": "2026-09-07T11:00:00+00:00"
+ },
+ "3a6285cd69eb6f979db8a9d8c67cde1ed1ad07410b2958a5f04f29a2d431476a": {
+  "type": "rule",
+  "written_at": "2026-09-06T09:00:00+00:00",
+  "updated_at": "2026-09-08T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 2.9,
+  "last_active_at": "2026-09-08T10:00:00+00:00",
+  "last_scan_at": "2026-09-08T10:00:00+00:00"
+ },
+ "27497be415aa655e548a0b6e965a26d1c16f836baf9a3570626afe2f498da48b": {
+  "type": "rule",
+  "written_at": "2026-09-06T10:00:00+00:00",
+  "updated_at": "2026-09-08T11:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 4.6,
+  "last_active_at": "2026-09-08T11:00:00+00:00",
+  "last_scan_at": "2026-09-08T11:00:00+00:00"
+ },
+ "73579683c1aec634eb041d62b1fb2e1d9d1a36caa34d16c727ed8a3c1c849d74": {
+  "type": "rule",
+  "written_at": "2026-09-07T09:00:00+00:00",
+  "updated_at": "2026-09-09T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.3,
+  "last_active_at": "2026-09-09T10:00:00+00:00",
+  "last_scan_at": "2026-09-09T10:00:00+00:00"
+ },
+ "70efde0451020954eb019d77291908a40c43937530f6a53db3a12381f7b37df9": {
+  "type": "rule",
+  "written_at": "2026-09-07T10:00:00+00:00",
+  "updated_at": "2026-09-09T11:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.4,
+  "last_active_at": "2026-09-09T11:00:00+00:00",
+  "last_scan_at": "2026-09-09T11:00:00+00:00"
+ },
+ "b8e2ddeec7fce2a358a376e2d7bc12d658568ee2bc16504600e1c8ad5a82be80": {
+  "type": "rule",
+  "written_at": "2026-09-08T09:00:00+00:00",
+  "updated_at": "2026-09-10T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.5,
+  "last_active_at": "2026-09-10T10:00:00+00:00",
+  "last_scan_at": "2026-09-10T10:00:00+00:00"
+ },
+ "3a8ce9d94c68c9e5c2b60e7375437f1da0633849743b8ee852d70718c2e04497": {
+  "type": "rule",
+  "written_at": "2026-09-08T10:00:00+00:00",
+  "updated_at": "2026-09-10T11:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.7,
+  "last_active_at": "2026-09-10T11:00:00+00:00",
+  "last_scan_at": "2026-09-10T11:00:00+00:00"
+ },
+ "635e52e58e357db54271ceb936b87e4d1719c52e0ab8ec14d8a4aa21c2177cdd": {
+  "type": "rule",
+  "written_at": "2026-09-09T09:00:00+00:00",
+  "updated_at": "2026-09-11T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 3.8,
+  "last_active_at": "2026-09-11T10:00:00+00:00",
+  "last_scan_at": "2026-09-11T10:00:00+00:00"
+ },
+ "3328d9ea10b4c569c9e75cb0042d14f66121608c0ac2fd4b643e08a2e5363980": {
+  "type": "rule",
+  "written_at": "2026-09-01T00:00:00+00:00",
+  "updated_at": "2026-09-10T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 2.2,
+  "last_active_at": "2026-09-10T10:00:00+00:00",
+  "last_scan_at": "2026-09-10T10:00:00+00:00"
+ },
+ "776e2a5787b3b01e4399b1f3166bdada2c01ce819c9b45e8d7527bb3926c8a44": {
+  "type": "rule",
+  "written_at": "2026-09-07T00:00:00+00:00",
+  "updated_at": "2026-09-13T05:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 1.9,
+  "last_active_at": "2026-09-13T05:00:00+00:00",
+  "last_scan_at": "2026-09-13T05:00:00+00:00"
+ },
+ "bdfc8cd59e34b36efc6cf4fb93646109908dbb3f6b7c8fe79ac0daf79857be18": {
+  "type": "rule",
+  "written_at": "2026-09-09T09:00:00+00:00",
+  "updated_at": "2026-09-12T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 2.4,
+  "last_active_at": "2026-09-12T10:00:00+00:00",
+  "last_scan_at": "2026-09-12T10:00:00+00:00"
+ },
+ "bc52e58f541d20bfb06a73e2cdb438aea95b52d71d8c1947c785f47a15a8b917": {
+  "type": "state",
+  "written_at": "2026-09-11T00:00:00+00:00",
+  "updated_at": "2026-09-12T10:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 1.8,
+  "last_active_at": "2026-09-12T10:00:00+00:00",
+  "last_scan_at": "2026-09-12T10:00:00+00:00"
+ },
+ "c7a022b669307a132df312eb96e83d1cfab2e5ba38d3b6c3caede7454d8cca19": {
+  "type": "rule",
+  "written_at": "2026-09-12T00:00:00+00:00",
+  "updated_at": "2026-09-13T05:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 1.7,
+  "last_active_at": "2026-09-13T05:00:00+00:00",
+  "last_scan_at": "2026-09-13T05:00:00+00:00"
+ },
+ "28d76b05cda58fbf20cd7f8fc05cb7a8b97ab36819116b8bf081df1ecf37fe8b": {
+  "type": "rule",
+  "written_at": "2026-09-10T00:00:00+00:00",
+  "updated_at": "2026-09-13T05:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 1.6,
+  "last_active_at": "2026-09-13T05:00:00+00:00",
+  "last_scan_at": "2026-09-13T05:00:00+00:00"
+ },
+ "e568bfd5aeb87f465430129609c82f571d04fcebd2022aa87c06ac2873e83009": {
+  "type": "rule",
+  "written_at": "2026-09-05T00:00:00+00:00",
+  "updated_at": "2026-09-13T05:00:00+00:00",
+  "origin": "legacy",
+  "importance": 0.8,
+  "weight": 1.5,
+  "last_active_at": "2026-09-13T05:00:00+00:00",
+  "last_scan_at": "2026-09-13T05:00:00+00:00"
+ }
+}

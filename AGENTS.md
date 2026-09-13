@@ -21,9 +21,10 @@ MemoryCore —— LLM Agent 记忆层治理方案(MIT 开源版)。
    运行与测试不得依赖 `~/.hermes` 生产配置/生产记忆 (测试用 `MEMORY_DIR` /
    `MNEMOSYNE_DATA_DIR` 指向 tempfile); LLM 文件来源默认关闭, 只能通过
    `MEMCORE_LLM_FILE_SOURCES=1` 显式开启。
-10. **机制常量与源树同源** — `GRACE_MULT=9.0`、`RULE_MIN_RESIDENCY_DAYS=7`、
-   `RULE_BUDGET_CHARS=2000`、`WEIGHT_INIT=1.0` 等标定值不得在发布版另定一套;
-   回滚开关与语义见 `README.md` 的 Cache policy V2 / SAFE-JUDGE v3 章节。
+10. **机制常量单一来源** — 所有阈值/窗口/乘数集中定义在
+    `memorycore/core/config.py`（README 的 "Capacity constants" / 容量常量章节同源），
+    任何模块不得另行硬编码同名字面量；改常量必须同步 `README.md`、
+    `README.zh-CN.md` 与 `docs/ARCHITECTURE.md`。
 11. **禁 push 审查节奏** — 发布移植轮在用户审查 diff 前不得 `git push`、不得
    改远端或 git 历史; 若工作树保留未提交改动, 以审查报告明确说明。
 

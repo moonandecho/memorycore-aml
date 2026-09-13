@@ -185,7 +185,7 @@ def test_i2_apply_activity_hits_future_stamp_normalized(
              written_at=future, updated_at=future, last_active_at=now,
              weight=1.0)
     monkeypatch.setattr(ov, "_load_fresh_queries", lambda metastores: ["查询"])
-    monkeypatch.setattr(ov, "_embed_batch_mnemosyne",
+    monkeypatch.setattr(ov, "_embed_texts",
                         lambda client, queries: [[1.0]])
     monkeypatch.setattr(ov, "_rule_vectors",
                         lambda metastores, rules, client: {"memory": {e: [1.0]}})

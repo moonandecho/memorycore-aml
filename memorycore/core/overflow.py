@@ -172,6 +172,37 @@ _EMBED_MODEL = os.environ.get("MEMORYCORE_EMBED_MODEL", "qwen3-embedding:0.6b")
 # S4: 单轮休眠判定评估的候选上限 (LLM 调用量护栏)
 _STUB_EVAL_CAP = 10
 
+# E5/FIX (R5): 统一嵌入入口的失败原因通道。_embed_texts 失败时写入,
+# merge/activity 调用方经 _record_embed_fail 转存 stat["embed_fail_reason"]。
+_LAST_EMBED_FAIL_REASON: Optional[str] = None
+
+
+def _embed_backend() -> str:
+    """运行时读取 EMBED_BACKEND (E8 惰性解析 + monkeypatch 契约)。
+
+    优先模块字典的显式覆盖 (monkeypatch.setattr(overflow, "EMBED_BACKEND", v));
+    未覆盖时惰性委托 core.config, 保证运行中改 env 即时生效。
+    """
+    value = globals().get("EMBED_BACKEND")
+    if value is None:
+        value = getattr(_cfg, "EMBED_BACKEND", "mnemosyne")
+    return str(value or "mnemosyne")
+
+
+def _record_embed_fail(stat: Optional[dict] = None,
+                       reason: Optional[str] = None) -> None:
+    """merge/activity 同口径: 计数 + 首次原因 + 首次 warning(不刷屏)。"""
+    if stat is None:
+        return
+    stat["embed_fail"] = int(stat.get("embed_fail", 0)) + 1
+    if not stat.get("embed_fail_reason"):
+        stat["embed_fail_reason"] = str(
+            reason or _LAST_EMBED_FAIL_REASON
+            or f"{_embed_backend()}: unavailable")
+        log.warning("EMBED: 嵌入失败 (%s) → 降级纯词法",
+                    stat["embed_fail_reason"])
+
+
 
 def _is_protected_rule(entry: str, meta: dict) -> bool:
     """protected 判定 — 仅提供排序乘数来源 (CACHE-POLICY-V2)。
@@ -759,9 +790,15 @@ def _stub_gc(store, metastore, target: str, stat: dict,
 
 # S3 嵌入通道 (可选增强; 不可用 → 纯词法降级, 溢流永不阻塞)
 def _embed_batch(texts: List[str]) -> Optional[Dict[str, List[float]]]:
-    """ollama /api/embed 批量嵌入; 不可用/失败 → None (降级纯词法)。"""
+    """ollama /api/embed 批量嵌入; 不可用/失败 → None (降级纯词法)。
+
+    失败原因写入模块级 _LAST_EMBED_FAIL_REASON, 供统一入口 _embed_texts
+    转成 stat["embed_fail_reason"]; 本函数自身仍保证不抛。
+    """
+    global _LAST_EMBED_FAIL_REASON
     if not texts:
         return None
+    _LAST_EMBED_FAIL_REASON = None
     try:
         import json
         import urllib.request
@@ -775,10 +812,80 @@ def _embed_batch(texts: List[str]) -> Optional[Dict[str, List[float]]]:
             data = json.loads(resp.read().decode())
         vecs = data.get("embeddings") or []
         if len(vecs) != len(texts):
+            _LAST_EMBED_FAIL_REASON = "ollama: batch size mismatch"
             return None
         return {t: v for t, v in zip(texts, vecs)}
-    except Exception:
+    except Exception as e:
+        _LAST_EMBED_FAIL_REASON = f"ollama: {type(e).__name__}"
         return None
+
+
+def _embed_texts(client, texts: List[str]) -> Optional[List[List[float]]]:
+    """统一嵌入入口: merge/activity 只经过这里, 不再各自直连 ollama。
+
+    路由:
+      mnemosyne -> client.embed_texts, 按 EMBED_BATCH_MAX 分片, 返回
+                   List[List[float]] (与 recall 同分数空间);
+      ollama    -> 本地 _embed_batch, dict 按输入顺序转 list;
+      off       -> None (显式纯词法);
+    任何失败/异常 -> None, 原因写入 _LAST_EMBED_FAIL_REASON 供调用方
+    转存 stat["embed_fail_reason"]; 绝不抛出, 保持安全降级方向。
+    """
+    global _LAST_EMBED_FAIL_REASON
+    _LAST_EMBED_FAIL_REASON = None
+    if not texts:
+        return []
+    backend = _embed_backend()
+    if backend == "off":
+        _LAST_EMBED_FAIL_REASON = "off: disabled"
+        return None
+    if backend == "ollama":
+        try:
+            res = _embed_batch(texts)  # _embed_batch 内部已写具体错误类型
+        except Exception as e:
+            _LAST_EMBED_FAIL_REASON = f"ollama: {type(e).__name__}"
+            return None
+        if not isinstance(res, dict):
+            if not _LAST_EMBED_FAIL_REASON:
+                _LAST_EMBED_FAIL_REASON = "ollama: unavailable"
+            return None
+        out: List[List[float]] = []
+        for text in texts:
+            vec = res.get(text)
+            if not isinstance(vec, list) or not vec:
+                _LAST_EMBED_FAIL_REASON = "ollama: invalid vector"
+                return None
+            out.append(vec)
+        return out
+    if backend != "mnemosyne":
+        _LAST_EMBED_FAIL_REASON = f"{backend}: unsupported backend"
+        return None
+    if client is None or not hasattr(client, "embed_texts"):
+        _LAST_EMBED_FAIL_REASON = "mnemosyne: client unavailable"
+        return None
+    out: List[List[float]] = []
+    try:
+        for i in range(0, len(texts), EMBED_BATCH_MAX):
+            chunk = texts[i:i + EMBED_BATCH_MAX]
+            vecs = client.embed_texts(chunk)
+            if (not isinstance(vecs, (list, tuple))
+                    or len(vecs) != len(chunk)):
+                _LAST_EMBED_FAIL_REASON = "mnemosyne: invalid batch result"
+                return None
+            for vec in vecs:
+                if not isinstance(vec, (list, tuple)):
+                    _LAST_EMBED_FAIL_REASON = "mnemosyne: invalid vector"
+                    return None
+            out.extend([list(v) for v in vecs])
+        return out
+    except Exception as e:
+        _LAST_EMBED_FAIL_REASON = f"mnemosyne: {type(e).__name__}"
+        return None
+
+
+# 兼容旧内部调用名: 仍可 import/直接调用, 行为收敛到统一入口。
+def _embed_batch_mnemosyne(client, texts):
+    return _embed_texts(client, texts)
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
@@ -1003,7 +1110,7 @@ def _run_overflow(store, client, target: str, stat: Dict[str, Any]) -> dict:
         stat["chars_after_split"] = store.char_count(target)
 
     # ---- Step 4: 同类事实合并 (先于下沉) ---------------------------------
-    merged_entries, merge_count = _merge_local_fragments(entries, stat)
+    merged_entries, merge_count = _merge_local_fragments(entries, stat, client)
     if merge_count > 0:
         _rebuild_file(store, target, merged_entries)
         stat["merged"] = merge_count
@@ -1524,7 +1631,8 @@ def _smart_ratio(a: str, b: str) -> float:
 
 
 def _merge_local_fragments(entries: List[str],
-                           stat: dict = None) -> Tuple[List[str], int]:
+                           stat: dict = None,
+                           client=None) -> Tuple[List[str], int]:
     """检测本地同主题碎片并合并。返回 (merged, merge_count)。
 
     Phase 3 (2026-08-20): stub 指针 ([规则指针] 前缀) 不参与合并 —
@@ -1550,11 +1658,16 @@ def _merge_local_fragments(entries: List[str],
             parent[ra] = rb
 
     # Phase 3 S3: 可选嵌入通道 (词法不达标时补充同主题判定; 嵌入不可用 → 纯词法)
-    # E5: 嵌入失败与 activity 路径同口径计数 (embed_fail), 不再静默纯词法
+    # E5/R5: merge 路径走统一入口 _embed_texts(client, ...); 失败与 activity
+    # 路径同口径计数 (embed_fail), 原因只记首次 (embed_fail_reason), 不静默。
     mergeable = [e for i, e in enumerate(entries) if i not in skip]
-    emb_map = _embed_batch(mergeable) if len(mergeable) >= 2 else None
-    if emb_map is None and len(mergeable) >= 2 and stat is not None:
-        stat["embed_fail"] = stat.get("embed_fail", 0) + 1
+    emb_map = None
+    if len(mergeable) >= 2:
+        emb_vecs = _embed_texts(client, mergeable)
+        if emb_vecs is not None and len(emb_vecs) == len(mergeable):
+            emb_map = {text: vec for text, vec in zip(mergeable, emb_vecs)}
+        else:
+            _record_embed_fail(stat)
     for i in range(n):
         if i in skip:
             continue
@@ -2119,42 +2232,7 @@ def _iter_meta_values(ms: MetaStore):
         return []
 
 
-def _embed_batch_mnemosyne(client, texts: List[str]) -> Optional[List[List[float]]]:
-    """方案 b: 经 Mnemosyne embed_texts 批量嵌入 (与 recall 同分数空间)。
-
-    按 EMBED_BATCH_MAX 分片; 任一异常 → None (降级纯词法, 保守方向)。
-    EMBED_BACKEND 接线 (M3, 2026-08-26):
-      mnemosyne (默认) → client.embed_texts (方案 b, 分数空间一致)
-      ollama      → 本地 _embed_batch (方案 c, 需重校准阈值)
-      off         → None (强制降级纯词法)
-    """
-    if _cfg.EMBED_BACKEND == "off":
-        return None
-    if _cfg.EMBED_BACKEND == "ollama":
-        # 本地 ollama 通道 (S3 聚簇嵌入复用): 可用 → list of vectors
-        try:
-            res = _embed_batch(texts)
-            if isinstance(res, dict):
-                emb = res.get("embeddings")
-                if (isinstance(emb, list) and emb
-                        and isinstance(emb[0], list)):
-                    return emb
-        except Exception:
-            return None
-        return None
-    out: List[List[float]] = []
-    try:
-        for i in range(0, len(texts), EMBED_BATCH_MAX):
-            chunk = texts[i:i + EMBED_BATCH_MAX]
-            vecs = client.embed_texts(chunk)
-            if not vecs or len(vecs) != len(chunk):
-                return None
-            out.extend(vecs)
-        return out
-    except Exception:
-        return None
-
-
+# R5: _embed_batch_mnemosyne 已并入 _embed_texts 统一入口 (兼容别名见文件前部)。
 def _rule_vectors(metastores: Dict[str, MetaStore], rules: Dict[str, List[str]],
                   client) -> Dict[str, Dict[str, List[float]]]:
     """规则向量: sidecar 缓存命中 + 缺失批量补嵌 (惰性, 每轮 ≤1 批)。
@@ -2178,7 +2256,7 @@ def _rule_vectors(metastores: Dict[str, MetaStore], rules: Dict[str, List[str]],
             else:
                 missing.append(e)
         if missing:
-            mvecs = _embed_batch_mnemosyne(client, missing)
+            mvecs = _embed_texts(client, missing)
             if mvecs:
                 for e, v in zip(missing, mvecs):
                     vecs[e] = v
@@ -2240,13 +2318,13 @@ def apply_activity_hits(metastores: Dict[str, MetaStore],
     if not queries:
         return
     stat["scan_queries"] = len(queries)
-    # 查询嵌入 (每轮唯一真实成本, 1 批)
-    qvecs = _embed_batch_mnemosyne(client, queries)
+    # 查询嵌入 (每轮唯一真实成本, 1 批) — R5: 统一入口, 与 merge 同口径。
+    qvecs = _embed_texts(client, queries)
     if qvecs is None:
         # 降级: 纯词法弱命中 (degraded 模式)
         if _cfg.HIT_WEAK_MODE == "degraded":
             _degraded_lexical_hits(metastores, rules, queries, stat)
-        stat["embed_fail"] = stat.get("embed_fail", 0) + 1
+        _record_embed_fail(stat)
         return
     rvecs = _rule_vectors(metastores, rules, client)
     now = datetime.now(timezone.utc)

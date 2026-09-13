@@ -111,6 +111,8 @@ def test_s3_embedding_channel_merges_lexical_distant(tmp_store, mock_client,
     b = "服务器内存配置说明: 交换分区与压缩调优结论。"
     tmp_store.add("memory", a)
     tmp_store.add("memory", b)
+    # R5: 统一入口后, 显式走 ollama 路由以复用 _embed_batch 的 mock 向量。
+    monkeypatch.setattr(config_mod, "EMBED_BACKEND", "ollama")
     monkeypatch.setattr(ov, "_embed_batch",
                         lambda texts: {t: [1.0, 0.0] for t in texts})
     stat = run_overflow(tmp_store, mock_client, "memory")

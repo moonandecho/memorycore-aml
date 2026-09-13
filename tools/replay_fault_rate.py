@@ -160,15 +160,21 @@ def evaluate_fixture(fixture: Dict[str, Any]) -> Dict[str, Any]:
     baseline_fault = (n - baseline_hits) / n if n else 0.0
     fault_rate = (n - hits) / n if n else 0.0
     # F5/FIX4 P3: 相对下降必须由 fixture 内复算的 baseline 驱动, 不硬编码。
-    # `baseline_k3_048_reference` 仅作证据数值展示。
+    # `baseline_k3_048_reference` 只作证据数值展示: 优先使用 fixture 归档的
+    # 参考值, fixture 缺失时回落到本次复算 baseline; 模块常量 BASELINE_REFERENCE
+    # 不参与任何回放计算, monkeypatch 它不得改变这里返回的任何字段。
     rel_drop = ((baseline_fault - fault_rate) / baseline_fault
                 if baseline_fault else 0.0)
+    baseline_reference = fixture.get("provenance", {}).get(
+        "baseline_k3_048_reference")
+    if baseline_reference is None:
+        baseline_reference = round(baseline_fault, 4)
     return {
         "silver": {
             "queries": n,
             "pairs": len(fixture.get("pairs", [])),
             "baseline_k3_048_fault_rate": round(baseline_fault, 4),
-            "baseline_k3_048_reference": BASELINE_REFERENCE,
+            "baseline_k3_048_reference": baseline_reference,
             "baseline_hits_replayed": baseline_hits,
         },
         "implementation": {

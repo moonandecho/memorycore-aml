@@ -137,12 +137,18 @@ def test_e4_activity_scan_failure_counted(tmp_store, mock_client, monkeypatch,
 
 # ---- E5: merge 路径嵌入失败 → 对齐 activity 路径 embed_fail ----------------
 
-def test_e5_merge_embed_fail_counted(monkeypatch):
-    monkeypatch.setattr(ov_mod, "_embed_batch", lambda texts: None)
+def test_e5_merge_embed_fail_counted(caplog):
+    class _TimeoutClient:
+        def embed_texts(self, texts):
+            raise TimeoutError("simulated")
+
     stat = {}
     merged, count = ov_mod._merge_local_fragments(
-        ["规则甲: 用词简洁, 注释用中文。", "规则甲: 用词简洁, 注释中文。"], stat)
+        ["规则甲: 用词简洁, 注释用中文。", "规则甲: 用词简洁, 注释中文。"],
+        stat, _TimeoutClient())
     assert stat["embed_fail"] == 1, "merge 路径嵌入失败必须对齐 embed_fail 计数"
+    assert stat["embed_fail_reason"] == "mnemosyne: TimeoutError", stat
+    assert any("EMBED: 嵌入失败" in r.message for r in caplog.records)
     # 无 stat 时静默降级 (向后兼容), 不崩溃
     ov_mod._merge_local_fragments(
         ["规则甲: 用词简洁, 注释用中文。", "规则甲: 用词简洁, 注释中文。"])
@@ -341,8 +347,9 @@ def test_overflow_rotation_no_starvation(tmp_store, mock_client, monkeypatch,
     monkeypatch.setattr(llm_rot, "ROT_PATH", tmp_path / "llm_rot.json")
     monkeypatch.setenv("LLM_API_KEY", "sk-test-rotation")
     llm_config.invalidate_cache()
-    # 隔离环境嵌入服务 (有 ollama 时条目会被语义聚类合并, 场景失真)
-    monkeypatch.setattr(ov_mod, "_embed_batch", lambda texts: None)
+    # 隔离嵌入服务 (有 ollama 时条目会被语义聚类合并, 场景失真)
+    monkeypatch.setattr(ov_mod, "_embed_texts",
+                        lambda client, texts: None)
     # CACHE-POLICY-V2: 本用例只测 LLM 轮转; 隔离统一预算换出, 防挤压候选数。
     monkeypatch.setattr(ov_mod, "enforce_rule_budget", lambda *a, **k: None)
 

@@ -1,0 +1,19 @@
+{
+  "frozen_at": "2026-01-01T00:00:00+00:00",
+  "labels_file": "eval/eval_holdout.labels.jsonl",
+  "labels_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "dev_labels_file": "eval/eval_dev.labels.jsonl",
+  "dev_labels_sha256": "201b28b271a6fe1a537339ffdffab182ff6413b951932d95d2b73e1abbdacfd4",
+  "labeler": "synthetic-fixture-p0",
+  "label_version": "p0-schema-v1",
+  "embed_model": "synthetic-test-model",
+  "buckets": [
+    "entity",
+    "date",
+    "paraphrase",
+    "multihop",
+    "negative_control"
+  ],
+  "holdout_sealed": true,
+  "note": "holdout 为空占位; dev 为纯合成样例, 不含任何真实记忆内容。"
+}

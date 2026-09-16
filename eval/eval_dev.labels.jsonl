@@ -1,0 +1,6 @@
+{"qid": "synth-entity-001", "query": "合成样例：代号 ATLAS-1 对应哪个演示实体？", "targets": ["cold_synth_entity_01"], "supportable": true, "bucket": "entity", "anchor_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+{"qid": "synth-date-001", "query": "合成样例：演示环境计划在哪一天冻结？", "targets": ["cold_synth_date_01"], "supportable": true, "bucket": "date", "anchor_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+{"qid": "synth-paraphrase-001", "query": "合成样例：换一种说法问同一组演示偏好？", "targets": ["cold_synth_para_01"], "supportable": true, "bucket": "paraphrase", "anchor_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+{"qid": "synth-multihop-001", "query": "合成样例：两条合成指针共同指向的结论是什么？", "targets": ["cold_synth_hop_01", "cold_synth_hop_02"], "supportable": true, "bucket": "multihop", "anchor_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}
+{"qid": "synth-neg-001", "query": "合成样例：完全不存在的随机标记 QUUX-9 是什么？", "targets": [], "supportable": false, "bucket": "negative_control", "anchor_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
+{"qid": "synth-neg-002", "query": "合成样例：从未记录过的无关问题 ZZZ-0 呢？", "targets": [], "supportable": false, "bucket": "negative_control", "anchor_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}

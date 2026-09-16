@@ -8,6 +8,8 @@
 访问冷层 (默认进程内 mnemosyne-memory, 可切 MCP 远程后端)。
 """
 import json
+import math
+import time
 from datetime import datetime, timezone
 
 try:
@@ -55,10 +57,13 @@ from .core.overflow import (run_overflow, _recall_safe, _find_best_match,  # noq
                            _soft_residency_grace_ts,
                            _cache_policy_v2, _stub_topic, _rule_activity_tier,
                            _ambiguous_a1_eligible,
-                           _ambiguous_hold_valid)
+                           _ambiguous_hold_valid,
+                           _lex_evidence)
 from .core.maintenance import run_maintenance  # noqa: E402
 from .core import llm_config  # noqa: E402  # TTL 失效入口 (终审低危)
 from .core.decay import _apply_decay  # noqa: E402  # 小项1: 提取到独立模块
+from .core.recall_probe import (  # noqa: E402  # P0 只读观测探针
+    query_sha256 as _probe_query_sha256, record_recall_probe)
 
 mcp = MCPServer("memorycore")
 
@@ -808,6 +813,161 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
 # 工具 5: memorycore_recall — 主动召回冷层 (只读, 冷层降权重排)
 # ---------------------------------------------------------------------------
 
+# ---- P0 只读观测探针本地 helper (零行为影响) --------------------------------
+
+def _probe_float(value):
+    """字段缺失/类型异常/非有限值容错: 一律视为 0 (严格 JSON 安全)。"""
+    try:
+        if isinstance(value, bool):
+            num = float(value)
+        else:
+            num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return num if math.isfinite(num) else 0.0
+
+
+def _probe_int(value, default=0):
+    """非有限/异常 candidate_count/top_k 降级, 不允许拖垮整条事件。"""
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(num)
+
+
+def _probe_id(value):
+    """id 契约: None -> ""; 0/False/bytes 等保留可表示文本, 不折叠。"""
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _recall_channel_of(result, handle_cold_id=None, query=""):
+    """S=dense 分数命中; K=keyword/fts 或本地 _lex_evidence; H=handle 直查。
+
+    H>K>S; 本地 bigram 证据用于兼容旧冷层只返回 dense 字段的情况 (§5)。
+    """
+    if handle_cold_id and result.get("id") == handle_cold_id:
+        return "H"
+    if (_probe_float(result.get("keyword_score")) > 0
+            or _probe_float(result.get("fts_score")) > 0):
+        return "K"
+    content = result.get("content")
+    if query and isinstance(content, str) and content.strip():
+        try:
+            if _lex_evidence(query, content):
+                return "K"
+        except Exception:
+            pass
+    return "S"
+
+
+def _probe_candidate_of(result):
+    """候选快照白名单 (R3): 只含 id/渠道/分数/page_fault, 不含正文。"""
+    try:
+        return {
+            "id": _probe_id(result.get("id")),
+            "channel": result.get("channel"),
+            "keyword_score": _probe_float(result.get("keyword_score")),
+            "fts_score": _probe_float(result.get("fts_score")),
+            "dense_score": _probe_float(result.get("dense_score")),
+            "page_fault": bool(result.get("page_fault")),
+            "handle": result.get("handle"),
+        }
+    except Exception:
+        return {"id": "", "channel": "S", "keyword_score": 0.0,
+                "fts_score": 0.0, "dense_score": 0.0,
+                "page_fault": False, "handle": None}
+
+
+def _json_safe_response(value):
+    """MCP 返回串严格 JSON 化: 非有限 float 归 0, 不可序列化对象转文本。"""
+    try:
+        if isinstance(value, float):
+            return value if math.isfinite(value) else 0.0
+        if isinstance(value, dict):
+            return {str(k): _json_safe_response(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe_response(v) for v in value]
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).decode("utf-8", errors="replace")
+        return value
+    except Exception:
+        return str(value)
+
+
+def _build_recall_probe_event(*, query, top_k, candidate_count, results,
+                              page_fault, restore, latency_ms, error=None,
+                              candidates=None, restored_ids=None):
+    """构造探针事件 (只入白名单字段; query 只以 sha256/len 形式存在)。
+
+    R3: candidates/restored_ids 为 restore 前快照与成功恢复 id, page_fault 由
+    调用方按快照计算, 不由 restore 后的 results 反推。
+    R8: rows = list(results or []) 一次物化, 所有数组严格同长; id 不折叠
+    0/False, 不可 JSON 序列化字段在探针落盘层再降级, 不丢整条事件。
+    """
+    try:
+        if results is None:
+            rows = []
+        else:
+            rows = list(results)
+        if len(rows) > 512:
+            rows = rows[:512]
+        candidate_rows = [] if candidates is None else list(candidates)
+        if len(candidate_rows) > 512:
+            candidate_rows = candidate_rows[:512]
+        restored = [] if restored_ids is None else list(restored_ids)
+        err = error
+        if err is not None and query:
+            # 即使上游异常文本意外带上 query, 探针也不落明文。
+            try:
+                err = str(err).replace(str(query), "<query>")
+            except Exception:
+                err = str(err)
+        return {
+            "source": "server_recall",
+            "query_sha256": _probe_query_sha256(query or ""),
+            "query_len": len((query or "")),
+            "top_k": _probe_int(top_k, 0),
+            "candidate_count": _probe_int(candidate_count, 0),
+            "returned_ids": [_probe_id(_r.get("id")) if isinstance(_r, dict)
+                             else _probe_id(_r) for _r in rows],
+            "dense_scores": [_probe_float(_r.get("dense_score"))
+                             if isinstance(_r, dict) else 0.0 for _r in rows],
+            "keyword_scores": [_probe_float(_r.get("keyword_score"))
+                               if isinstance(_r, dict) else 0.0 for _r in rows],
+            "fts_scores": [_probe_float(_r.get("fts_score"))
+                           if isinstance(_r, dict) else 0.0 for _r in rows],
+            "channel": [(_r.get("channel") or _recall_channel_of(_r, query=query))
+                        if isinstance(_r, dict) else "S" for _r in rows],
+            # 与 returned_ids 同长; selected 只做 raw-selected 占位。
+            "selected": [True] * len(rows),
+            "page_fault": bool(page_fault),
+            "restore": _probe_int(restore, 0),
+            "latency_ms": round(max(0.0, _probe_float(latency_ms)), 3),
+            "error": err,
+            "candidate_ids": [_probe_id(_r.get("id")) if isinstance(_r, dict)
+                              else _probe_id(_r) for _r in candidate_rows],
+            "candidate_channels": [_r.get("channel") or "S"
+                                   if isinstance(_r, dict) else "S"
+                                   for _r in candidate_rows],
+            "candidate_page_fault": [bool(_r.get("page_fault"))
+                                     if isinstance(_r, dict) else False
+                                     for _r in candidate_rows],
+            "candidates": [_probe_candidate_of(_r) if isinstance(_r, dict)
+                           else _r for _r in candidate_rows],
+            "restored_ids": [_probe_id(_rid) for _rid in restored],
+        }
+    except Exception:
+        # 观测构造自身失败也不得改变工具行为。
+        return {"source": "server_recall", "error": "probe_build_error"}
+
 @mcp.tool()
 def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
     """主动召回冷层记忆 (只读, 不写冷层/不 remember/update/forget)。
@@ -815,6 +975,9 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
     支持 CACHE-POLICY-V2 的句柄直查: 传入 handle 时先用本地 stub 目录定位
     cold_id, 再按 stub 主题召回并标注 page_fault/channel; 常规 query 保留冷层
     降权重排。冷层读取统一 bump=False (只读)。
+
+    P0 观测: 返回前向 core.recall_probe 落一条独立 JSONL (默认关闭);
+    不改返回顺序/内容, 不新增 MCP 工具。
 
     Args:
         query: 查询内容 (自然语言, 语义召回)
@@ -824,8 +987,13 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
         JSON: {"results": [...], "handle": ..., "page_fault": bool}
               冷层不可达时 {"error": "..."}
     """
+    _probe_t0 = time.perf_counter()
+    _probe_k = 0
+    _probe_candidate_count = 0
+    q = ""
     try:
         k = max(1, min(int(top_k), 10))
+        _probe_k = k
         handle = (handle or "").strip()
         handle_map = {}
         for _t in ("memory", "user"):
@@ -839,15 +1007,28 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
         if handle:
             hit = handle_map.get(handle)
             if not hit:
+                record_recall_probe(_build_recall_probe_event(
+                    query=q, top_k=k, candidate_count=0, results=[],
+                    page_fault=False, restore=0,
+                    latency_ms=(time.perf_counter() - _probe_t0) * 1000.0,
+                    error=f"handle not found: {handle}"))
                 return json.dumps({"error": f"handle not found: {handle}",
                                    "handle": handle}, ensure_ascii=False)
             q = _stub_topic(hit["stub"]) or q
         if q:
             log_activity_query(q)
         if not q:
+            record_recall_probe(_build_recall_probe_event(
+                query=q, top_k=k, candidate_count=0, results=[],
+                page_fault=False, restore=0,
+                latency_ms=(time.perf_counter() - _probe_t0) * 1000.0))
             return json.dumps({"results": [], "handle": handle,
                                "page_fault": False}, ensure_ascii=False)
         results = _client.recall_results(q, top_k=k, bump=False)
+        try:
+            _probe_candidate_count = len(results)
+        except Exception:
+            _probe_candidate_count = 0
         results = _apply_decay(results)
         # page_fault 标注: 结果命中本地任一 stub 的 cold_id 即为缺页写回候选。
         stub_ids = {}
@@ -857,23 +1038,59 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
                 _m = _ms.get_entry(_e) or {}
                 if _m.get("type") == "stub" and _m.get("cold_id"):
                     stub_ids[_m["cold_id"]] = _m.get("handle") or ""
+        _handle_cold_id = (hit["meta"].get("cold_id")
+                           if (handle and hit) else None)
         for _r in results:
+            # additive 透传: 缺失 keyword/fts 时补 0, 不改变原键值语义。
+            _r["keyword_score"] = _probe_float(_r.get("keyword_score"))
+            _r["fts_score"] = _probe_float(_r.get("fts_score"))
             _cid = _r.get("id")
             _r["page_fault"] = bool(_cid in stub_ids)
-            _r["channel"] = "H" if (handle and hit and _cid == hit["meta"].get("cold_id")) else "S"
+            _r["channel"] = _recall_channel_of(_r, _handle_cold_id, q)
             if _cid in stub_ids:
                 _r["handle"] = stub_ids[_cid]
-        # Phase 4: 召回结果命中 stub 的 cold_id → 自动恢复全文到热层
+        # Phase 4: 召回结果命中 stub 的 cold_id → 自动恢复全文到热层。
+        # R3: restore 前先快照候选; page_fault 按快照计算, restore 是独立成功计数。
+        _probe_candidates = [_probe_candidate_of(_r) if isinstance(_r, dict)
+                             else {"id": _probe_id(_r)} for _r in results]
+        _probe_page_fault = bool(handle) or any(
+            bool(_c.get("page_fault")) for _c in _probe_candidates)
+        _restore_before = len(results)
+        _restore_before_ids = {_probe_id(_r.get("id")) for _r in results
+                               if isinstance(_r, dict)}
         try:
             results = restore_stubs_from_results(
                 _store, {t: _metastore_for(t) for t in ("memory", "user")}, results)
         except Exception:
             pass  # 恢复失败不影响召回返回
-        return json.dumps({"results": results, "handle": handle,
+        _restore_after_ids = {_probe_id(_r.get("id")) for _r in results
+                              if isinstance(_r, dict)}
+        _restored_ids = [rid for rid in
+                         [(_r.get("id") if isinstance(_r, dict) else _r)
+                          for _r in (_probe_candidates)]
+                         if _probe_id(rid) in _restore_before_ids
+                         and _probe_id(rid) not in _restore_after_ids]
+        _restored = max(0, _restore_before - len(results))
+        record_recall_probe(_build_recall_probe_event(
+            query=q, top_k=k, candidate_count=_probe_candidate_count,
+            results=results, page_fault=_probe_page_fault, restore=_restored,
+            candidates=_probe_candidates,
+            restored_ids=_restored_ids or (
+                [] if _restored == 0 else _restored_ids),
+            latency_ms=(time.perf_counter() - _probe_t0) * 1000.0))
+        return json.dumps({"results": _json_safe_response(results),
+                           "handle": handle,
                            "page_fault": bool(handle),
                            "mode": "handle" if handle else "semantic"},
                           ensure_ascii=False)
     except Exception as e:
+        # 探针自身 fail-silent; 不吞掉工具原有错误返回。
+        record_recall_probe(_build_recall_probe_event(
+            query=q, top_k=_probe_k,
+            candidate_count=_probe_candidate_count, results=[],
+            page_fault=False, restore=0,
+            latency_ms=(time.perf_counter() - _probe_t0) * 1000.0,
+            error=str(e)[:280]))
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 

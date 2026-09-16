@@ -868,6 +868,40 @@ def _recall_channel_of(result, handle_cold_id=None, query=""):
     return "S"
 
 
+def _k_source_of(result, query="", channel=None):
+    """P1 观测: 单条结果的 K 证据来源 (只进探针事件, 不参与判断)。
+
+    冷层 keyword/fts 分数优先; 两者都缺失/异常时才尝试本地 bigram 证据。
+    任何字段缺失/类型异常一律降级为 "" (无 K 证据), 不抛异常。
+
+    k_source 必须服从 channel 优先级: H 行 (句柄直查) 一律返回 "",
+    不把已判 H 的行再染成 cold_kw/cold_kw_fts; K/S 行沿用原有证据口径。
+    """
+    try:
+        if channel == "H":
+            return ""
+        if not isinstance(result, dict):
+            return ""
+        kw = _probe_float(result.get("keyword_score")) > 0
+        fts = _probe_float(result.get("fts_score")) > 0
+        if kw and fts:
+            return "cold_kw_fts"
+        if kw:
+            return "cold_kw"
+        if fts:
+            return "cold_fts"
+        content = result.get("content")
+        if query and isinstance(content, str) and content.strip():
+            try:
+                if _lex_evidence(query, content):
+                    return "local_lex"
+            except Exception:
+                pass
+        return ""
+    except Exception:
+        return ""
+
+
 def _probe_candidate_of(result):
     """候选快照白名单 (R3): 只含 id/渠道/分数/page_fault, 不含正文。"""
     try:
@@ -904,7 +938,8 @@ def _json_safe_response(value):
 
 def _build_recall_probe_event(*, query, top_k, candidate_count, results,
                               page_fault, restore, latency_ms, error=None,
-                              candidates=None, restored_ids=None):
+                              candidates=None, restored_ids=None,
+                              handle_cold_id=None):
     """构造探针事件 (只入白名单字段; query 只以 sha256/len 形式存在)。
 
     R3: candidates/restored_ids 为 restore 前快照与成功恢复 id, page_fault 由
@@ -923,6 +958,17 @@ def _build_recall_probe_event(*, query, top_k, candidate_count, results,
         if len(candidate_rows) > 512:
             candidate_rows = candidate_rows[:512]
         restored = [] if restored_ids is None else list(restored_ids)
+        # P1/F1: channel 与 k_source 同一行、同一口径; channel 先算,
+        # k_source(..., channel=...) 再算, 保证 H 行 k_source 必为空。
+        channels = []
+        for _r in rows:
+            if isinstance(_r, dict):
+                _ch = _r.get("channel")
+                if not _ch:
+                    _ch = _recall_channel_of(_r, handle_cold_id, query)
+            else:
+                _ch = "S"
+            channels.append(_ch)
         err = error
         if err is not None and query:
             # 即使上游异常文本意外带上 query, 探针也不落明文。
@@ -944,8 +990,12 @@ def _build_recall_probe_event(*, query, top_k, candidate_count, results,
                                if isinstance(_r, dict) else 0.0 for _r in rows],
             "fts_scores": [_probe_float(_r.get("fts_score"))
                            if isinstance(_r, dict) else 0.0 for _r in rows],
-            "channel": [(_r.get("channel") or _recall_channel_of(_r, query=query))
-                        if isinstance(_r, dict) else "S" for _r in rows],
+            "channel": channels,
+            # P1/F1: 每条结果的 K 证据来源; channel=H 时强制为空,
+            # 与同位置 channel 数组严格自洽 (只进事件, 不参与判断)。
+            "k_source": [_k_source_of(_r, query=query, channel=channels[_i])
+                         if isinstance(_r, dict) else ""
+                         for _i, _r in enumerate(rows)],
             # 与 returned_ids 同长; selected 只做 raw-selected 占位。
             "selected": [True] * len(rows),
             "page_fault": bool(page_fault),
@@ -1077,6 +1127,7 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
             candidates=_probe_candidates,
             restored_ids=_restored_ids or (
                 [] if _restored == 0 else _restored_ids),
+            handle_cold_id=_handle_cold_id,
             latency_ms=(time.perf_counter() - _probe_t0) * 1000.0))
         return json.dumps({"results": _json_safe_response(results),
                            "handle": handle,

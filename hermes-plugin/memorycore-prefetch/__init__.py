@@ -25,6 +25,7 @@ queue_prefetch(query) 已禁用 (2026-08-05): 后台预取结果缓存从未被�
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -67,6 +68,8 @@ try:
         direct_write_govern, log_activity_query, MetaStore,
     )
     from memorycore.core.decay import _apply_decay  # noqa: E402
+    from memorycore.core.recall_probe import (  # noqa: E402  # P1 只读观测探针
+        query_sha256 as _probe_query_sha256, record_recall_probe)
 except ImportError:
     _REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     sys.path.insert(0, _REPO_ROOT)
@@ -90,6 +93,8 @@ except ImportError:
         direct_write_govern, log_activity_query, MetaStore,
     )
     from memorycore.core.decay import _apply_decay  # noqa: E402
+    from memorycore.core.recall_probe import (  # noqa: E402  # P1 只读观测探针
+        query_sha256 as _probe_query_sha256, record_recall_probe)
 
 _RECALL_CANDIDATES = 20    # 第一阶段召回候选数 (单模型 dense, 2026-08-11 qwen3 切换后沿用 20)
 _INJECT_TOP_N = 5          # 缺页注入上限 (沿用现有常量)
@@ -711,6 +716,10 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             client = ColdStoreClient(timeout=_PREFETCH_TIMEOUT)
             results = client.recall_results(q, top_k=_RECALL_CANDIDATES,
                                             bump=False)
+            # FIX-P2 (REVIEW-6 L2): 单条候选的异常 dense_score (超大整数/
+            # 非有限) 按 0 兜底后再进入 decay/选择链; 有限分数行原样通过,
+            # 保证正常输入下注入集合/顺序/文本逐字节不变。
+            results = self._normalize_abnormal_dense(results)
             self._record_baseline(results)
             results = _apply_decay(results)
             # 句柄直查: 对匹配 stub 主题追加只读 recall, 取回冷层真实 id 结果。
@@ -755,10 +764,252 @@ class MemoryCorePrefetchProvider(MemoryProvider):
                 except Exception:
                     pass  # 恢复失败不影响注入 (下轮重试)
             self._mark_injected_audit(selected)
-            return self._format_results(selected)
+            context = self._format_results(selected)
+            # P1: 注入决策完成后只读观测; 任何异常不得改变 prefetch 返回值。
+            # F1/F3: 必须把本次 H 句柄 id 集合带到事件构造处, channel 按
+            # 与 _recall_channel_of 相同口径逐候选计算; k_source 服从 channel。
+            try:
+                self._emit_prefetch_probe(q, results, selected, handle_ids)
+            except Exception:
+                pass
+            return context
         except Exception as e:
             logger.debug("memorycore-prefetch sync recall failed: %s", e)
             return ""
+
+    # -- P1: 探针接入 (只读观测, 绝不参与判断/排序/写回) -------------------
+
+    @staticmethod
+    def _probe_id_text(value: Any) -> str:
+        """探针 id 文本化: None -> ""; 异常 -> "" (不抛)。"""
+        if value is None:
+            return ""
+        try:
+            return str(value)[:4096]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _finite_score(value: Any) -> Optional[float]:
+        """L2 分数有限化探测: 类型异常/不可转 float/非有限值 → None。
+
+        与 ``_probe_num`` 共用同一转换 (P0 冻结口径: 非有限值一律归 0),
+        供选择链判断"该分数能否作为证据"以及选择前的兜底归一化使用。
+        """
+        try:
+            num = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return num if math.isfinite(num) else None
+
+    @staticmethod
+    def _probe_num(value: Any) -> float:
+        """探针数值降级: 缺失/类型异常/非有限值一律 0.0 (不抛)。"""
+        num = MemoryCorePrefetchProvider._finite_score(value)
+        return num if num is not None else 0.0
+
+    def _probe_k_source_of(self, query: str, result: Any,
+                           channel: Optional[str] = None) -> str:
+        """K 证据来源 (仅观测): cold keyword/fts 优先, 其次本地 bigram。
+
+        F1: 该行 channel 已判 H 时一律返回 "", 保证 channel/k_source 自洽;
+        K/S 行沿用 P1 原有证据口径。
+        """
+        try:
+            if channel == "H":
+                return ""
+            if not isinstance(result, dict):
+                return ""
+            kw = self._probe_num(result.get("keyword_score")) > 0
+            fts = self._probe_num(result.get("fts_score")) > 0
+            if kw and fts:
+                return "cold_kw_fts"
+            if kw:
+                return "cold_kw"
+            if fts:
+                return "cold_fts"
+            content = result.get("content")
+            if query and isinstance(content, str) and content.strip():
+                try:
+                    if _lex_evidence(query, content):
+                        return "local_lex"
+                except Exception:
+                    pass
+            return ""
+        except Exception:
+            return ""
+
+    def _probe_recall_channel_of(self, result: Any, query: str,
+                                 handle_ids: Any = None) -> str:
+        """prefetch 事件 channel 口径 (观测, 与 server._recall_channel_of 一致)。
+
+        H > K > S: id 命中本次 handle_ids 为 H; cold keyword/fts>0 或本地
+        bigram 证据为 K; 其余 S。仅用于事件构造, 不参与选择/排序/注入。
+        """
+        try:
+            if not isinstance(result, dict):
+                return ""
+            if handle_ids:
+                try:
+                    if result.get("id") in handle_ids:
+                        return "H"
+                except TypeError:
+                    pass
+            if (self._probe_num(result.get("keyword_score")) > 0
+                    or self._probe_num(result.get("fts_score")) > 0):
+                return "K"
+            content = result.get("content")
+            if query and isinstance(content, str) and content.strip():
+                try:
+                    if _lex_evidence(query, content):
+                        return "K"
+                except Exception:
+                    pass
+            return "S"
+        except Exception:
+            return ""
+
+    def _build_prefetch_probe_event(self, query: str,
+                                    candidates: List[Dict[str, Any]],
+                                    selected: List[Dict[str, Any]],
+                                    handle_ids: Any = None) -> Dict[str, Any]:
+        """构造 prefetch 观测事件: 候选数组 + injected 布尔数组 + selected id 列表。
+
+        ``returned_ids/channel/k_source`` 等数组按候选顺序与 ``injected`` 等长;
+        query 绝不落明文, 只落 sha256/长度。
+
+        F1: 先算 channel, 再用 channel 约束 k_source; H 行 k_source 必为 ""。
+        F2: injected 按行身份 (``_probe_candidate_index``) 反向标记, 而不是用
+        id 字符串 membership 反推; 重复/None id 不再全量误报 True。
+        F3: channel/candidate_channels 对每条候选按与 ``_recall_channel_of``
+        相同的 H>K>S 口径计算, 未进 selected / 被写回移除的候选不落 ""。
+        """
+        q = query or ""
+        rows = list(candidates or [])
+        final = list(selected or [])
+        selected_ids = [self._probe_id_text(r.get("id")) if isinstance(r, dict)
+                        else self._probe_id_text(r) for r in final]
+        selected_keys = list(selected_ids)
+
+        # F2: _select_fault_candidates 在每个被选中行副本上写入原始候选下标;
+        # 该行身份随行经过 _dedupe_injected / _dedupe_hot_layer / 写回移除,
+        # 最终仍留在 selected 里的下标集合就是真实注入集合。
+        selected_by_idx: Dict[int, str] = {}
+        all_final_indexed = bool(final)
+        for r in final:
+            idx = (r.get("_probe_candidate_index")
+                   if isinstance(r, dict) else None)
+            if (isinstance(idx, int) and not isinstance(idx, bool)
+                    and idx >= 0):
+                if idx not in selected_by_idx:
+                    selected_by_idx[idx] = (
+                        r.get("_channel") or r.get("channel") or "")
+            else:
+                all_final_indexed = False
+        selected_idxs = set(selected_by_idx)
+        use_row_identity = all_final_indexed and bool(selected_by_idx)
+
+        # 兼容回退: 直接调用事件构造、selected 未带行身份下标时, 维持旧版
+        # 按 id 集合判断 injected; 生产 _recall_sync 路径始终走行身份。
+        channel_by_id: Dict[str, Any] = {}
+        for r in final:
+            if isinstance(r, dict):
+                rid = self._probe_id_text(r.get("id"))
+                if rid not in channel_by_id:
+                    channel_by_id[rid] = (r.get("_channel")
+                                          or r.get("channel") or "")
+
+        returned_ids: List[str] = []
+        dense_scores: List[float] = []
+        keyword_scores: List[float] = []
+        fts_scores: List[float] = []
+        channels: List[str] = []
+        k_sources: List[str] = []
+        injected: List[bool] = []
+        candidate_page_fault: List[bool] = []
+        candidates_out: List[Dict[str, Any]] = []
+        for row_index, r in enumerate(rows):
+            if isinstance(r, dict):
+                rid = self._probe_id_text(r.get("id"))
+                dense = self._probe_num(r.get("dense_score"))
+                kws = self._probe_num(r.get("keyword_score"))
+                fts = self._probe_num(r.get("fts_score"))
+                # F1/F3: selected 行以真实 _channel 为准; 未 selected 行按
+                # 本次 handle_ids + K 证据同口径重算。selected 行 _channel
+                # 为空时也回落到重算, 不落空 ""。
+                if use_row_identity and row_index in selected_by_idx:
+                    ch = selected_by_idx[row_index]
+                    if not ch:
+                        ch = self._probe_recall_channel_of(
+                            r, q, handle_ids)
+                elif not use_row_identity and channel_by_id.get(rid):
+                    ch = channel_by_id[rid]
+                else:
+                    ch = self._probe_recall_channel_of(r, q, handle_ids)
+                pf = bool(r.get("page_fault"))
+                candidates_out.append({
+                    "id": rid, "channel": ch, "keyword_score": kws,
+                    "fts_score": fts, "dense_score": dense,
+                    "page_fault": pf, "handle": r.get("handle"),
+                })
+            else:
+                rid = self._probe_id_text(r)
+                dense = 0.0
+                kws = 0.0
+                fts = 0.0
+                ch = ""
+                pf = False
+                candidates_out.append({
+                    "id": rid, "channel": ch, "keyword_score": kws,
+                    "fts_score": fts, "dense_score": dense,
+                    "page_fault": pf, "handle": None,
+                })
+            returned_ids.append(rid)
+            dense_scores.append(dense)
+            keyword_scores.append(kws)
+            fts_scores.append(fts)
+            channels.append(ch)
+            # F1: K 证据必须服从已算出的 channel; H 行强制空串。
+            k_sources.append(self._probe_k_source_of(q, r, channel=ch))
+            if use_row_identity:
+                injected.append(row_index in selected_idxs)
+            else:
+                injected.append(rid in selected_keys)
+            candidate_page_fault.append(pf)
+
+        return {
+            "source": "prefetch",
+            "query_sha256": _probe_query_sha256(q),
+            "query_len": len(q),
+            "top_k": _INJECT_TOP_N,
+            "candidate_count": len(rows),
+            "returned_ids": returned_ids,
+            "dense_scores": dense_scores,
+            "keyword_scores": keyword_scores,
+            "fts_scores": fts_scores,
+            "channel": channels,
+            "k_source": k_sources,
+            "selected": selected_ids,
+            "injected": injected,
+            "page_fault": bool(any(candidate_page_fault)),
+            "restore": 0,
+            "candidate_ids": list(returned_ids),
+            "candidate_channels": list(channels),
+            "candidate_page_fault": list(candidate_page_fault),
+            "candidates": candidates_out,
+        }
+
+    def _emit_prefetch_probe(self, query: str,
+                             candidates: List[Dict[str, Any]],
+                             selected: List[Dict[str, Any]],
+                             handle_ids: Any = None) -> None:
+        """落一条 prefetch 只读观测; 失败完全静默。"""
+        try:
+            record_recall_probe(self._build_prefetch_probe_event(
+                query, candidates, selected, handle_ids))
+        except Exception:
+            pass
+
 
     def _mark_injected_audit(self, results: List[Dict[str, Any]]) -> None:
         """仅写 sidecar last_injected_at 审计; 不刷新 last_active_at/weight。"""
@@ -829,15 +1080,36 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             return True
         return self._shared_bigrams(q, topic) >= 2
 
+    def _normalize_abnormal_dense(self, results: list) -> list:
+        """FIX-P2 (REVIEW-6 L2): 选择前把无法有限化的 dense_score 归 0。
+
+        仅改写异常行 (不可转 float / 非有限 / 缺失), 让单条坏分数只影响该条
+        自己; 可有限化分数一律原样返回, 以保持正常输入行为逐字节不变。
+        """
+        if not isinstance(results, list):
+            return results
+        changed = False
+        rows = []
+        for r in results:
+            if (isinstance(r, dict)
+                    and self._finite_score(r.get("dense_score")) is None):
+                r = dict(r)
+                r["dense_score"] = 0.0
+                changed = True
+            rows.append(r)
+        return rows if changed else results
+
     def _keyword_consensus(self, q: str, result: Dict[str, Any]) -> bool:
-        """K 通道: keyword/fts>0 或本地 bigram 词法证据 (sb≥2)。"""
-        try:
-            if float(result.get("keyword_score") or 0) > 0:
-                return True
-            if float(result.get("fts_score") or 0) > 0:
-                return True
-        except (TypeError, ValueError):
-            pass
+        """K 通道: keyword/fts 有限正分 或 本地 bigram 词法证据 (sb≥2)。
+
+        FIX-P2 (REVIEW-6 L2): 与 ``_probe_num``/``_probe_float`` 统一口径;
+        float(x) 失败或非有限 (inf/"inf"/"1e400"/nan/超大整数) 一律按 0,
+        不作为 K 证据, 也不得因单条异常分数让整条 prefetch 失败。
+        """
+        kw = self._probe_num(result.get("keyword_score"))
+        fts = self._probe_num(result.get("fts_score"))
+        if kw > 0 or fts > 0:
+            return True
         content = result.get("content") or ""
         if not content:
             return False
@@ -851,11 +1123,13 @@ class MemoryCorePrefetchProvider(MemoryProvider):
                                  *, action_trigger: bool = False) -> List[Dict[str, Any]]:
         """S/K/H 三通道共识 + H>K>S 排序, 注入 ≤_INJECT_TOP_N (沿用现有常量)。"""
         picked = []
-        for r in results:
+        for candidate_index, r in enumerate(results):
             rid = r.get("id")
-            try:
-                dense = float(r.get("dense_score") or 0)
-            except (TypeError, ValueError):
+            # FIX-P2 (REVIEW-6 L2): 与 _probe_num 同口径有限化; 异常/非有限
+            # dense 只按 0 参与本条判断, 不拖累其它候选或整条 prefetch。
+            dense = self._finite_score(r.get("dense_score"))
+            dense_abnormal = dense is None
+            if dense is None:
                 dense = 0.0
             h = bool(rid in handle_ids)
             k = self._keyword_consensus(q, r)
@@ -872,13 +1146,26 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             else:
                 ch = "S"
             rr = dict(r)
+            if dense_abnormal:
+                # L2: 本条异常 dense 归 0, 避免格式化整数值再次拖垮 prefetch;
+                # 该行仍可凭 H/K 证据继续参与注入。
+                rr["dense_score"] = 0.0
             rr["_channel"] = ch
             rr["_consensus"] = bool(h or k)  # F4: 不含 action_trigger
             rr["_action_recall"] = bool(action_trigger)
+            # P1-F2: 仅观测的行身份 (原始候选下标), 不参与选择/排序/注入;
+            # 事件构造用它精确区分重复 id 中真正注入的那一行。
+            # observation-only bookkeeping; accepted exception per REVIEW-6 L1
+            rr["_probe_candidate_index"] = candidate_index
             picked.append(rr)
         order = {"H": 0, "K": 1, "S": 2}
-        picked.sort(key=lambda r: (order.get(r.get("_channel"), 3),
-                                   -float(r.get("dense_score") or 0)))
+
+        def _rank_key(r):
+            dense_norm = self._finite_score(r.get("dense_score"))
+            return (order.get(r.get("_channel"), 3),
+                    -(dense_norm if dense_norm is not None else 0.0))
+
+        picked.sort(key=_rank_key)
         return picked[:_INJECT_TOP_N]
 
     def _filter_by_dense_topn(self, results: list) -> list:

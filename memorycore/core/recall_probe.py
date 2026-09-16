@@ -20,9 +20,9 @@
   * ``MEMORYCORE_RECALL_PROBE_COMPACT=0`` 可禁用滚动/截断 (只读调试开关;
     文件写入路径与事件字段不受影响)。
 
-TODO(P1): 热层 prefetch 侧接入
-(``hermes-plugin/memorycore-prefetch/__init__.py::_recall_sync``) 留待下一轮；
-本轮明确不改插件, 避免影响 K/H/S 共识与写回行为。
+P1: prefetch 侧已通过 ``hermes-plugin/memorycore-prefetch/__init__.py::
+_recall_sync`` 接入同一探针；新增 ``k_source`` / ``injected`` 观测字段仍只进
+事件白名单, 不改变注入行为。
 """
 from __future__ import annotations
 
@@ -79,7 +79,9 @@ _EVENT_FIELDS = (
     "keyword_scores",
     "fts_scores",
     "channel",
+    "k_source",
     "selected",
+    "injected",
     "page_fault",
     "restore",
     "latency_ms",
@@ -95,8 +97,9 @@ _EVENT_FIELDS = (
 
 _ARRAY_FIELDS = (
     "returned_ids", "dense_scores", "keyword_scores", "fts_scores",
-    "channel", "selected", "candidate_ids", "candidate_channels",
-    "candidate_page_fault", "candidates", "restored_ids",
+    "channel", "k_source", "selected", "injected", "candidate_ids",
+    "candidate_channels", "candidate_page_fault", "candidates",
+    "restored_ids",
 )
 
 _METRICS: Dict[str, int] = {
@@ -322,14 +325,14 @@ def _cap_array(items: Any, limit: int = PROBE_MAX_ARRAY_ITEMS) -> Any:
 def _shrink_value(key: str, value: Any) -> Any:
     value = _json_safe(value)
     if key in ("returned_ids", "candidate_ids", "restored_ids", "channel",
-               "candidate_channels"):
+               "candidate_channels", "k_source"):
         value = _cap_array(value)
         if isinstance(value, list):
             return [x[:PROBE_MAX_STRING_CHARS] if isinstance(x, str) else x
                     for x in value]
         return value
     if key in ("dense_scores", "keyword_scores", "fts_scores",
-               "candidate_page_fault", "selected"):
+               "candidate_page_fault", "selected", "injected"):
         return _cap_array(value)
     if key == "candidates":
         value = _cap_array(value)

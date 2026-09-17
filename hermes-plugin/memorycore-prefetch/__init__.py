@@ -1203,7 +1203,9 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             ch = r.get("_channel") or r.get("channel") or ""
             tag = f"|{ch}" if ch else ""
             lines.append(f"- [{score:.2f}{tag}] {content}")
-        return "## MemoryCore Recall\n" + "\n".join(lines)
+        return ("## MemoryCore Recall\n"
+                "> 以下为候选记忆(按相似度排序, 未经核实); 涉及精确事实/数值时请先交叉核对。\n"
+                + "\n".join(lines))
 
     @staticmethod
     def _preprocess_query(query: str) -> str:

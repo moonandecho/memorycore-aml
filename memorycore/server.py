@@ -1272,6 +1272,9 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
     P0 观测: 返回前向 core.recall_probe 落一条独立 JSONL (默认关闭);
     不改返回顺序/内容, 不新增 MCP 工具。
 
+    口径: 返回内容为候选记忆 (按相似度排序, 未经核实), 不保证与查询
+    意图相关; 涉及精确事实/数值时请先交叉核对, 不应直接作为事实依据。
+
     Args:
         query: 查询内容 (自然语言, 语义召回)
         top_k: 返回条数 (默认 3, 最大 10)

@@ -325,9 +325,11 @@ _FINITE_SCENARIOS = [
     ),
 ]
 
-# 整改前 (review6) 同样 6 组 mock 的 prefetch return 规范化 JSON sha256。
+# 历史: 整改前 (review6) 同样 6 组 mock 的 prefetch return 规范化 JSON
+# sha256 为 a892c433...; 本次为有意的口径改动 (候选/未核实 caveat 文案),
+# 按重新冻结流程更新为下方实测值, 检索/排序/注入逻辑未动。
 _FINITE_RETURN_SHA256 = (
-    "a892c433ed9e2ea152adfa0d2a3efef7c764aea3e38fdf02a5a9a751984ac4d2")
+    "80f755091c3e3da6336d7e44450d6af52de2cd009c01ac811e7699289c523d3e")
 
 
 def test_l2_finite_six_mocks_return_unchanged(tmp_path, monkeypatch):
@@ -342,4 +344,7 @@ def test_l2_finite_six_mocks_return_unchanged(tmp_path, monkeypatch):
         returns[scenario["name"]] = provider.prefetch(scenario["query"])
     blob = json.dumps(returns, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":")).encode("utf-8")
-    assert hashlib.sha256(blob).hexdigest() == _FINITE_RETURN_SHA256
+    actual = hashlib.sha256(blob).hexdigest()
+    assert actual == _FINITE_RETURN_SHA256, (
+        f"finite return hash mismatch: expected {_FINITE_RETURN_SHA256}, "
+        f"actual {actual}")

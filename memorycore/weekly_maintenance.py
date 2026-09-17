@@ -431,6 +431,30 @@ def smart_tidy(store, client, target: str, stat: dict, dry: bool) -> None:
                 break
 
 
+# ---- 冷层数据完整性守卫 (2026-09-18) ----
+
+def _cold_integrity_lines(client) -> list:
+    """把「有多少记忆掉出召回范围」变成每周报告里可见的一行。
+
+    2026-09-18 事故: 08-15 引入 working_memory 层时, 此前写入的 123 条历史条目
+    从未迁入 —— 它们既召回不到、也不参与治理, 而 doctor 判「正常」, 4 周后才被
+    偶然发现。适配层 stats() 现在上报 memory_rows / orphan_rows, 这里消费它。
+    """
+    try:
+        st = client.stats() or {}
+    except Exception as e:  # 冷层不可达不能让周治理整体失败
+        return [f"  冷层完整性: 检查失败 ({type(e).__name__})"]
+    orphan = st.get("orphan_rows")
+    raw = st.get("memory_rows")
+    if orphan is None:
+        return ["  冷层完整性: ⚠️ 未上报 (适配层 stats 无 orphan_rows, 可能是旧版)"
+                " — 无法确认是否有记忆掉出召回"]
+    if orphan > 0:
+        return [f"  冷层完整性: ⚠️ {orphan} 条记忆只在 memories 表、对召回与治理不可见"
+                f" (raw={raw}) — 需要回填!"]
+    return [f"  冷层完整性: 正常 (raw={raw} 条, 差集 0)"]
+
+
 def _ratio(a: str, b: str) -> float:
     import difflib
     return difflib.SequenceMatcher(None, a, b).ratio()
@@ -518,6 +542,8 @@ def main() -> None:
         except Exception as e:
             lines.append(f"\n## 冷层治理\n异常: {e}")
             stat["errors"] += 1
+        # 冷层数据完整性 (2026-09-18): 掉出召回范围的历史行
+        lines.extend(_cold_integrity_lines(client))
     finally:
         llm_guard.close()
 

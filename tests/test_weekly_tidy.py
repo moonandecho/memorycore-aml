@@ -502,3 +502,42 @@ def test_tidy_ambiguous_llm_unavailable_before_due_backs_off(
     m = meta_for("memory").get_entry(e)
     assert m["judge_review_count"] == 1 and m["judge_review_at"]
     assert mock_client.stored == []
+
+
+# ---- 冷层数据完整性上报 (2026-09-18) --------------------------------------
+
+class _StatsClient(MockMnemosyneClient):
+    """stats() 可控的 mock: 验证「掉出召回范围」的各个上报分支。"""
+
+    def __init__(self, stats=None, raise_exc=None):
+        super().__init__()
+        self._stats = stats
+        self._raise = raise_exc
+
+    def stats(self):
+        if self._raise is not None:
+            raise self._raise
+        return dict(self._stats or {})
+
+
+def test_cold_integrity_flags_orphans():
+    out = "\n".join(wm._cold_integrity_lines(_StatsClient(
+        {"total": 270, "memory_rows": 270, "orphan_rows": 123})))
+    assert "123" in out and "不可见" in out and "⚠️" in out
+
+
+def test_cold_integrity_ok_when_no_orphans():
+    out = "\n".join(wm._cold_integrity_lines(_StatsClient(
+        {"total": 270, "memory_rows": 270, "orphan_rows": 0})))
+    assert "正常" in out and "270" in out and "⚠️" not in out
+
+
+def test_cold_integrity_unknown_when_field_missing():
+    out = "\n".join(wm._cold_integrity_lines(_StatsClient({"total": 270})))
+    assert "未上报" in out
+
+
+def test_cold_integrity_survives_cold_unreachable():
+    out = "\n".join(wm._cold_integrity_lines(
+        _StatsClient(raise_exc=RuntimeError("cold down"))))
+    assert "检查失败" in out and "RuntimeError" in out

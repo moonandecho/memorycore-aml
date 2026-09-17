@@ -80,6 +80,8 @@ def test_recall_readonly_bump_false_and_no_hot_writes(
     expected = [r["id"] for r in _apply_decay([dict(it) for it in items])]
     client = _RecallClient(items)
     _patch_server(monkeypatch, tmp_store, client)
+    # 2026-09-18 融合改默认开之后: 本用例钉住旧路径的单次 top_k=3 调用形状。
+    monkeypatch.setenv("MEMORYCORE_RECALL_FUSION", "0")
 
     got = server.recall_readonly("合成查询", top_k=3)
 

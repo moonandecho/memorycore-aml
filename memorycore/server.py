@@ -812,11 +812,13 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
 
 
 # ---------------------------------------------------------------------------
-# P2: 预注册召回融合 (治理层, env 开关默认关)
+# P2: 预注册召回融合 (治理层; 2026-09-18 起默认开, 可显式关)
 # ---------------------------------------------------------------------------
 # 预注册超参 (DESIGN-P2.md §1.3): 不得因 dev/holdout 结果调参。
 _RECALL_FUSION_ENV = "MEMORYCORE_RECALL_FUSION"
 _RECALL_FUSION_CANDIDATE_K_ENV = "MEMORYCORE_RECALL_FUSION_CANDIDATE_K"
+# 显式关闭白名单 (2026-09-18 默认开之后: 只有这些值关闭融合)
+_RECALL_FUSION_OFF_VALUES = ("0", "false", "no", "off")
 _RECALL_FUSION_CANDIDATE_K_DEFAULT = 30
 _RECALL_FUSION_CANDIDATE_K_MAX = 50
 _RECALL_FUSION_RRF_K = 5
@@ -832,9 +834,25 @@ _RECALL_FUSION_DIGIT2_RE = re.compile(r"\d{2,}")
 
 
 def _recall_fusion_enabled():
-    """env 开关默认关; 仅显式白名单真值启用。"""
-    value = (os.environ.get(_RECALL_FUSION_ENV, "0") or "").strip().lower()
-    return value in ("1", "true", "yes", "on")
+    """融合默认开; 仅显式白名单假值关闭 (2026-09-18 闸门判定后改默认)。
+
+    判定依据 (PREREGISTRATION-v7-rrf.md / RRF-V7-VALIDATION-REPORT.md):
+    未参与选参的 v7 闸门块 (153 正样本 / 79 负控) hit@5 **+10.91pp**,
+    配对 McNemar 精确 p=0.0227 (24 组不一致), MRR +0.086, 负控误返率不变,
+    每次召回 p50 +4.3ms, 无新模型/服务/依赖; 30% 封存块同向 (+9.30pp, 无回退)。
+    关闭 = 回到判定前的原召回路径 (逐字节旧行为, 由 golden 回归测试钉住)。
+
+    取值口径 (默认开之后): 未设置 / 空串 / 纯空白 → 开;
+    0/false/no/off (任意大小写与首尾空白) → 关;
+    其余值 (含拼写错误与随机串) → 开 (默认即开; 见发布说明)。
+    """
+    raw = os.environ.get(_RECALL_FUSION_ENV)
+    if raw is None:
+        return True
+    value = raw.strip().lower()
+    if not value:
+        return True
+    return value not in _RECALL_FUSION_OFF_VALUES
 
 
 def _recall_fusion_candidate_k():
@@ -1031,7 +1049,8 @@ def _recall_core(query, k, *, fusion_on=False, handle_cold_id=None,
 def recall_readonly(query: str = "", top_k: int = 3, *, fusion_on=None):
     """只读评估入口: 与 ``memorycore_recall`` 共用 ``_recall_core`` 内核。
 
-    ``fusion_on=None`` 时读取 env 开关 ``MEMORYCORE_RECALL_FUSION`` (默认关);
+    ``fusion_on=None`` 时读取 env 开关 ``MEMORYCORE_RECALL_FUSION``
+    (2026-09-18 起默认开, 可显式 0/false/no/off 关闭);
     env 关闭时与设计轮基线逐字节同路径: 单次
     ``_client.recall_results(bump=False)`` → ``_apply_decay`` → 同样的
     keyword/fts 收口与 page_fault/channel 标注。区别是本函数**不写热层**:

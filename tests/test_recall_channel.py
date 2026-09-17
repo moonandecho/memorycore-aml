@@ -37,8 +37,11 @@ def _patch(tmp_store, client):
     server._client = client
 
 
-def test_missing_keyword_fts_order_identical_to_decay(tmp_store):
+def test_missing_keyword_fts_order_identical_to_decay(tmp_store, monkeypatch):
     """dense-only 冷层: 返回顺序 == _apply_decay 顺序, K/S 字段 additive。"""
+    # 2026-09-18 融合改默认开之后: 本用例断言的是旧路径的顺序/调用形状,
+    # 融合路径下由 RRF 分数决定顺序 → 显式关闭融合。
+    monkeypatch.setenv("MEMORYCORE_RECALL_FUSION", "0")
     items = [
         {"id": "c1", "content": "甲", "dense_score": 0.40,
          "importance": 0.9},
@@ -176,7 +179,10 @@ def test_probe_off_zero_write_on_writes_full_event_no_plaintext(
         "attempts": 1, "written": 1, "errors": 0, "dropped": 0}
 
 
-def test_top_k_clamped_to_10_and_min_1(tmp_store):
+def test_top_k_clamped_to_10_and_min_1(tmp_store, monkeypatch):
+    # 2026-09-18 融合改默认开之后: 本用例钉住旧路径的 top_k 夹取调用形状
+    # (融合路径下候选请求固定为 candidate_k=30, 与 top_k 夹取无关)。
+    monkeypatch.setenv("MEMORYCORE_RECALL_FUSION", "0")
     client = _RecallClient([])
     _patch(tmp_store, client)
     server.memorycore_recall("查询", top_k=99)

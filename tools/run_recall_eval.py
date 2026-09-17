@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -38,6 +39,57 @@ RecallFn = Callable[[str, int], Sequence[Any]]
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _parse_freeze_decay_time(value: str) -> datetime:
+    """解析 CLI 的 ISO8601 冻结时间; 无时区按 UTC。"""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("freeze decay time must be a non-empty ISO8601 string")
+    raw = value.strip()
+    if raw[-1:] in ("Z", "z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"freeze decay time is not valid ISO8601: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_decay_reference(reference: datetime) -> str:
+    value = (reference if reference.tzinfo is not None
+             else reference.replace(tzinfo=timezone.utc))
+    return (value.astimezone(timezone.utc)
+            .isoformat().replace("+00:00", "Z"))
+
+
+def _install_frozen_decay_clock(reference: datetime):
+    """把 ``memorycore.core.decay.datetime`` 换成返回固定 now 的子类 (仅进程内)。
+
+    ``memorycore.server`` 从 ``memorycore.core.decay`` import 的是函数对象;
+    函数在调用时按 ``memorycore.core.decay`` 模块全局名查找 ``datetime``,
+    因此 patch 对该进程内所有 ``_apply_decay`` 调用生效。返回原始引用供恢复。
+    """
+    from memorycore.core import decay as _decay
+    frozen = reference.astimezone(timezone.utc)
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return frozen.replace(tzinfo=None)
+            return frozen.astimezone(tz)
+
+    original = _decay.datetime
+    _decay.datetime = _FrozenDateTime
+    return original
+
+
+def _restore_decay_clock(original) -> None:
+    from memorycore.core import decay as _decay
+    _decay.datetime = original
 
 
 def load_labels(path: Path) -> List[Dict[str, Any]]:
@@ -142,9 +194,29 @@ def _cold_store_recall_factory() -> RecallFn:
     return _recall
 
 
+
+def _server_recall_factory() -> RecallFn:
+    """治理层只读召回路径: 复用 ``memorycore.server.recall_readonly``。
+
+    ``recall_readonly`` 与 ``memorycore_recall`` 的无 handle 语义 query 分支
+    共用同一冷层调用 (bump=False) 与同一份 ``_apply_decay``，但不写活动
+    日志/探针，也不调用 ``restore_stubs_from_results``。
+    """
+    from memorycore.server import recall_readonly
+
+    def _recall(query: str, top_k: int) -> List[str]:
+        results = recall_readonly(query, top_k=top_k)
+        return _result_ids(results)
+
+    return _recall
+
+
 def _recall_source(name: str) -> RecallFn:
+    """解析 --recall-source: cold/mnemosyne=双后端直连, server=治理层只读, empty=自检。"""
     if name == "empty":
         return _empty_recall
+    if name == "server":
+        return _server_recall_factory()
     if name in ("cold", "mnemosyne"):
         return _cold_store_recall_factory()
     raise ValueError(f"unknown recall source: {name}")
@@ -333,11 +405,15 @@ def main(argv: Optional[Sequence[str]] = None, *,
     ap.add_argument("--top-k", type=int, default=5,
                     help="评估截断 (默认 5; 仅只读召回, 不改变 server 行为)")
     ap.add_argument("--recall-source",
-                    choices=("cold", "mnemosyne", "empty"),
+                    choices=("cold", "mnemosyne", "server", "empty"),
                     default="cold",
                     help="cold = 只读冷层评估 (mnemosyne 为兼容别名); "
+                         "server = 治理层只读路径 (同 memorycore_recall 召回/decay); "
                          "empty = 离线输出格式自检, 不产生真实数字")
     ap.add_argument("--json-out", type=Path, default=None)
+    ap.add_argument("--freeze-decay-time", default=None, metavar="ISO8601",
+                    help="冻结 _apply_decay 的评估侧时间参考 (仅本进程内); "
+                         "未给定时记录并使用实际墙钟")
     args = ap.parse_args(argv)
 
     if args.top_k < 1:
@@ -359,31 +435,49 @@ def main(argv: Optional[Sequence[str]] = None, *,
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    frozen_reference = None
+    if args.freeze_decay_time is not None:
+        try:
+            frozen_reference = _parse_freeze_decay_time(args.freeze_decay_time)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    eval_reference = (frozen_reference if frozen_reference is not None
+                      else datetime.now(timezone.utc))
+    decay_clock_original = None
+    if frozen_reference is not None:
+        decay_clock_original = _install_frozen_decay_clock(frozen_reference)
     try:
-        fn = recall_fn or _recall_source(args.recall_source)
-    except Exception as exc:  # noqa: BLE001
-        print(f"error: recall source unavailable: {type(exc).__name__}",
-              file=sys.stderr)
-        return 2
-    try:
-        report = evaluate_labels(
-            rows, fn, top_k=args.top_k,
-            labels_sha256=labels_sha256,
-            label_version=manifest.get("label_version"),
-            embed_model=manifest.get("embed_model"),
-            manifest_buckets=manifest.get("buckets"),
-            frozen_at=manifest.get("frozen_at"),
-        )
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    report["recall_source"] = ("injected" if recall_fn is not None
-                               else args.recall_source)
-    text = json.dumps(report, ensure_ascii=False, indent=2)
-    print(text)
-    if args.json_out:
-        Path(args.json_out).write_text(text + "\n", encoding="utf-8")
-    return 0
+        try:
+            fn = recall_fn or _recall_source(args.recall_source)
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: recall source unavailable: {type(exc).__name__}",
+                  file=sys.stderr)
+            return 2
+        try:
+            report = evaluate_labels(
+                rows, fn, top_k=args.top_k,
+                labels_sha256=labels_sha256,
+                label_version=manifest.get("label_version"),
+                embed_model=manifest.get("embed_model"),
+                manifest_buckets=manifest.get("buckets"),
+                frozen_at=manifest.get("frozen_at"),
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        report["recall_source"] = ("injected" if recall_fn is not None
+                                   else args.recall_source)
+        # P2-FIX-D: 冻结口径可复现; 未冻结时记录实际墙钟参考时间。
+        report["decay_reference_time"] = _format_decay_reference(eval_reference)
+        text = json.dumps(report, ensure_ascii=False, indent=2)
+        print(text)
+        if args.json_out:
+            Path(args.json_out).write_text(text + "\n", encoding="utf-8")
+        return 0
+    finally:
+        if decay_clock_original is not None:
+            _restore_decay_clock(decay_clock_original)
 
 
 if __name__ == "__main__":

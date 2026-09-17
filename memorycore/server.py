@@ -9,6 +9,8 @@
 """
 import json
 import math
+import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -810,6 +812,247 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
 
 
 # ---------------------------------------------------------------------------
+# P2: 预注册召回融合 (治理层, env 开关默认关)
+# ---------------------------------------------------------------------------
+# 预注册超参 (DESIGN-P2.md §1.3): 不得因 dev/holdout 结果调参。
+_RECALL_FUSION_ENV = "MEMORYCORE_RECALL_FUSION"
+_RECALL_FUSION_CANDIDATE_K_ENV = "MEMORYCORE_RECALL_FUSION_CANDIDATE_K"
+_RECALL_FUSION_CANDIDATE_K_DEFAULT = 30
+_RECALL_FUSION_CANDIDATE_K_MAX = 50
+_RECALL_FUSION_RRF_K = 5
+_RECALL_FUSION_W_ENGINE = 1.0
+_RECALL_FUSION_W_DECAY = 1.5
+_RECALL_FUSION_W_LEX = 0.25
+_RECALL_FUSION_LEX_PRODUCT_LIMIT = 200_000
+
+_RECALL_FUSION_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_RECALL_FUSION_LATIN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.:/#\-]*")
+_RECALL_FUSION_DATE_RE = re.compile(r"\d{4}[-/年]\d{1,2}(?:[-/月]\d{1,2}日?)?")
+_RECALL_FUSION_DIGIT2_RE = re.compile(r"\d{2,}")
+
+
+def _recall_fusion_enabled():
+    """env 开关默认关; 仅显式白名单真值启用。"""
+    value = (os.environ.get(_RECALL_FUSION_ENV, "0") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _recall_fusion_candidate_k():
+    """预注册 candidate_k 默认 30; 允许 env 覆盖, 硬上限 50。"""
+    raw = os.environ.get(_RECALL_FUSION_CANDIDATE_K_ENV)
+    try:
+        value = (int(raw) if raw is not None
+                 else _RECALL_FUSION_CANDIDATE_K_DEFAULT)
+    except (TypeError, ValueError):
+        value = _RECALL_FUSION_CANDIDATE_K_DEFAULT
+    if value < 1:
+        value = 1
+    return min(value, _RECALL_FUSION_CANDIDATE_K_MAX)
+
+
+def _recall_fusion_longest_common_cjk(a, b):
+    """LCS 项的公共连续中文字串长度 (只统计 CJK, 与预注册公式一致)。"""
+    aa = "".join(_RECALL_FUSION_CJK_RE.findall(a or ""))
+    bb = "".join(_RECALL_FUSION_CJK_RE.findall(b or ""))
+    if not aa or not bb:
+        return 0
+    prev = [0] * (len(bb) + 1)
+    best = 0
+    for i in range(1, len(aa) + 1):
+        cur = [0] * (len(bb) + 1)
+        ai = aa[i - 1]
+        for j in range(1, len(bb) + 1):
+            if ai == bb[j - 1]:
+                val = prev[j - 1] + 1
+                cur[j] = val
+                if val > best:
+                    best = val
+        prev = cur
+    return best
+
+
+def _recall_fusion_normalize_date(token):
+    return re.sub(r"[年月/]", "-", token).rstrip("日")
+
+
+def _recall_fusion_lex_score(query, content):
+    """DESIGN-P2 §1.2 预注册词法/实体弱特征 (只读, 不调用冷层)。
+
+    非字符串 query/content 一律按无词法证据处理 (score=0), 不让单条
+    坏数据把整条融合召回变成报错/空结果。
+    """
+    q = query if isinstance(query, str) else ""
+    c = content if isinstance(content, str) else ""
+    cl = c.lower()
+    score = 0.0
+    for token in _RECALL_FUSION_LATIN_RE.findall(q):
+        if len(token) < 2:
+            continue
+        tl = token.lower()
+        if token.isalpha():
+            if re.search(r"(?<![a-z0-9_])" + re.escape(tl) +
+                         r"(?![a-z0-9_])", cl):
+                score += 0.4
+        elif tl in cl:
+            score += 1.0
+    if set(_RECALL_FUSION_DIGIT2_RE.findall(q)) & set(
+            _RECALL_FUSION_DIGIT2_RE.findall(c)):
+        score += 0.7
+    q_dates = {_recall_fusion_normalize_date(x)
+               for x in _RECALL_FUSION_DATE_RE.findall(q)}
+    c_dates = {_recall_fusion_normalize_date(x)
+               for x in _RECALL_FUSION_DATE_RE.findall(c)}
+    if q_dates & c_dates:
+        score += 1.0
+    if len(q) * len(c) <= _RECALL_FUSION_LEX_PRODUCT_LIMIT:
+        common = _recall_fusion_longest_common_cjk(q, c)
+        if common >= 3:
+            score += min(0.5 * (common - 2), 1.5)
+    return round(score, 6)
+
+
+def _fuse_recall_candidates(results, query, top_k):
+    """对候选池做三路 RRF 融合, 返回截断到 top_k 的原候选 dict 列表。
+
+    三路: R_eng=冷层返回序; R_dec=`_apply_decay` 后 final_score 序;
+    R_lex=本地预注册词法证据序 (仅正证据). 只读, 不调冷层/不落盘/不扩候选。
+
+    名次 key 是候选在 `pool` 中的位置 (行身份), 不是 `id`。因此重复 id
+    各自保留独立名次, 缺失 id 的行同样按独立候选参与, 不会被 dict 折叠。
+    """
+    pool = list(results or [])
+    if not pool:
+        return []
+    n = len(pool)
+    # R_eng: 冷层返回序 (1-based, 位置即身份).
+    engine_rank = list(range(1, n + 1))
+
+    # R_lex: 仅正词法证据参与; 同分以 engine rank 稳定决胜。
+    lex_scores = [_recall_fusion_lex_score(query, row.get("content"))
+                  for row in pool]
+    lex_items = sorted(
+        [(-lex_scores[pos], engine_rank[pos], pos)
+         for pos in range(n) if lex_scores[pos] > 0],
+    )
+    lex_rank = {pos: i + 1 for i, (_, _, pos) in enumerate(lex_items)}
+
+    # R_dec: 复用现有 decay 路径; 按候选对象身份还原到原位置, 不被 id 折叠。
+    decayed = _apply_decay(list(pool))
+    positions_by_identity = {}
+    for pos, row in enumerate(pool):
+        positions_by_identity.setdefault(id(row), []).append(pos)
+    decay_rank = {}
+    for rank, row in enumerate(decayed, 1):
+        pending = positions_by_identity.get(id(row))
+        if pending:
+            decay_rank[pending.pop(0)] = rank
+
+    scored = []
+    for pos, row in enumerate(pool):
+        score = (_RECALL_FUSION_W_ENGINE /
+                 (_RECALL_FUSION_RRF_K + engine_rank[pos])
+                 + _RECALL_FUSION_W_DECAY /
+                 (_RECALL_FUSION_RRF_K + decay_rank.get(pos, n + 1)))
+        if pos in lex_rank:
+            score += _RECALL_FUSION_W_LEX / (
+                _RECALL_FUSION_RRF_K + lex_rank[pos])
+        scored.append((score, engine_rank[pos], pos))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    limit = max(0, int(top_k))
+    return [pool[pos] for _, _, pos in scored[:limit]]
+
+
+def _recall_core(query, k, *, fusion_on=False, handle_cold_id=None,
+                 safe_annotation=False, candidate_count_sink=None):
+    """单一召回内核: 冷层单次 bump=False 读取 → 融合/原衰减 → 字段标注。
+
+    生产 ``memorycore_recall`` (handle/写回/探针) 与只读评估
+    ``recall_readonly`` 共用本函数; 开关关闭时逐字节保持原召回路径行为。
+    返回 ``(results, candidate_count)``: candidate_count 为冷层本次实际返回
+    条数 (融合开启且冷层只返回不足 candidate_k 时如实反映实际值)。
+    ``candidate_count_sink`` (可选 list) 在字段标注前写入候选数, 供生产探针
+    在标注/衰减失败时仍与关闭路径记录同一 candidate_count。
+    """
+    def _remember_candidate_count(value):
+        if candidate_count_sink is not None:
+            try:
+                candidate_count_sink[0] = value
+            except Exception:
+                pass
+
+    if fusion_on:
+        results = _client.recall_results(
+            query, top_k=_recall_fusion_candidate_k(), bump=False)
+        try:
+            candidate_count = len(results)
+        except Exception:
+            candidate_count = 0
+        _remember_candidate_count(candidate_count)
+        results = _fuse_recall_candidates(results, query, k)
+    else:
+        results = _client.recall_results(query, top_k=k, bump=False)
+        try:
+            candidate_count = len(results)
+        except Exception:
+            candidate_count = 0
+        _remember_candidate_count(candidate_count)
+        results = _apply_decay(results)
+
+    try:
+        # page_fault 标注: 结果命中本地任一 stub 的 cold_id 即为缺页写回候选。
+        stub_ids = {}
+        for _t, _ms in (("memory", _metastore_for("memory")),
+                        ("user", _metastore_for("user"))):
+            for _e in _store.entries(_t):
+                _m = _ms.get_entry(_e) or {}
+                if _m.get("type") == "stub" and _m.get("cold_id"):
+                    stub_ids[_m["cold_id"]] = _m.get("handle") or ""
+        for _r in results:
+            # additive 透传: 缺失 keyword/fts 时补 0, 不改变原键值语义。
+            _r["keyword_score"] = _probe_float(_r.get("keyword_score"))
+            _r["fts_score"] = _probe_float(_r.get("fts_score"))
+            _cid = _r.get("id")
+            _r["page_fault"] = bool(_cid in stub_ids)
+            _r["channel"] = _recall_channel_of(_r, handle_cold_id, query)
+            if _cid in stub_ids:
+                _r["handle"] = stub_ids[_cid]
+    except Exception:
+        # recall_readonly 原约定: 热层 stub 标注失败不影响冷层召回本身;
+        # 生产路径保持原语义, 标注异常照常抛出由工具壳处理。
+        if not safe_annotation:
+            raise
+    return results, candidate_count
+
+
+# ---------------------------------------------------------------------------
+# P2-step0: 评估/治理只读召回入口 (复用 memorycore_recall 的召回与排序路径)
+# ---------------------------------------------------------------------------
+
+def recall_readonly(query: str = "", top_k: int = 3, *, fusion_on=None):
+    """只读评估入口: 与 ``memorycore_recall`` 共用 ``_recall_core`` 内核。
+
+    ``fusion_on=None`` 时读取 env 开关 ``MEMORYCORE_RECALL_FUSION`` (默认关);
+    env 关闭时与设计轮基线逐字节同路径: 单次
+    ``_client.recall_results(bump=False)`` → ``_apply_decay`` → 同样的
+    keyword/fts 收口与 page_fault/channel 标注。区别是本函数**不写热层**:
+      * 不调用 ``log_activity_query`` (活动日志追加也属于写)；
+      * 不调用 ``restore_stubs_from_results`` (因此不会 replace 热层 stub)；
+      * 不写 ``record_recall_probe`` (观测落盘)。
+    供 ``tools/run_recall_eval.py --recall-source server`` 测治理层排序。
+    异常向上抛给 runner，由 runner 按 miss 计数。
+    """
+    k = max(1, min(int(top_k), 10))
+    q = (query or "").strip()
+    if not q:
+        return []
+    if fusion_on is None:
+        fusion_on = _recall_fusion_enabled()
+    results, _ = _recall_core(q, k, fusion_on=bool(fusion_on),
+                              safe_annotation=True)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # 工具 5: memorycore_recall — 主动召回冷层 (只读, 冷层降权重排)
 # ---------------------------------------------------------------------------
 
@@ -1040,6 +1283,7 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
     _probe_t0 = time.perf_counter()
     _probe_k = 0
     _probe_candidate_count = 0
+    _probe_candidate_count_sink = [0]
     q = ""
     try:
         k = max(1, min(int(top_k), 10))
@@ -1074,31 +1318,14 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
                 latency_ms=(time.perf_counter() - _probe_t0) * 1000.0))
             return json.dumps({"results": [], "handle": handle,
                                "page_fault": False}, ensure_ascii=False)
-        results = _client.recall_results(q, top_k=k, bump=False)
-        try:
-            _probe_candidate_count = len(results)
-        except Exception:
-            _probe_candidate_count = 0
-        results = _apply_decay(results)
-        # page_fault 标注: 结果命中本地任一 stub 的 cold_id 即为缺页写回候选。
-        stub_ids = {}
-        for _t, _ms in (("memory", _metastore_for("memory")),
-                        ("user", _metastore_for("user"))):
-            for _e in _store.entries(_t):
-                _m = _ms.get_entry(_e) or {}
-                if _m.get("type") == "stub" and _m.get("cold_id"):
-                    stub_ids[_m["cold_id"]] = _m.get("handle") or ""
+        # P2: 单一召回内核, 与 recall_readonly 同源; handle 直查不启用融合。
         _handle_cold_id = (hit["meta"].get("cold_id")
                            if (handle and hit) else None)
-        for _r in results:
-            # additive 透传: 缺失 keyword/fts 时补 0, 不改变原键值语义。
-            _r["keyword_score"] = _probe_float(_r.get("keyword_score"))
-            _r["fts_score"] = _probe_float(_r.get("fts_score"))
-            _cid = _r.get("id")
-            _r["page_fault"] = bool(_cid in stub_ids)
-            _r["channel"] = _recall_channel_of(_r, _handle_cold_id, q)
-            if _cid in stub_ids:
-                _r["handle"] = stub_ids[_cid]
+        _fusion_on = bool(not handle and _recall_fusion_enabled())
+        results, _ = _recall_core(
+            q, k, fusion_on=_fusion_on, handle_cold_id=_handle_cold_id,
+            candidate_count_sink=_probe_candidate_count_sink)
+        _probe_candidate_count = _probe_candidate_count_sink[0]
         # Phase 4: 召回结果命中 stub 的 cold_id → 自动恢复全文到热层。
         # R3: restore 前先快照候选; page_fault 按快照计算, restore 是独立成功计数。
         _probe_candidates = [_probe_candidate_of(_r) if isinstance(_r, dict)
@@ -1136,6 +1363,7 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
                           ensure_ascii=False)
     except Exception as e:
         # 探针自身 fail-silent; 不吞掉工具原有错误返回。
+        _probe_candidate_count = _probe_candidate_count_sink[0]
         record_recall_probe(_build_recall_probe_event(
             query=q, top_k=_probe_k,
             candidate_count=_probe_candidate_count, results=[],

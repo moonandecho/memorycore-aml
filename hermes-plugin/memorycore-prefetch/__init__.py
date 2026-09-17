@@ -68,6 +68,7 @@ try:
         direct_write_govern, log_activity_query, MetaStore,
     )
     from memorycore.core.decay import _apply_decay  # noqa: E402
+    from memorycore.core import recall_fusion as _recall_fusion  # noqa: E402  # P2 融合内核(与治理层同一份实现)
     from memorycore.core.recall_probe import (  # noqa: E402  # P1 只读观测探针
         query_sha256 as _probe_query_sha256, record_recall_probe)
 except ImportError:
@@ -93,6 +94,7 @@ except ImportError:
         direct_write_govern, log_activity_query, MetaStore,
     )
     from memorycore.core.decay import _apply_decay  # noqa: E402
+    from memorycore.core import recall_fusion as _recall_fusion  # noqa: E402  # P2 融合内核(与治理层同一份实现)
     from memorycore.core.recall_probe import (  # noqa: E402  # P1 只读观测探针
         query_sha256 as _probe_query_sha256, record_recall_probe)
 
@@ -714,14 +716,25 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             handle_ids = {r.get("cold_id") for r in handle_records
                           if r.get("cold_id")}
             client = ColdStoreClient(timeout=_PREFETCH_TIMEOUT)
-            results = client.recall_results(q, top_k=_RECALL_CANDIDATES,
-                                            bump=False)
+            # 2026-09-18: 融合默认开, 与治理层共用 core/recall_fusion 内核
+            # (此前插件自己拼「引擎序 + 纯 decay」, 治理层的排序改进到不了
+            #  每轮注入这条真实流量路径)。池大小: 融合开 → 预注册
+            # candidate_k(默认 30); 融合关 → 沿用旧口径 20。
+            # 滚动基线的样本口径**不变**: 仍取引擎序前 _RECALL_CANDIDATES 条。
+            _fuse_on = _recall_fusion.fusion_enabled()
+            _pool_k = (_recall_fusion.candidate_k() if _fuse_on
+                       else _RECALL_CANDIDATES)
+            results = client.recall_results(q, top_k=_pool_k, bump=False)
             # FIX-P2 (REVIEW-6 L2): 单条候选的异常 dense_score (超大整数/
             # 非有限) 按 0 兜底后再进入 decay/选择链; 有限分数行原样通过,
             # 保证正常输入下注入集合/顺序/文本逐字节不变。
             results = self._normalize_abnormal_dense(results)
-            self._record_baseline(results)
-            results = _apply_decay(results)
+            self._record_baseline(results[:_RECALL_CANDIDATES])
+            if _fuse_on:
+                results = _recall_fusion.fuse_candidates(results, q,
+                                                         len(results))
+            else:
+                results = _apply_decay(results)
             # 句柄直查: 对匹配 stub 主题追加只读 recall, 取回冷层真实 id 结果。
             if handle_records:
                 seen = {r.get("id") for r in results}

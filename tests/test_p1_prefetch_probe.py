@@ -112,7 +112,8 @@ def test_prefetch_probe_enabled_identical_injection_and_event(tmp_path,
 
     # 同一组 mock 输入差分: 注入集合、顺序、格式逐字节一致
     assert out_on == out_off
-    assert fake_on.queries and fake_on.queries[0][1] == 20
+    # 2026-09-18: 融合默认开 → 候选池 = 预注册 candidate_k(默认 30)。
+    assert fake_on.queries and fake_on.queries[0][1] == 30
     assert fake_on.queries[0][2] is False
     # 注入顺序: K(dense 0.3) -> K(local lex, dense 0.2) -> S(dense 0.9)
     assert selected_capture == [["c-kw", "c-lex", "c-s"]]

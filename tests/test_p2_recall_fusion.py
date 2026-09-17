@@ -15,6 +15,7 @@ import pytest
 
 from memorycore import server
 from memorycore.core.decay import _apply_decay
+from memorycore.core import recall_fusion as core_recall_fusion  # noqa: F401  P2 融合内核 (2026-09-18 抽出)
 
 
 class _RecallClient:
@@ -177,7 +178,9 @@ def test_fuse_candidates_rrf_expected_order(monkeypatch):
         rows.sort(key=lambda r: r.get("final_score", 0), reverse=True)
         return rows
 
-    monkeypatch.setattr(server, "_apply_decay", _fake_decay)
+    # 2026-09-18: 融合内核已抽到 core/recall_fusion.py, patch 点随之移动
+    # (patch server._apply_decay 不再影响内核 → 会静默跑真 decay)。
+    monkeypatch.setattr(core_recall_fusion, "_apply_decay", _fake_decay)
     rows = [
         {"id": "A", "content": "alpha", "dense_score": 0.1,
          "_decay_score": 0.1, "importance": 0.9},

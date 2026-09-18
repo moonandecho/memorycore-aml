@@ -7,7 +7,7 @@
 
 | Item | Value |
 |---|---|
-| System name and version | MemoryCore (AML edition); version + fixed commit — see §5 |
+| System name and version | MemoryCore (AML edition) v0.1.0; **fixed commit (evaluated code): `f48b7b373d9e775bb36c96afc85fe76fc92dbfb6`** |
 | Evaluation type | **Open-Source Methods board** (participant-hosted Add / Search API; not a repository submission) |
 | Track | **Textual memory** (no multimodal track, no code track this cycle) |
 | Add endpoint | `http://47.108.28.129:18000/add` |
@@ -174,6 +174,9 @@ embedding: ollama + derived tag qwen3-embedding-aml-ctx1024 (FROM qwen3-embeddin
 - No external LLM is used in writing or retrieval; no answer generation.
 
 ## 5. Reproduction
+
+**Version and fixed commit**: system version `0.1.0`; evaluated code pinned at **`f48b7b373d9e775bb36c96afc85fe76fc92dbfb6`**
+(the deployed `/health` reports the same commit for cross-checking; documentation commits in this repo are not part of the frozen version).
 
 ### 5.1 Local start (bare metal)
 

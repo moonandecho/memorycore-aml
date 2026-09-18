@@ -695,12 +695,20 @@ async def aml_search(request: Request) -> JSONResponse:
     _log_multimodal_counts(img_count, oversize_count)
     query = " ".join(query_texts)
 
-    top_k = body.get("top_k", _MAX_TOP_K)
-    try:
-        top_k = int(top_k)
-    except (TypeError, ValueError):
-        return _bad(400, "top_k must be an integer")
-    top_k = max(1, min(top_k, _MAX_TOP_K))
+    # Spec §05: top_k is required; the response count must never exceed it.
+    # Accept only JSON integers.  bool is an int subclass; reject it
+    # explicitly.  Floats (including Infinity/NaN), strings, null, missing
+    # and negative values are field-validation errors (422), not 500/400.
+    if "top_k" not in body:
+        return _validation_error("top_k is required and must be an integer")
+    raw_top_k = body["top_k"]
+    if isinstance(raw_top_k, bool) or not isinstance(raw_top_k, int):
+        return _validation_error("top_k must be an integer")
+    if raw_top_k < 0:
+        return _validation_error("top_k must be a non-negative integer")
+    top_k = min(raw_top_k, _MAX_TOP_K)
+    if top_k == 0:
+        return JSONResponse({"data": []}, status_code=200)
 
     # Image-only query: legal ContentPart[], but there is no text to search.
     if not query_texts:

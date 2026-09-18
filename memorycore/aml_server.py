@@ -718,7 +718,9 @@ async def aml_health(request: Request) -> JSONResponse:
         except Exception:
             state = "degraded"
             detail["storage"] = "unavailable"
-    return JSONResponse({"status": state, **detail}, status_code=200)
+    payload = {"status": state, **detail,
+               "version": SERVICE_VERSION, "commit": _git_commit()}
+    return JSONResponse(payload, status_code=200)
 
 
 def main() -> None:

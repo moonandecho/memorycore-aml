@@ -115,6 +115,8 @@ _GOVERNANCE_COUNTS: Dict[str, int] = {
     "textless_requests": 0,
     "image_parts": 0,
     "oversize_image_parts": 0,
+    "aggregate_image_parts": 0,
+    "invalid_image_parts": 0,
 }
 
 logger = logging.getLogger("memorycore.aml")
@@ -416,92 +418,226 @@ def _require_str(body: Dict[str, Any], field: str) -> Optional[str]:
     return v
 
 
-def _estimate_inline_image_bytes(url: Any) -> Optional[int]:
-    """Approximate decoded bytes for an inline data:image/...;base64 URL.
+class _MalformedImagePart(ValueError):
+    """Structural image_url error -> request validation 422 (not skip)."""
 
-    Returns None when the URL is not an accepted inline image.  Base64 is never
-    decoded, so an oversize image part cannot trigger a decode/OOM.
+
+def _parse_inline_image_url(url: Any) -> Tuple[str, int, str]:
+    """Parse an inline data:image Base64 URL without decoding the payload.
+
+    Returns (normalized_mime, estimated_decoded_bytes, payload_status) where
+    payload_status is "valid" or "invalid".  Structural problems (remote URL,
+    unsupported mime, missing ;base64,) raise _MalformedImagePart so the caller
+    can return 422; only a malformed *payload* is a tolerant skip.
     """
     if not isinstance(url, str) or len(url) < 12:
-        return None
-    if url[:11].lower() != "data:image/":
-        return None
-    sep = url.find(";base64,")
+        raise _MalformedImagePart(
+            "must be a non-empty inline data:image/...;base64 URL")
+    lower = url.lower()
+    if not lower.startswith("data:image/"):
+        raise _MalformedImagePart(
+            "must be an inline data:image/...;base64 URL")
+    sep = lower.find(";base64,")
     if sep < 0:
-        return None
-    mime = url[11:sep].strip().lower()
+        raise _MalformedImagePart(
+            "must be an inline data:image/...;base64 URL")
+    mime = lower[11:sep].strip().lower()
     if mime not in _SUPPORTED_IMAGE_MIMES:
+        raise _MalformedImagePart(
+            f"uses unsupported image mime {mime!r}; expected JPEG, PNG or WebP")
+    payload = re.sub(r"\s+", "", url[sep + len(";base64,"):])
+    normalized_mime = f"image/{mime}"
+    if not payload or len(payload) % 4 != 0 or not _BASE64_RE.fullmatch(payload):
+        # Review round 3 / C2: a technically inline data URI with a bad
+        # Base64 payload must be skipped and counted, not rejected with 4xx.
+        return normalized_mime, 0, "invalid"
+    padding = payload.count("=")
+    decoded = (len(payload) // 4) * 3 - padding
+    if decoded < 0:
+        return normalized_mime, 0, "invalid"
+    return normalized_mime, decoded, "valid"
+
+
+def _estimate_inline_image_bytes(url: Any) -> Optional[int]:
+    """Backward-compatible size helper; invalid payloads return None."""
+    try:
+        _mime, size, status = _parse_inline_image_url(url)
+    except _MalformedImagePart:
         return None
-    payload_start = sep + len(";base64,")
-    payload_len = len(url) - payload_start
-    if payload_len <= 0:
+    if status != "valid":
         return None
-    # 3 bytes per 4 base64 chars, minus padding.  No decode / no payload copy.
-    padding = url.count("=", payload_start)
-    return max((payload_len * 3) // 4 - padding, 0)
+    return size
 
 
-def _extract_texts(content: Any, where: str) -> Tuple[List[str], int, int, Optional[str]]:
-    """Extract ordered text parts from Add/Search content (string or array).
+def _scan_content_parts(
+        content: Any, where: str
+) -> Tuple[List[str], List[Dict[str, Any]], Optional[str]]:
+    """Extract ordered texts and image-part metadata from content.
 
-    Returns (texts, image_count, oversize_image_count, error_reason).
-    Image parts are counted only; no visual processing, no original image
-    retention.  Images estimated to decode above 10 MiB are skipped while all
-    text parts are preserved.
+    Structural errors are returned as error_reason (422).  Image payloads are
+    classified as valid or invalid; no original image bytes are retained and no
+    Base64 payload is decoded.
     """
     if isinstance(content, str):
         text = content.strip()
         if not text:
-            return [], 0, 0, f"{where} must be a non-empty string or content array"
-        return [text], 0, 0, None
+            return [], [], f"{where} must be a non-empty string or content array"
+        return [text], [], None
 
     if not isinstance(content, list) or not content:
-        return [], 0, 0, f"{where} must be a non-empty string or content array"
+        return [], [], f"{where} must be a non-empty string or content array"
 
     texts: List[str] = []
-    image_count = 0
-    oversize_count = 0
+    image_events: List[Dict[str, Any]] = []
     for idx, part in enumerate(content):
         if not isinstance(part, dict):
-            return [], image_count, oversize_count, f"{where}[{idx}] must be an object"
+            return [], image_events, f"{where}[{idx}] must be an object"
         part_type = part.get("type")
         if part_type == "text":
             text = part.get("text")
             if not isinstance(text, str) or not text.strip():
-                return [], image_count, oversize_count, (
+                return [], image_events, (
                     f"{where}[{idx}].text must be a non-empty string")
             texts.append(text.strip())
         elif part_type == "image_url":
             image = part.get("image_url")
             if not isinstance(image, dict):
-                return [], image_count, oversize_count, (
+                return [], image_events, (
                     f"{where}[{idx}].image_url must be an object")
-            size = _estimate_inline_image_bytes(image.get("url"))
-            if size is None:
-                return [], image_count, oversize_count, (
-                    f"{where}[{idx}].image_url.url must be an inline "
-                    "data:image/...;base64 URL")
-            if size > _MAX_IMAGE_DECODED_BYTES:
-                oversize_count += 1
-            else:
-                image_count += 1
+            try:
+                mime, decoded, payload_status = _parse_inline_image_url(
+                    image.get("url"))
+            except _MalformedImagePart as e:
+                return [], image_events, (
+                    f"{where}[{idx}].image_url.url {e}")
+            image_events.append({
+                "mime": mime,
+                "decoded_bytes": decoded,
+                "payload_status": payload_status,
+                "part_index": idx,
+            })
         else:
-            return [], image_count, oversize_count, (
+            return [], image_events, (
                 f"{where}[{idx}].type must be 'text' or 'image_url'")
-    # Spec ContentPart[]: every part must have a valid type; type=text must
-    # be non-empty.  There is no requirement that the array contain a text
-    # part, so an image-only array is valid input.  Callers decide what a
-    # textless request means (Add: valid/no write; Search: valid/no results).
-    return texts, image_count, oversize_count, None
+    return texts, image_events, None
 
 
-def _log_multimodal_counts(image_count: int, oversize_count: int) -> None:
+def _empty_image_counts() -> Dict[str, int]:
+    return {
+        "accepted": 0,
+        "oversize": 0,
+        "aggregate": 0,
+        "invalid": 0,
+        "cumulative_bytes": 0,
+    }
+
+
+def _apply_image_limits(
+        image_events: List[Dict[str, Any]], cumulative_bytes: int = 0
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Classify image events under the 10 MiB/image + 30 MiB/request limits.
+
+    The aggregate counter includes every valid decoded payload in source order;
+    skipped-but-valid parts still count toward the request total so the limit is
+    enforced even when earlier images were individually oversize.
+    """
+    annotated: List[Dict[str, Any]] = []
+    counts = _empty_image_counts()
+    running = max(int(cumulative_bytes or 0), 0)
+    for raw in image_events or []:
+        ev = dict(raw)
+        if ev.get("payload_status") != "valid":
+            ev["kind"] = "invalid"
+            counts["invalid"] += 1
+            annotated.append(ev)
+            continue
+        size = max(int(ev.get("decoded_bytes") or 0), 0)
+        running += size
+        if size > _MAX_IMAGE_DECODED_BYTES:
+            ev["kind"] = "oversize"
+            counts["oversize"] += 1
+        elif running > _MAX_TOTAL_IMAGE_DECODED_BYTES:
+            ev["kind"] = "aggregate"
+            counts["aggregate"] += 1
+        else:
+            ev["kind"] = "accepted"
+            counts["accepted"] += 1
+        annotated.append(ev)
+    counts["cumulative_bytes"] = running
+    return annotated, counts
+
+
+def _extract_texts(content: Any, where: str) -> Tuple[List[str], int, int, Optional[str]]:
+    """Extract ordered text parts from Add/Search content (string or array).
+
+    Returns (texts, accepted_image_count, skipped_image_count, error_reason).
+    Image parts are counted only; no visual processing, no original image
+    retention.  Single images above 10 MiB, request totals above 30 MiB, and
+    malformed Base64 payloads are skipped and counted while all text is kept.
+    """
+    texts, image_events, err = _scan_content_parts(content, where)
+    if err:
+        return [], 0, 0, err
+    _annotated, counts = _apply_image_limits(image_events, 0)
+    skipped = counts["oversize"] + counts["aggregate"] + counts["invalid"]
+    return texts, counts["accepted"], skipped, None
+
+
+def _placeholder_content(session_id: str,
+                         image_events: List[Dict[str, Any]]) -> str:
+    """Metadata-only placeholder for legal Add requests without text parts.
+
+    G4/B1: image-only (including all-skipped-image) requests must have a
+    durable, immediately searchable record instead of returning a zero-write
+    200.  No original image bytes, OCR output, or image evidence are retained.
+    """
+    chosen = None
+    for ev in image_events or []:
+        if ev.get("payload_status") == "valid":
+            chosen = ev
+            break
+    if chosen is None:
+        return (f"[image-only message] mime=image/unknown decoded_bytes=0 "
+                f"session={session_id}")
+    mime = chosen.get("mime") or "image/unknown"
+    decoded = int(chosen.get("decoded_bytes") or 0)
+    return (f"[image-only message] mime={mime} decoded_bytes={decoded} "
+            f"session={session_id}")
+
+
+def _write_placeholder(client: ColdStoreClient, user_id: str, session_id: str,
+                       image_events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Persist one placeholder metadata record for a no-text legal Add.
+
+    Route through the module-level _store_fragment so governance and test
+    double hooks stay consistent.  duplicate/updated are acceptable: the
+    record already exists and is searchable, so the 200 is still truthful.
+    """
+    content = _placeholder_content(session_id, image_events)
+    try:
+        result = _store_fragment(
+            client, content, user_id, source="image-only")
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+    status = str(result.get("status", "error"))
+    if status == "stored":
+        return {"status": "stored", "memory_id": result.get("memory_id")}
+    if status in ("duplicate", "updated"):
+        return {"status": status, "memory_id": result.get("memory_id")}
+    if status in ("stale", "filtered"):
+        return {"status": "error",
+                "detail": f"placeholder metadata record was {status}: "
+                          f"{result.get('detail', '')}"}
+    return {"status": "error", "detail": str(result)}
+
+
+def _log_multimodal_counts(accepted_count: int, skipped_count: int) -> None:
     """One aggregate count log per request; payload bytes are never logged."""
-    if image_count or oversize_count:
+    if accepted_count or skipped_count:
         logger.info(
-            "AML multimodal content: image_parts=%d oversize_skipped=%d "
+            "AML multimodal content: image_parts=%d skipped_parts=%d "
             "(no original image / no OCR / no image evidence returned)",
-            image_count, oversize_count,
+            accepted_count, skipped_count,
         )
 
 
@@ -512,7 +648,7 @@ def _governance_snapshot() -> Dict[str, int]:
 
 def _record_governance(request_id: str, parsed_messages: List[Tuple[str, str]],
                        write_results: List[Dict[str, Any]],
-                       image_count: int, oversize_count: int) -> None:
+                       media_counts: Dict[str, int]) -> None:
     """Aggregate policy outcomes for observability, never for the response.
 
     Governance decisions (stale / filtered / duplicate / stored / updated)
@@ -523,8 +659,14 @@ def _record_governance(request_id: str, parsed_messages: List[Tuple[str, str]],
     with _GOVERNANCE_LOCK:
         _GOVERNANCE_COUNTS["requests"] += 1
         _GOVERNANCE_COUNTS["fragments"] += len(statuses)
-        _GOVERNANCE_COUNTS["image_parts"] += image_count
-        _GOVERNANCE_COUNTS["oversize_image_parts"] += oversize_count
+        _GOVERNANCE_COUNTS["image_parts"] += int(
+            media_counts.get("accepted", 0))
+        _GOVERNANCE_COUNTS["oversize_image_parts"] += int(
+            media_counts.get("oversize", 0))
+        _GOVERNANCE_COUNTS["aggregate_image_parts"] += int(
+            media_counts.get("aggregate", 0))
+        _GOVERNANCE_COUNTS["invalid_image_parts"] += int(
+            media_counts.get("invalid", 0))
         if not parsed_messages:
             _GOVERNANCE_COUNTS["textless_requests"] += 1
         for status in statuses:
@@ -532,12 +674,11 @@ def _record_governance(request_id: str, parsed_messages: List[Tuple[str, str]],
                 _GOVERNANCE_COUNTS[status] += 1
     logger.info(
         "AML governance request_id=%s text_parts=%d fragments=%d "
-        "statuses=%s textless_images=%d",
-        request_id, len(parsed_messages), len(statuses), statuses, image_count,
+        "statuses=%s textless_images=%d media=%s",
+        request_id, len(parsed_messages), len(statuses), statuses,
+        int(media_counts.get("accepted", 0)), media_counts,
     )
 
-
-# ---- request_id idempotency ledger (SQLite, bounded, restart-safe) --------
 
 def _ledger_path() -> str:
     return os.path.join(_require_data_dir(), "aml_request_ledger.sqlite3")
@@ -719,27 +860,39 @@ async def aml_add(request: Request) -> JSONResponse:
     if not isinstance(messages, list) or not messages:
         return _validation_error("messages must be a non-empty array")
 
-    # validate every message before any write, so one bad message cannot leave
+    # Validate every message before any write, so one bad message cannot leave
     # a partially-written request behind.
     parsed_messages: List[Tuple[str, str]] = []
-    total_images = 0
-    total_oversize = 0
+    image_events_all: List[Dict[str, Any]] = []
+    media_counts = _empty_image_counts()
+    cumulative_image_bytes = 0
     for idx, msg in enumerate(messages):
         if not isinstance(msg, dict):
             return _validation_error(f"messages[{idx}] must be an object")
         role = msg.get("role")
-        if not isinstance(role, str) or not role.strip():
-            return _validation_error(f"messages[{idx}].role must be a non-empty string")
-        texts, img_count, oversize_count, err = _extract_texts(
+        # Spec line 1440: "The message role is user or assistant."
+        if not isinstance(role, str) or role.strip() not in ("user", "assistant"):
+            return _validation_error(
+                f"messages[{idx}].role must be 'user' or 'assistant'")
+        texts, image_events, err = _scan_content_parts(
             msg.get("content"), f"messages[{idx}].content")
         if err:
             return _validation_error(err)
-        total_images += img_count
-        total_oversize += oversize_count
+        annotated, counts = _apply_image_limits(
+            image_events, cumulative_image_bytes)
+        cumulative_image_bytes = counts["cumulative_bytes"]
+        for key in ("accepted", "oversize", "aggregate", "invalid"):
+            media_counts[key] += counts[key]
+        media_counts["cumulative_bytes"] = cumulative_image_bytes
+        image_events_all.extend(annotated)
         for text in texts:
             parsed_messages.append((role.strip(), text))
 
-    _log_multimodal_counts(total_images, total_oversize)
+    _log_multimodal_counts(
+        media_counts["accepted"],
+        media_counts["oversize"] + media_counts["aggregate"]
+        + media_counts["invalid"],
+    )
 
     body_hash = _body_hash(body)
     try:
@@ -754,31 +907,44 @@ async def aml_add(request: Request) -> JSONResponse:
     if state == "replay":
         return _ledger_response(row)
 
-    # Image-only (or all-oversize-image) requests are legal but have no text
-    # to write; they still go through the idempotency ledger and return 200.
-    client = _get_client() if parsed_messages else None
-    if parsed_messages and client is None:
+    # B1 / fix-round3a: every legal Add that would otherwise have no text to
+    # write (image-only, all-oversize-image, all-invalid-image) must persist a
+    # metadata-only placeholder before a 200 is returned.  The storage client
+    # is required even for these requests because success now implies a write.
+    client = _get_client()
+    if client is None:
         _ledger_abort(request_id, body_hash)
         return _bad(500, "storage backend unavailable (embedding service down?)")
 
     write_results: List[Dict[str, Any]] = []
     try:
-        for role, text in parsed_messages:
-            for frag in _split_fragments(text):
-                result = _store_fragment(client, frag, user_id, source=role)
-                if result.get("status") == "error":
-                    _ledger_abort(request_id, body_hash)
-                    return _bad(500, f"write failed: {result.get('detail', result)}")
-                write_results.append(result)
+        if not parsed_messages:
+            result = _write_placeholder(
+                client, user_id, session_id, image_events_all)
+            if result.get("status") == "error":
+                _ledger_abort(request_id, body_hash)
+                return _bad(500, f"placeholder write failed: "
+                                 f"{result.get('detail', result)}")
+            write_results.append(result)
+        else:
+            for role, text in parsed_messages:
+                for frag in _split_fragments(text):
+                    result = _store_fragment(client, frag, user_id, source=role)
+                    if result.get("status") == "error":
+                        _ledger_abort(request_id, body_hash)
+                        return _bad(500, f"write failed: "
+                                         f"{result.get('detail', result)}")
+                    write_results.append(result)
     except Exception as e:
         _ledger_abort(request_id, body_hash)
         return _bad(500, f"write failed: {e}")
 
     # I-1: policy filtering is not a malformed request.  A legal Add returns
     # 200 success=true even when governance writes zero memories
-    # (stale/filtered/duplicate-only) or the request carried only images.
+    # (stale/filtered/duplicate-only).  Requests with no text still wrote the
+    # B1 metadata placeholder above.
     _record_governance(request_id, parsed_messages, write_results,
-                       total_images, total_oversize)
+                       media_counts)
 
     response = {
         "success": True,

@@ -31,6 +31,16 @@ from .core.config import COLD_BACKEND, MNEMOSYNE_URL  # noqa: E402
 
 TIMEOUT = 10.0
 
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return max(minimum, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
+
 # ── P0 storage safety (2026-09-19) ──────────────────────────────────────────
 # Mnemosyne engines hold long-lived sqlite3 connections.  The shared engine is
 # used by recall/dedup for every author, and per-author engines all point at the
@@ -40,6 +50,16 @@ TIMEOUT = 10.0
 # the embedding/HTTP work is warmed out of the lock by the AML adapter, so the
 # critical section is only SQLite/enrichment CPU+I/O.
 _ENGINE_GLOBAL_LOCK = threading.RLock()
+
+
+def _path_identity(path: Any) -> Optional[Dict[str, Any]]:
+    """Return (st_dev, st_ino) for a path, or None if it does not exist."""
+    try:
+        st = os.stat(str(path))
+        return {"path": str(path), "st_dev": int(st.st_dev),
+                "st_ino": int(st.st_ino)}
+    except OSError:
+        return None
 
 
 class StorageBusyError(RuntimeError):
@@ -276,6 +296,16 @@ class LocalBackend:
         self._aml_engine_locks: Dict[tuple, threading.RLock] = {}
         self._aml_lock = threading.Lock()
         self._engine_lock = threading.RLock()
+        self._max_user_engines = _env_int(
+            "MNEMOSYNE_MAX_USER_ENGINES", 512, minimum=1)
+
+        # P0.5 data-lifecycle guard (review §3.2/§4.5).  A long-lived
+        # sqlite connection to an unlinked DB silently splits Add/Search.
+        self._db_path = str(getattr(self._engine, "db_path", ""))
+        self._db_identity = _path_identity(self._db_path)
+        self._identity_mismatch_count = 0
+        self._identity_last_mismatch_at = None
+        self._identity_last_before = None
 
     def _ensure_engine_locks(self) -> None:
         if not hasattr(self, "_engine_lock") or self._engine_lock is None:
@@ -285,11 +315,97 @@ class LocalBackend:
         if not hasattr(self, "_aml_lock") or self._aml_lock is None:
             self._aml_lock = threading.Lock()
 
+    @staticmethod
+    def _close_engine(engine: Any) -> None:
+        seen = set()
+        for conn in (getattr(engine, "conn", None),
+                     getattr(getattr(engine, "beam", None), "conn", None)):
+            if conn is None or id(conn) in seen:
+                continue
+            seen.add(id(conn))
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _ensure_data_identity_locked(self):
+        """Detect DB path unlink/recreate and rebuild all live engines.
+
+        Returns (current_identity, mismatch_detected).  Must be called while
+        holding _ENGINE_GLOBAL_LOCK.
+        """
+        # Test doubles construct LocalBackend via object.__new__ and only set
+        # ``_engine``; initialise the lifecycle fields lazily for them.
+        if not hasattr(self, "_db_path"):
+            self._db_path = str(getattr(self._engine, "db_path", ""))
+            self._db_identity = _path_identity(self._db_path)
+            self._identity_mismatch_count = 0
+            self._identity_last_mismatch_at = None
+            self._identity_last_before = None
+            self._aml_engines = getattr(self, "_aml_engines", {})
+            self._aml_engine_locks = getattr(self, "_aml_engine_locks", {})
+            self._aml_lock = getattr(self, "_aml_lock", threading.Lock())
+            self._engine_lock = getattr(self, "_engine_lock", threading.RLock())
+            return self._db_identity, False
+        current = _path_identity(self._db_path)
+        if current == self._db_identity:
+            return current, False
+
+        self._identity_mismatch_count += 1
+        self._identity_last_mismatch_at = time.time()
+        self._identity_last_before = dict(self._db_identity or {})
+
+        for eng in list(self._aml_engines.values()):
+            self._close_engine(eng)
+        self._close_engine(self._engine)
+        self._aml_engines.clear()
+        self._aml_engine_locks.clear()
+
+        # mnemosyne memory.py and beam.py each keep their own thread-local
+        # connection.  Close alone is not enough: the legacy memory.py
+        # _get_connection() trusts a non-None thread-local and would hand the
+        # closed connection straight back to init_db().  Drop both caches.
+        try:
+            from mnemosyne.core import beam as _beam_mod
+            from mnemosyne.core import memory as _memory_mod
+            for mod in (_memory_mod, _beam_mod):
+                tl = getattr(mod, "_thread_local", None)
+                if tl is None:
+                    continue
+                for attr in ("conn", "db_path"):
+                    try:
+                        delattr(tl, attr)
+                    except AttributeError:
+                        pass
+        except Exception:
+            pass
+
+        from mnemosyne import Mnemosyne  # noqa: E402
+        self._engine = Mnemosyne(session_id="memorycore")
+        self._db_path = str(getattr(self._engine, "db_path", self._db_path))
+        self._db_identity = _path_identity(self._db_path)
+        return self._db_identity, True
+
+    def check_data_identity(self) -> Dict[str, Any]:
+        """Public health/business hook: recover from DB inode split now."""
+        with _ENGINE_GLOBAL_LOCK:
+            current, mismatch = self._ensure_data_identity_locked()
+            return {
+                "db_path": self._db_path,
+                "db_identity": dict(current or {}),
+                "identity_mismatch": bool(
+                    mismatch or self._identity_mismatch_count > 0),
+                "identity_mismatch_count": int(self._identity_mismatch_count),
+                "identity_last_mismatch_at": self._identity_last_mismatch_at,
+                "identity_last_before": dict(self._identity_last_before or {}),
+            }
+
     @contextlib.contextmanager
     def _engine_guard(self, key):
         """Serialise engine access: global lock + per-engine lock."""
         self._ensure_engine_locks()
         with _ENGINE_GLOBAL_LOCK:
+            self._ensure_data_identity_locked()
             if key is None:
                 lock = self._engine_lock
             else:
@@ -304,6 +420,15 @@ class LocalBackend:
         for attempt in range(4):
             try:
                 with self._engine_guard(key):
+                    # If the identity guard rebuilt engines while we were
+                    # waiting, a bound method captured on the old engine
+                    # would still point at the unlinked inode.  Rebind by
+                    # method name to the current engine under the same lock.
+                    target = self._engine if key is None \
+                        else self._aml_engines.get(key)
+                    fn_name = getattr(fn, "__name__", None)
+                    if target is not None and fn_name and hasattr(target, fn_name):
+                        return getattr(target, fn_name)(*args, **kwargs)
                     return fn(*args, **kwargs)
             except sqlite3.OperationalError as exc:
                 last_exc = exc
@@ -338,6 +463,7 @@ class LocalBackend:
         # Keep global → per-engine lock ordering consistent with
         # _engine_guard(); otherwise _engine_for and _engine_call can deadlock.
         with _ENGINE_GLOBAL_LOCK:
+            self._ensure_data_identity_locked()
             with self._aml_lock:
                 eng = self._aml_engines.get(key)
                 if eng is None:
@@ -350,7 +476,55 @@ class LocalBackend:
                     )
                     self._aml_engines[key] = eng
                     self._aml_engine_locks[key] = threading.RLock()
+                    # Bound the long-evaluation per-user map.  Do not close
+                    # evicted engines: a caller that already fetched one may
+                    # still hold a bound method; removing map references lets
+                    # GC reclaim it after the call.
+                    while len(self._aml_engines) > self._max_user_engines:
+                        old_key = next(iter(self._aml_engines))
+                        if old_key == key:
+                            break
+                        self._aml_engines.pop(old_key, None)
+                        self._aml_engine_locks.pop(old_key, None)
                 return eng
+
+    def find_exact(self, content: str,
+                   author_id: Optional[str] = None,
+                   author_type: Optional[str] = None,
+                   channel_id: Optional[str] = None) -> Optional[str]:
+        """Return an exact same-content working-memory id, if any.
+
+        This is the crash-window idempotency hook: a committed fragment can be
+        absent from recall candidate gates, but a direct SQLite equality lookup
+        still sees it before the retry re-executes the write.  It is read-only
+        and scoped to the same per-user engine as the write.
+        """
+        if content is None:
+            return None
+        if author_id:
+            key = (author_id or "", author_type or "", channel_id or "")
+            engine = self._engine_for(author_id, author_type, channel_id)
+        else:
+            key = None
+            engine = self._engine
+
+        def _lookup():
+            conn = getattr(engine, "conn", None)
+            if conn is None:
+                return None
+            try:
+                row = conn.execute(
+                    "SELECT id FROM working_memory "
+                    "WHERE session_id = ? AND content = ? "
+                    "AND superseded_by IS NULL "
+                    "ORDER BY timestamp DESC LIMIT 1",
+                    (engine.session_id, str(content)),
+                ).fetchone()
+            except Exception:
+                return None
+            return row[0] if row else None
+
+        return self._engine_call(key, _lookup)
 
     # -- remember -------------------------------------------------------
 
@@ -374,6 +548,15 @@ class LocalBackend:
         else:
             key = None
             engine = self._engine
+        # Crash-window idempotency: a retry after a committed fragment must
+        # not refresh an existing exact row's timestamp/source.  Dedup recall
+        # gates can miss it (review probe_ledger_crash), so do a direct exact
+        # equality lookup before handing the write to mnemosyne.
+        existing_id = self.find_exact(
+            content, author_id=author_id, author_type=author_type,
+            channel_id=channel_id)
+        if existing_id is not None:
+            return {"status": "stored", "memory_id": existing_id}
         kwargs: Dict[str, Any] = {}
         if source is not None:
             kwargs["source"] = source
@@ -533,23 +716,49 @@ class LocalBackend:
         def _do_stats():
             conn = self._engine.conn  # has sqlite-vec loaded
             if all_sessions:
-                total = conn.execute(
-                    "SELECT COUNT(*) FROM working_memory"
-                ).fetchone()[0]
+                where = ""
+                params: tuple = ()
             else:
-                total = conn.execute(
-                    "SELECT COUNT(*) FROM working_memory"
-                    " WHERE session_id = ?",
-                    ("memorycore",),
-                ).fetchone()[0]
+                where = " WHERE session_id = ?"
+                params = ("memorycore",)
+
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM working_memory{where}",
+                params,
+            ).fetchone()[0]
+
+            # P0.5: health must count both vector stores.  vec_working is the
+            # primary sqlite-vec shadow table; memory_embeddings is the legacy
+            # JSON fallback.  A row is vector-backed if either store has it.
+            legacy_ids = set()
+            try:
+                legacy_ids = {
+                    row[0] for row in conn.execute(
+                        "SELECT memory_id FROM memory_embeddings")
+                }
+            except Exception:
+                pass
+            vec_rowids = set()
+            try:
+                vec_rowids = {
+                    row[0] for row in conn.execute(
+                        "SELECT rowid FROM vec_working_rowids")
+                }
+            except Exception:
+                pass
 
             embeddings = 0
             try:
-                embeddings = conn.execute(
-                    "SELECT COUNT(*) FROM vec_working_rowids"
-                ).fetchone()[0]
+                wm_rows = conn.execute(
+                    f"SELECT id, rowid FROM working_memory{where}",
+                    params,
+                ).fetchall()
+                embeddings = sum(
+                    1 for row in wm_rows
+                    if row[0] in legacy_ids or row[1] in vec_rowids
+                )
             except Exception:
-                pass  # shadow table may not exist yet
+                embeddings = 0
 
             ep_total = 0
             if all_sessions:
@@ -566,6 +775,8 @@ class LocalBackend:
             return {
                 "total": total,
                 "embeddings": embeddings,
+                "memory_embeddings": len(legacy_ids),
+                "vec_working": len(vec_rowids),
                 "database": str(self._engine.db_path),
                 "mode": "beam",
                 "beam": {
@@ -574,11 +785,12 @@ class LocalBackend:
                         "consolidated": 0,
                         "unconsolidated": total,
                         "last": None,
+                        "vectors": embeddings,
                     },
                     "episodic_memory": {
                         "total": ep_total,
                         "last": None,
-                        "vectors": embeddings,
+                        "vectors": 0,
                         "vec_type": "sqlite-vec",
                     },
                 },
@@ -625,6 +837,63 @@ class LocalBackend:
             _warn_embed_once(e)
             return []
 
+    def prefetch_embeddings(self, kind: str,
+                           texts: List[str]) -> List[List[float]]:
+        """Explicitly precompute embeddings for Phase A.
+
+        With the P0.5 library patch this populates both the normal LRU (when
+        enabled) and a bounded explicit prefetch buffer, so Phase B can still
+        reuse vectors even when MNEMOSYNE_EMBED_CACHE_SIZE=0.
+        """
+        if not texts:
+            return []
+        try:
+            from mnemosyne.core import embeddings as _emb  # noqa: E402
+            vecs = None
+            fn = getattr(_emb, "prefetch_embeddings", None)
+            if callable(fn):
+                try:
+                    vecs = fn(list(texts), kind=kind)
+                except Exception:
+                    vecs = None
+            if vecs is None or len(vecs) == 0:
+                # Compatibility with callers/tests that monkeypatch the legacy
+                # batch entry points; retain the returned vectors explicitly
+                # so a disabled normal cache still gives write-phase hits.
+                if kind == "query" and hasattr(_emb, "embed_queries"):
+                    vecs = _emb.embed_queries(list(texts))
+                else:
+                    vecs = _emb.embed(list(texts))
+                prime = getattr(_emb, "prime_embeddings", None)
+                if callable(prime) and vecs is not None:
+                    prime(list(texts), vecs, kind=kind)
+            if vecs is None:
+                return []
+            return [[round(float(x), 6) for x in v] for v in vecs]
+        except Exception as e:
+            _warn_embed_once(e)
+            return []
+
+    def assert_embeddings_cached(self, kind: str,
+                                 texts: List[str]) -> bool:
+        """Return True when every text is already available cache-side."""
+        if not texts:
+            return True
+        try:
+            from mnemosyne.core import embeddings as _emb  # noqa: E402
+            fn = getattr(_emb, "embeddings_cached", None)
+            if callable(fn):
+                # The write path calls the public embed()/embed_query()
+                # functions.  If they were replaced, the prefetch-aware cache
+                # check cannot be assumed, so fail closed before any write.
+                unsafe = not getattr(getattr(_emb, "embed", None),
+                                     "_mnemosyne_prefetch_aware", False)
+                return bool(fn(list(texts), kind=kind)) and not unsafe
+        except Exception:
+            return False
+        # Older patch versions lack the probe; do not block writes on it.
+        return True
+
     def list_all(self) -> List[Dict[str, Any]]:
         """List all memories (both working + episodic)."""
         all_mems = self._engine_call(None, self._engine.get_all_memories)
@@ -665,6 +934,8 @@ class RemoteBackend:
         self.timeout = timeout
         self._session_id: Optional[str] = None
         self._rpc_id = 0
+        # Review §2.2: _post/_initialize/session-id mutation were unlocked.
+        self._lock = threading.RLock()
 
     def _headers(self) -> Dict[str, str]:
         h = {
@@ -678,18 +949,19 @@ class RemoteBackend:
     def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         import urllib.request
 
-        req = urllib.request.Request(
-            self.url,
-            data=json.dumps(payload).encode(),
-            headers=self._headers(),
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            body = resp.read().decode()
-            sid = resp.headers.get("mcp-session-id")
-            if sid:
-                self._session_id = sid
-        return _parse_sse(body)
+        with self._lock:
+            req = urllib.request.Request(
+                self.url,
+                data=json.dumps(payload).encode(),
+                headers=self._headers(),
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode()
+                sid = resp.headers.get("mcp-session-id")
+                if sid:
+                    self._session_id = sid
+            return _parse_sse(body)
 
     def _initialize(self) -> None:
         resp = self._post({
@@ -715,40 +987,41 @@ class RemoteBackend:
 
     def _call_tool(self, name: str,
                    arguments: Dict[str, Any]) -> Dict[str, Any]:
-        if not self._session_id:
-            self._initialize()
-        self._rpc_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._rpc_id,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        }
-        try:
-            resp = self._post(payload)
-        except urllib.error.HTTPError as e:
-            # Server restart invalidates old session → 4xx.
-            # Clear session, re-initialize, retry once.
-            if e.code in (400, 401, 404) and self._session_id:
-                self._session_id = None
+        with self._lock:
+            if not self._session_id:
                 self._initialize()
-                resp = self._post(payload)
-            else:
-                raise
-        if "error" in resp:
-            raise RuntimeError(
-                f"cold tier tool {name} error: {resp['error']}"
-            )
-        content = resp.get("result", {}).get("content", [])
-        text = content[0]["text"] if content else "{}"
-        try:
-            return json.loads(text)
-        except Exception:
+            self._rpc_id += 1
+            payload = {
+                "jsonrpc": "2.0",
+                "id": self._rpc_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
             try:
-                import ast
-                return ast.literal_eval(text)
+                resp = self._post(payload)
+            except urllib.error.HTTPError as e:
+                # Server restart invalidates old session → 4xx.
+                # Clear session, re-initialize, retry once.
+                if e.code in (400, 401, 404) and self._session_id:
+                    self._session_id = None
+                    self._initialize()
+                    resp = self._post(payload)
+                else:
+                    raise
+            if "error" in resp:
+                raise RuntimeError(
+                    f"cold tier tool {name} error: {resp['error']}"
+                )
+            content = resp.get("result", {}).get("content", [])
+            text = content[0]["text"] if content else "{}"
+            try:
+                return json.loads(text)
             except Exception:
-                return {"raw": text}
+                try:
+                    import ast
+                    return ast.literal_eval(text)
+                except Exception:
+                    return {"raw": text}
 
     # -- 5-method interface --------------------------------------------
 
@@ -1043,6 +1316,40 @@ class ColdStoreClient:
     def embed_queries(self, texts) -> List[List[float]]:
         """Batch-embed query texts via the active backend (P0 cache warm)."""
         return self._backend.embed_queries(texts)
+
+    def prefetch_embeddings(self, kind: str,
+                            texts: List[str]) -> List[List[float]]:
+        """Explicit Phase A warm-up for the active backend (P0.5)."""
+        fn = getattr(self._backend, "prefetch_embeddings", None)
+        if not callable(fn):
+            return self._backend.embed_queries(texts) if kind == "query" \
+                else self._backend.embed_texts(texts)
+        return fn(kind, texts)
+
+    def assert_embeddings_cached(self, kind: str, texts: List[str]) -> bool:
+        """Return True when the active backend has every text cached."""
+        fn = getattr(self._backend, "assert_embeddings_cached", None)
+        if callable(fn):
+            return bool(fn(kind, texts))
+        return True
+
+    def check_data_identity(self) -> Dict[str, Any]:
+        """Delegate the runtime DB-inode guard to the active backend."""
+        fn = getattr(self._backend, "check_data_identity", None)
+        if callable(fn):
+            return fn()
+        return {}
+
+    def find_exact(self, content: str,
+                   author_id: Optional[str] = None,
+                   author_type: Optional[str] = None,
+                   channel_id: Optional[str] = None) -> Optional[str]:
+        """Delegate exact-content idempotency lookup when supported."""
+        fn = getattr(self._backend, "find_exact", None)
+        if not callable(fn):
+            return None
+        return fn(content, author_id=author_id,
+                  author_type=author_type, channel_id=channel_id)
 
 
 # -- CLI quick-test --------------------------------------------------------

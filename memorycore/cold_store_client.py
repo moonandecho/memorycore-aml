@@ -17,16 +17,38 @@ Multi-tenant isolation (AML per-user engines):
   All parameters default to None → existing single-tenant behaviour
   is unchanged.
 """
+import contextlib
 import json
 import logging
 import os
+import sqlite3
 import threading
+import time
 import urllib.error
 from typing import Any, Dict, List, Optional
 
 from .core.config import COLD_BACKEND, MNEMOSYNE_URL  # noqa: E402
 
 TIMEOUT = 10.0
+
+# ── P0 storage safety (2026-09-19) ──────────────────────────────────────────
+# Mnemosyne engines hold long-lived sqlite3 connections.  The shared engine is
+# used by recall/dedup for every author, and per-author engines all point at the
+# same SQLite file.  A process-wide RLock serialises every engine call; per-
+# engine locks keep the same connection from being entered concurrently even if
+# a future refactor drops the global lock.  This is deliberately conservative:
+# the embedding/HTTP work is warmed out of the lock by the AML adapter, so the
+# critical section is only SQLite/enrichment CPU+I/O.
+_ENGINE_GLOBAL_LOCK = threading.RLock()
+
+
+class StorageBusyError(RuntimeError):
+    """SQLite stayed locked after bounded retries (mapped to retryable 5xx)."""
+
+
+def _is_sqlite_locked(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg or "busy" in msg
 
 # Search response content cap.  The AML text-track evidence is often a long
 # conversation/BEAM fragment, so the old 500-character cut dropped answer
@@ -251,7 +273,56 @@ class LocalBackend:
 
         # AML per-user engines: key = (author_id, author_type, channel_id)
         self._aml_engines: Dict[tuple, Any] = {}
+        self._aml_engine_locks: Dict[tuple, threading.RLock] = {}
         self._aml_lock = threading.Lock()
+        self._engine_lock = threading.RLock()
+
+    def _ensure_engine_locks(self) -> None:
+        if not hasattr(self, "_engine_lock") or self._engine_lock is None:
+            self._engine_lock = threading.RLock()
+        if not hasattr(self, "_aml_engine_locks") or self._aml_engine_locks is None:
+            self._aml_engine_locks = {}
+        if not hasattr(self, "_aml_lock") or self._aml_lock is None:
+            self._aml_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def _engine_guard(self, key):
+        """Serialise engine access: global lock + per-engine lock."""
+        self._ensure_engine_locks()
+        with _ENGINE_GLOBAL_LOCK:
+            if key is None:
+                lock = self._engine_lock
+            else:
+                with self._aml_lock:
+                    lock = self._aml_engine_locks.setdefault(key, threading.RLock())
+            with lock:
+                yield
+
+    def _engine_call(self, key, fn, *args, **kwargs):
+        """Run an engine call under both locks, retrying SQLite busy errors."""
+        last_exc = None
+        for attempt in range(4):
+            try:
+                with self._engine_guard(key):
+                    return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if _is_sqlite_locked(exc) and attempt < 3:
+                    time.sleep(0.2 * (2 ** attempt))
+                    continue
+                raise StorageBusyError(
+                    f"storage engine busy after {attempt + 1} attempt(s): {exc}"
+                ) from exc
+            except Exception as exc:
+                # Some mnemosyne versions surface sqlite lock failures as a
+                # generic OperationalError subclass or wrapped RuntimeError.
+                if _is_sqlite_locked(exc) and attempt < 3:
+                    last_exc = exc
+                    time.sleep(0.2 * (2 ** attempt))
+                    continue
+                raise
+        if last_exc is not None:
+            raise StorageBusyError(f"storage engine busy: {last_exc}") from last_exc
 
     def _engine_for(self, author_id: str, author_type: Optional[str] = None,
                     channel_id: Optional[str] = None):
@@ -264,18 +335,22 @@ class LocalBackend:
         regardless of session.
         """
         key = (author_id or "", author_type or "", channel_id or "")
-        with self._aml_lock:
-            eng = self._aml_engines.get(key)
-            if eng is None:
-                from mnemosyne import Mnemosyne  # noqa: E402
-                eng = Mnemosyne(
-                    session_id=f"{self._USER_SESSION_PREFIX}{author_id}",
-                    author_id=author_id,
-                    author_type=author_type or "agent",
-                    channel_id=channel_id or "aml",
-                )
-                self._aml_engines[key] = eng
-            return eng
+        # Keep global → per-engine lock ordering consistent with
+        # _engine_guard(); otherwise _engine_for and _engine_call can deadlock.
+        with _ENGINE_GLOBAL_LOCK:
+            with self._aml_lock:
+                eng = self._aml_engines.get(key)
+                if eng is None:
+                    from mnemosyne import Mnemosyne  # noqa: E402
+                    eng = Mnemosyne(
+                        session_id=f"{self._USER_SESSION_PREFIX}{author_id}",
+                        author_id=author_id,
+                        author_type=author_type or "agent",
+                        channel_id=channel_id or "aml",
+                    )
+                    self._aml_engines[key] = eng
+                    self._aml_engine_locks[key] = threading.RLock()
+                return eng
 
     # -- remember -------------------------------------------------------
 
@@ -294,18 +369,17 @@ class LocalBackend:
         source tags the origin (e.g. message role in multi-user ingestion).
         """
         if author_id:
+            key = (author_id or "", author_type or "", channel_id or "")
             engine = self._engine_for(author_id, author_type, channel_id)
         else:
+            key = None
             engine = self._engine
         kwargs: Dict[str, Any] = {}
         if source is not None:
             kwargs["source"] = source
-        memory_id = engine.remember(
-            content,
-            importance=importance,
-            scope=scope,
-            **kwargs,
-        )
+        memory_id = self._engine_call(
+            key, engine.remember, content,
+            importance=importance, scope=scope, **kwargs)
         if memory_id is None:
             return {"status": "filtered",
                     "detail": "content rejected by write classifier"}
@@ -350,16 +424,18 @@ class LocalBackend:
             kwargs["from_date"] = from_date
         if to_date is not None:
             kwargs["to_date"] = to_date
-        if bump:
-            items = self._engine.recall(query, top_k=top_k, **kwargs)
-        else:
-            try:
-                items = self._engine.recall(
-                    query, top_k=top_k, bump_recalled=False, **kwargs)
-            except TypeError:
-                # stock mnemosyne-memory lacks bump_recalled → degrade
-                items = self._engine.recall(query, top_k=top_k, **kwargs)
-        items = _hydrate_full_contents(self._engine, items)
+        def _do_recall():
+            if bump:
+                raw_items = self._engine.recall(query, top_k=top_k, **kwargs)
+            else:
+                try:
+                    raw_items = self._engine.recall(
+                        query, top_k=top_k, bump_recalled=False, **kwargs)
+                except TypeError:
+                    # stock mnemosyne-memory lacks bump_recalled → degrade
+                    raw_items = self._engine.recall(query, top_k=top_k, **kwargs)
+            return _hydrate_full_contents(self._engine, raw_items)
+        items = self._engine_call(None, _do_recall)
         content_max_chars = _get_content_max_chars()
         results = []
         for it in items:
@@ -407,10 +483,12 @@ class LocalBackend:
         the row's session scope ("aml:<author_id>").
         """
         if author_id:
+            key = (author_id or "", author_type or "", channel_id or "")
             engine = self._engine_for(author_id, author_type, channel_id)
         else:
+            key = None
             engine = self._engine
-        ok = engine.update(memory_id, content=content)
+        ok = self._engine_call(key, engine.update, memory_id, content=content)
         if ok:
             return {"status": "updated", "memory_id": memory_id}
         return {"status": "error",
@@ -424,10 +502,12 @@ class LocalBackend:
                channel_id: Optional[str] = None) -> Dict[str, Any]:
         """Delete by ID. Returns {status, memory_id} matching remote."""
         if author_id:
+            key = (author_id or "", author_type or "", channel_id or "")
             engine = self._engine_for(author_id, author_type, channel_id)
         else:
+            key = None
             engine = self._engine
-        ok = engine.forget(memory_id)
+        ok = self._engine_call(key, engine.forget, memory_id)
         if ok:
             return {"status": "deleted", "memory_id": memory_id}
         return {"status": "error",
@@ -450,58 +530,60 @@ class LocalBackend:
         Avoids the library's get_stats() which double-counts
         (legacy memories + BEAM working) and misses vec_working.
         """
-        conn = self._engine.conn  # has sqlite-vec loaded
-        if all_sessions:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM working_memory"
-            ).fetchone()[0]
-        else:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM working_memory"
-                " WHERE session_id = ?",
-                ("memorycore",),
-            ).fetchone()[0]
+        def _do_stats():
+            conn = self._engine.conn  # has sqlite-vec loaded
+            if all_sessions:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM working_memory"
+                ).fetchone()[0]
+            else:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM working_memory"
+                    " WHERE session_id = ?",
+                    ("memorycore",),
+                ).fetchone()[0]
 
-        embeddings = 0
-        try:
-            embeddings = conn.execute(
-                "SELECT COUNT(*) FROM vec_working_rowids"
-            ).fetchone()[0]
-        except Exception:
-            pass  # shadow table may not exist yet
+            embeddings = 0
+            try:
+                embeddings = conn.execute(
+                    "SELECT COUNT(*) FROM vec_working_rowids"
+                ).fetchone()[0]
+            except Exception:
+                pass  # shadow table may not exist yet
 
-        ep_total = 0
-        if all_sessions:
-            ep_total = conn.execute(
-                "SELECT COUNT(*) FROM episodic_memory"
-            ).fetchone()[0]
-        else:
-            ep_total = conn.execute(
-                "SELECT COUNT(*) FROM episodic_memory"
-                " WHERE session_id = ?",
-                ("memorycore",),
-            ).fetchone()[0]
+            ep_total = 0
+            if all_sessions:
+                ep_total = conn.execute(
+                    "SELECT COUNT(*) FROM episodic_memory"
+                ).fetchone()[0]
+            else:
+                ep_total = conn.execute(
+                    "SELECT COUNT(*) FROM episodic_memory"
+                    " WHERE session_id = ?",
+                    ("memorycore",),
+                ).fetchone()[0]
 
-        return {
-            "total": total,
-            "embeddings": embeddings,
-            "database": str(self._engine.db_path),
-            "mode": "beam",
-            "beam": {
-                "working_memory": {
-                    "total": total,
-                    "consolidated": 0,
-                    "unconsolidated": total,
-                    "last": None,
+            return {
+                "total": total,
+                "embeddings": embeddings,
+                "database": str(self._engine.db_path),
+                "mode": "beam",
+                "beam": {
+                    "working_memory": {
+                        "total": total,
+                        "consolidated": 0,
+                        "unconsolidated": total,
+                        "last": None,
+                    },
+                    "episodic_memory": {
+                        "total": ep_total,
+                        "last": None,
+                        "vectors": embeddings,
+                        "vec_type": "sqlite-vec",
+                    },
                 },
-                "episodic_memory": {
-                    "total": ep_total,
-                    "last": None,
-                    "vectors": embeddings,
-                    "vec_type": "sqlite-vec",
-                },
-            },
-        }
+            }
+        return self._engine_call(None, _do_stats)
 
     # -- list_all (optional, not in core 5-method contract) -------------
 
@@ -526,9 +608,26 @@ class LocalBackend:
             _warn_embed_once(e)
             return []
 
+    def embed_queries(self, texts) -> List[List[float]]:
+        """Batch-embed query texts (query prefix) and warm the shared cache."""
+        if not texts:
+            return []
+        try:
+            from mnemosyne.core import embeddings as _emb  # noqa: E402
+            if hasattr(_emb, "embed_queries"):
+                vecs = _emb.embed_queries(list(texts))
+            else:  # older patch/test double
+                vecs = [_emb.embed_query(t) for t in texts]
+            if vecs is None:
+                return []
+            return [[round(float(x), 6) for x in v] for v in vecs]
+        except Exception as e:
+            _warn_embed_once(e)
+            return []
+
     def list_all(self) -> List[Dict[str, Any]]:
         """List all memories (both working + episodic)."""
-        all_mems = self._engine.get_all_memories()
+        all_mems = self._engine_call(None, self._engine.get_all_memories)
         return [dict(m) for m in all_mems]
 
 
@@ -940,6 +1039,10 @@ class ColdStoreClient:
     def embed_texts(self, texts) -> List[List[float]]:
         """Batch-embed via the active backend (Phase 4 LRU activity signal)."""
         return self._backend.embed_texts(texts)
+
+    def embed_queries(self, texts) -> List[List[float]]:
+        """Batch-embed query texts via the active backend (P0 cache warm)."""
+        return self._backend.embed_queries(texts)
 
 
 # -- CLI quick-test --------------------------------------------------------

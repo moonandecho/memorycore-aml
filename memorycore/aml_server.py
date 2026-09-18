@@ -23,14 +23,19 @@ Env:
   MEMORYCORE_EMBED_MODEL— embedding model (default qwen3-embedding:0.6b)
   AML_API_KEY           — optional shared key for Add/Search
 """
+import hashlib
 import json
+import logging
 import os
 import re
 import secrets
+import sqlite3
+import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from mcp.server.mcpserver import MCPServer  # noqa: E402  # mcp 2.x 官方高级 API (替代第三方 fastmcp)
@@ -58,6 +63,7 @@ from .core.classifier import classify, STALE  # noqa: E402
 from .core.overflow import _find_best_match, _merge_two_entries  # noqa: E402
 from .core.decay import _apply_decay  # noqa: E402
 from .core.config import COLD_SOFT_LIMIT, COLD_HARD_LIMIT  # noqa: E402
+from . import __version__ as SERVICE_VERSION  # noqa: E402
 
 # ---- AML write-side constants (governance online) -------------------------
 
@@ -66,6 +72,16 @@ _DEDUP_RECALL_TOP_K = 5    # 写入前查重召回数 (比 overflow 的 3 更宽
 _MAX_FRAGMENT_CHARS = 300  # 长消息按句切分后的片段上限
 _SENTENCE_SPLIT_RE = re.compile(r"[。！？；;\n]")
 _MAX_TOP_K = 100           # AML 协议固定 top_k 上限
+_MAX_IMAGE_DECODED_BYTES = 10 * 1024 * 1024  # spec: 10 MiB decoded per image
+_SUPPORTED_IMAGE_MIMES = {"jpeg", "jpg", "png", "webp"}
+
+# request_id idempotency ledger bounds (persistent SQLite, restart-safe)
+_LEDGER_MAX_ROWS = 5000
+_LEDGER_TTL_SECONDS = 30 * 24 * 3600
+_LEDGER_INFLIGHT_STALE_SECONDS = 300
+_LEDGER_LOCK = threading.Lock()
+
+logger = logging.getLogger("memorycore.aml")
 
 AML_API_KEY = os.environ.get("AML_API_KEY", "").strip()
 
@@ -242,7 +258,12 @@ def _check_auth(request: Request) -> bool:
 
 
 def _bad(status: int, detail: str) -> JSONResponse:
-    return JSONResponse({"detail": detail}, status_code=status)
+    # AML business errors use {"detail":{"reason":"..."}} (spec §06).
+    return JSONResponse({"detail": {"reason": detail}}, status_code=status)
+
+
+def _validation_error(reason: str) -> JSONResponse:
+    return _bad(422, reason)
 
 
 def _require_str(body: Dict[str, Any], field: str) -> Optional[str]:
@@ -252,11 +273,259 @@ def _require_str(body: Dict[str, Any], field: str) -> Optional[str]:
     return v
 
 
+def _estimate_inline_image_bytes(url: Any) -> Optional[int]:
+    """Approximate decoded bytes for an inline data:image/...;base64 URL.
+
+    Returns None when the URL is not an accepted inline image.  Base64 is never
+    decoded, so an oversize image part cannot trigger a decode/OOM.
+    """
+    if not isinstance(url, str) or len(url) < 12:
+        return None
+    if url[:11].lower() != "data:image/":
+        return None
+    sep = url.find(";base64,")
+    if sep < 0:
+        return None
+    mime = url[11:sep].strip().lower()
+    if mime not in _SUPPORTED_IMAGE_MIMES:
+        return None
+    payload_start = sep + len(";base64,")
+    payload_len = len(url) - payload_start
+    if payload_len <= 0:
+        return None
+    # 3 bytes per 4 base64 chars, minus padding.  No decode / no payload copy.
+    padding = url.count("=", payload_start)
+    return max((payload_len * 3) // 4 - padding, 0)
+
+
+def _extract_texts(content: Any, where: str) -> Tuple[List[str], int, int, Optional[str]]:
+    """Extract ordered text parts from Add/Search content (string or array).
+
+    Returns (texts, image_count, oversize_image_count, error_reason).
+    Image parts are counted only; no visual processing, no original image
+    retention.  Images estimated to decode above 10 MiB are skipped while all
+    text parts are preserved.
+    """
+    if isinstance(content, str):
+        text = content.strip()
+        if not text:
+            return [], 0, 0, f"{where} must be a non-empty string or content array"
+        return [text], 0, 0, None
+
+    if not isinstance(content, list) or not content:
+        return [], 0, 0, f"{where} must be a non-empty string or content array"
+
+    texts: List[str] = []
+    image_count = 0
+    oversize_count = 0
+    for idx, part in enumerate(content):
+        if not isinstance(part, dict):
+            return [], image_count, oversize_count, f"{where}[{idx}] must be an object"
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return [], image_count, oversize_count, (
+                    f"{where}[{idx}].text must be a non-empty string")
+            texts.append(text.strip())
+        elif part_type == "image_url":
+            image = part.get("image_url")
+            if not isinstance(image, dict):
+                return [], image_count, oversize_count, (
+                    f"{where}[{idx}].image_url must be an object")
+            size = _estimate_inline_image_bytes(image.get("url"))
+            if size is None:
+                return [], image_count, oversize_count, (
+                    f"{where}[{idx}].image_url.url must be an inline "
+                    "data:image/...;base64 URL")
+            if size > _MAX_IMAGE_DECODED_BYTES:
+                oversize_count += 1
+            else:
+                image_count += 1
+        else:
+            return [], image_count, oversize_count, (
+                f"{where}[{idx}].type must be 'text' or 'image_url'")
+    if not texts:
+        return [], image_count, oversize_count, (
+            f"{where} must contain at least one non-empty text part")
+    return texts, image_count, oversize_count, None
+
+
+def _log_multimodal_counts(image_count: int, oversize_count: int) -> None:
+    """One aggregate count log per request; payload bytes are never logged."""
+    if image_count or oversize_count:
+        logger.info(
+            "AML multimodal content: image_parts=%d oversize_skipped=%d "
+            "(no original image / no OCR / no image evidence returned)",
+            image_count, oversize_count,
+        )
+
+
+# ---- request_id idempotency ledger (SQLite, bounded, restart-safe) --------
+
+def _ledger_path() -> str:
+    data_dir = os.environ.get("MNEMOSYNE_DATA_DIR") or os.path.expanduser(
+        "~/.memorycore/data")
+    return os.path.join(data_dir, "aml_request_ledger.sqlite3")
+
+
+def _ledger_connect() -> "sqlite3.Connection":
+    path = _ledger_path()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10.0)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS aml_request_ledger (
+            request_id TEXT PRIMARY KEY,
+            body_hash TEXT NOT NULL,
+            status_code INTEGER NOT NULL DEFAULT 0,
+            response_json TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    return conn
+
+
+def _body_hash(body: Dict[str, Any]) -> str:
+    canonical = json.dumps(body, sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _ledger_begin(request_id: str, body_hash: str):
+    """Reserve/replay a request_id atomically in SQLite.
+
+    Returns (state, row) where state is new/replay/conflict/busy.  A short
+    global lock plus BEGIN IMMEDIATE makes check-and-reserve atomic within the
+    process (and safe enough for the single-worker service contract).
+    """
+    conn = _ledger_connect()
+    try:
+        with _LEDGER_LOCK:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT request_id, body_hash, status_code, response_json, updated_at "
+                "FROM aml_request_ledger WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if row is not None:
+                if row[1] != body_hash:
+                    conn.execute("ROLLBACK")
+                    return "conflict", row
+                if row[2] and row[3]:
+                    conn.execute("ROLLBACK")
+                    return "replay", row
+                # Crash/stale in-flight reservation: allow a bounded retry.
+                if time.time() - float(row[4] or 0) < _LEDGER_INFLIGHT_STALE_SECONDS:
+                    conn.execute("ROLLBACK")
+                    return "busy", row
+                conn.execute(
+                    "DELETE FROM aml_request_ledger WHERE request_id = ?",
+                    (request_id,),
+                )
+            now = time.time()
+            conn.execute(
+                "INSERT OR REPLACE INTO aml_request_ledger "
+                "(request_id, body_hash, status_code, response_json, updated_at) "
+                "VALUES (?, ?, 0, '', ?)",
+                (request_id, body_hash, now),
+            )
+            # Bound the ledger by TTL, then keep only the most recent N rows.
+            conn.execute(
+                "DELETE FROM aml_request_ledger WHERE updated_at < ?",
+                (now - _LEDGER_TTL_SECONDS,),
+            )
+            count = conn.execute(
+                "SELECT COUNT(*) FROM aml_request_ledger").fetchone()[0]
+            if count > _LEDGER_MAX_ROWS:
+                conn.execute(
+                    "DELETE FROM aml_request_ledger WHERE request_id IN ("
+                    "SELECT request_id FROM aml_request_ledger "
+                    "ORDER BY updated_at ASC LIMIT ?)",
+                    (count - _LEDGER_MAX_ROWS,),
+                )
+            conn.commit()
+        return "new", None
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def _ledger_finalize(request_id: str, body_hash: str, status_code: int,
+                     response: Dict[str, Any]) -> None:
+    conn = _ledger_connect()
+    try:
+        with _LEDGER_LOCK:
+            conn.execute(
+                "UPDATE aml_request_ledger SET status_code = ?, "
+                "response_json = ?, updated_at = ? "
+                "WHERE request_id = ? AND body_hash = ?",
+                (status_code, json.dumps(response, ensure_ascii=False),
+                 time.time(), request_id, body_hash),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _ledger_abort(request_id: str, body_hash: str) -> None:
+    conn = _ledger_connect()
+    try:
+        with _LEDGER_LOCK:
+            conn.execute(
+                "DELETE FROM aml_request_ledger "
+                "WHERE request_id = ? AND body_hash = ? AND status_code = 0",
+                (request_id, body_hash),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _ledger_response(row) -> JSONResponse:
+    return JSONResponse(json.loads(row[3]), status_code=int(row[2]))
+
+
+# ---- version / commit ------------------------------------------------------
+
+_COMMIT_CACHE: Optional[str] = None
+
+
+def _git_commit() -> str:
+    global _COMMIT_CACHE
+    if _COMMIT_CACHE is not None:
+        return _COMMIT_CACHE
+    env_commit = os.environ.get("AML_GIT_COMMIT", "").strip()
+    if env_commit:
+        _COMMIT_CACHE = env_commit
+        return _COMMIT_CACHE
+    try:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=2.0, check=False,
+        )
+        commit = proc.stdout.strip() if proc.returncode == 0 else ""
+        _COMMIT_CACHE = commit or "unknown"
+    except Exception:
+        _COMMIT_CACHE = "unknown"
+    return _COMMIT_CACHE
+
+
 # ---- AML endpoints ---------------------------------------------------------
 
 @mcp.custom_route("/add", methods=["POST"])
 async def aml_add(request: Request) -> JSONResponse:
-    """AML Add: ingest one source conversation (session) into the cold tier."""
+    """AML Add: validate, idempotently ingest, then return success."""
     if not _check_auth(request):
         return _bad(401, "unauthorized")
     try:

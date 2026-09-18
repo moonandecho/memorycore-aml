@@ -81,6 +81,24 @@ _LEDGER_TTL_SECONDS = 30 * 24 * 3600
 _LEDGER_INFLIGHT_STALE_SECONDS = 300
 _LEDGER_LOCK = threading.Lock()
 
+# In-process governance observability (spec §06 business errors vs policy
+# filtering).  Policy outcomes are not exposed in the Add response; they are
+# logged and aggregated for /health.
+_GOVERNANCE_LOCK = threading.Lock()
+_GOVERNANCE_COUNTS: Dict[str, int] = {
+    "requests": 0,
+    "fragments": 0,
+    "stored": 0,
+    "updated": 0,
+    "duplicate": 0,
+    "stale": 0,
+    "filtered": 0,
+    "error": 0,
+    "textless_requests": 0,
+    "image_parts": 0,
+    "oversize_image_parts": 0,
+}
+
 logger = logging.getLogger("memorycore.aml")
 
 AML_API_KEY = os.environ.get("AML_API_KEY", "").strip()
@@ -362,6 +380,38 @@ def _log_multimodal_counts(image_count: int, oversize_count: int) -> None:
         )
 
 
+def _governance_snapshot() -> Dict[str, int]:
+    with _GOVERNANCE_LOCK:
+        return dict(_GOVERNANCE_COUNTS)
+
+
+def _record_governance(request_id: str, parsed_messages: List[Tuple[str, str]],
+                       write_results: List[Dict[str, Any]],
+                       image_count: int, oversize_count: int) -> None:
+    """Aggregate policy outcomes for observability, never for the response.
+
+    Governance decisions (stale / filtered / duplicate / stored / updated)
+    are successful Add outcomes per fix-round2 I-1 and must not be turned
+    into a 4xx contract error.  The request body is never logged.
+    """
+    statuses = [str(r.get("status", "error")) for r in write_results]
+    with _GOVERNANCE_LOCK:
+        _GOVERNANCE_COUNTS["requests"] += 1
+        _GOVERNANCE_COUNTS["fragments"] += len(statuses)
+        _GOVERNANCE_COUNTS["image_parts"] += image_count
+        _GOVERNANCE_COUNTS["oversize_image_parts"] += oversize_count
+        if not parsed_messages:
+            _GOVERNANCE_COUNTS["textless_requests"] += 1
+        for status in statuses:
+            if status in _GOVERNANCE_COUNTS:
+                _GOVERNANCE_COUNTS[status] += 1
+    logger.info(
+        "AML governance request_id=%s text_parts=%d fragments=%d "
+        "statuses=%s textless_images=%d",
+        request_id, len(parsed_messages), len(statuses), statuses, image_count,
+    )
+
+
 # ---- request_id idempotency ledger (SQLite, bounded, restart-safe) --------
 
 def _ledger_path() -> str:
@@ -601,15 +651,11 @@ async def aml_add(request: Request) -> JSONResponse:
         _ledger_abort(request_id, body_hash)
         return _bad(500, f"write failed: {e}")
 
-    # A successful Add must leave the requested content stored/updated, or
-    # match an existing searchable memory.  (Governance-filtered-only requests
-    # are handled in fix-round2 I-1.)  Textless image-only requests are valid.
-    if parsed_messages and not any(
-            r.get("status") in ("stored", "updated", "duplicate")
-            for r in write_results):
-        _ledger_abort(request_id, body_hash)
-        return _validation_error(
-            "messages were filtered by memory governance and no memory was written")
+    # I-1: policy filtering is not a malformed request.  A legal Add returns
+    # 200 success=true even when governance writes zero memories
+    # (stale/filtered/duplicate-only) or the request carried only images.
+    _record_governance(request_id, parsed_messages, write_results,
+                       total_images, total_oversize)
 
     response = {
         "success": True,
@@ -729,7 +775,8 @@ async def aml_health(request: Request) -> JSONResponse:
             state = "degraded"
             detail["storage"] = "unavailable"
     payload = {"status": state, **detail,
-               "version": SERVICE_VERSION, "commit": _git_commit()}
+               "version": SERVICE_VERSION, "commit": _git_commit(),
+               "governance": _governance_snapshot()}
     return JSONResponse(payload, status_code=200)
 
 

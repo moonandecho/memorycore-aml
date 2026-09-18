@@ -31,11 +31,17 @@ import re
 import secrets
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
+
+# Capture the caller's environment before importing core.config, which still
+# fills in a legacy ~/.memorycore/data default for backwards compatibility.
+# AML must never silently write to a directory the operator did not choose.
+_PROCESS_MNEMOSYNE_DATA_DIR_WAS_SET = "MNEMOSYNE_DATA_DIR" in os.environ
 
 try:
     from mcp.server.mcpserver import MCPServer  # noqa: E402  # mcp 2.x 官方高级 API (替代第三方 fastmcp)
@@ -81,6 +87,11 @@ _LEDGER_TTL_SECONDS = 30 * 24 * 3600
 _LEDGER_INFLIGHT_STALE_SECONDS = 300
 _LEDGER_LOCK = threading.Lock()
 
+_MNEMOSYNE_DATA_DIR_REQUIRED_MSG = (
+    "MNEMOSYNE_DATA_DIR must be explicitly set; "
+    "必须显式设置 MNEMOSYNE_DATA_DIR（拒绝回退到 ~/.memorycore/data）"
+)
+
 # In-process governance observability (spec §06 business errors vs policy
 # filtering).  Policy outcomes are not exposed in the Add response; they are
 # logged and aggregated for /health.
@@ -113,11 +124,27 @@ _client_error: Optional[str] = None
 _client_lock = threading.Lock()
 
 
+def _require_data_dir() -> str:
+    """Return MNEMOSYNE_DATA_DIR or fail explicitly.
+
+    T3 / fix-round2: no silent fallback to ~/.memorycore/data.  The check is
+    captured at import time so core.config's backwards-compatible default
+    cannot mask a missing operator setting.
+    """
+    if not _PROCESS_MNEMOSYNE_DATA_DIR_WAS_SET:
+        raise RuntimeError(_MNEMOSYNE_DATA_DIR_REQUIRED_MSG)
+    data_dir = (os.environ.get("MNEMOSYNE_DATA_DIR") or "").strip()
+    if not data_dir:
+        raise RuntimeError(_MNEMOSYNE_DATA_DIR_REQUIRED_MSG)
+    return data_dir
+
+
 def _get_client() -> Optional[ColdStoreClient]:
     global _client, _client_error
     with _client_lock:
         if _client is None:
             try:
+                _require_data_dir()
                 _client = ColdStoreClient()
                 _client_error = None
             except Exception as e:  # embedding unreachable etc.
@@ -415,9 +442,7 @@ def _record_governance(request_id: str, parsed_messages: List[Tuple[str, str]],
 # ---- request_id idempotency ledger (SQLite, bounded, restart-safe) --------
 
 def _ledger_path() -> str:
-    data_dir = os.environ.get("MNEMOSYNE_DATA_DIR") or os.path.expanduser(
-        "~/.memorycore/data")
-    return os.path.join(data_dir, "aml_request_ledger.sqlite3")
+    return os.path.join(_require_data_dir(), "aml_request_ledger.sqlite3")
 
 
 def _ledger_connect() -> "sqlite3.Connection":
@@ -789,6 +814,13 @@ async def aml_health(request: Request) -> JSONResponse:
 
 
 def main() -> None:
+    # T3: fail closed before binding the port when the operator did not set
+    # the data directory explicitly.
+    try:
+        _require_data_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"[memorycore] 启动失败: {e}\n")
+        raise SystemExit(2)
     host = os.environ.get("AML_HOST", "0.0.0.0")
     port = int(os.environ.get("AML_PORT", "8000"))
     import uvicorn

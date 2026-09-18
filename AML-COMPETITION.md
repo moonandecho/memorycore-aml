@@ -7,7 +7,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 系统名称与版本 | MemoryCore（AML 适配版）v0.1.0；**固定 commit（参评代码）：`f48b7b373d9e775bb36c96afc85fe76fc92dbfb6`** |
+| 系统名称与版本 | MemoryCore（AML 适配版）v0.1.0；**固定 commit（参评代码）：`68a77c5aee451c13cc987be10f3b4efbfcd8e6b8`** |
 | 参评类型 | **开源方法榜**（参赛方自托管 Add / Search API，非仓库提交） |
 | 参评赛道 | **文本记忆**（本期不报多模态赛道、不报代码赛道） |
 | Add 端点 | `http://47.108.28.129:18000/add` |
@@ -165,7 +165,7 @@ embedding: ollama + 派生模型 qwen3-embedding-aml-ctx1024（FROM qwen3-embedd
 
 ## 5. 复现步骤
 
-**版本与固定 commit**：系统版本 `0.1.0`；参评代码固定 commit **`f48b7b373d9e775bb36c96afc85fe76fc92dbfb6`**
+**版本与固定 commit**：系统版本 `0.1.0`；参评代码固定 commit **`68a77c5aee451c13cc987be10f3b4efbfcd8e6b8`**
 （部署端点的 `/health` 会返回同一 commit，可交叉核对；材料自身的文档提交不参与版本冻结）。
 
 ### 5.1 本地启动（裸机）

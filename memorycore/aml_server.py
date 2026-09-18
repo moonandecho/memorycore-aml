@@ -593,7 +593,7 @@ def _placeholder_content(session_id: str,
     """
     chosen = None
     for ev in image_events or []:
-        if ev.get("payload_status") == "valid":
+        if ev.get("mime"):
             chosen = ev
             break
     if chosen is None:

@@ -132,8 +132,11 @@ AML_MAX_INFLIGHT = _env_int("AML_MAX_INFLIGHT", 128, minimum=1)
 AML_MAX_QUEUE = _env_int("AML_MAX_QUEUE", 256, minimum=0)
 AML_MAX_INFLIGHT_BYTES = _env_int(
     "AML_MAX_INFLIGHT_BYTES", 256 * 1024 * 1024, minimum=1)
+# Spec §1428 caps decoded image bytes at 30 MiB/Add.  Base64 overhead is
+# 4/3 plus the data-URI/JSON envelope, so the raw HTTP cap must be wider than
+# 30 MiB or a legal boundary image would be rejected by 413 (review §2.6).
 AML_MAX_BODY_BYTES = _env_int(
-    "AML_MAX_BODY_BYTES", 30 * 1024 * 1024, minimum=1)
+    "AML_MAX_BODY_BYTES", 48 * 1024 * 1024, minimum=1)
 AML_HEALTH_PROBE_INTERVAL_S = _env_float(
     "AML_HEALTH_PROBE_INTERVAL_S", 5.0, minimum=0.2)
 AML_STARTUP_SELF_CHECK = os.environ.get(
@@ -291,6 +294,14 @@ def _get_client() -> Optional[ColdStoreClient]:
             except Exception as e:  # embedding unreachable etc.
                 _client_error = str(e)
                 return None
+        # P0.5 identity guard: recover/rebuild if the data dir/DB was replaced.
+        checker = getattr(_client, "check_data_identity", None)
+        if callable(checker):
+            try:
+                checker()
+            except Exception as e:
+                _client_error = f"data directory identity recovery failed: {e}"
+                return None
         return _client
 
 
@@ -324,13 +335,14 @@ class _AdmissionController:
                 and self.inflight_bytes + max(0, nbytes) <= self.max_bytes)
 
     async def acquire(self, nbytes: int, deadline: float):
-        """Return (ok, reason). reason is overload/budget/timeout."""
+        """Return (ok, reason). reason is overload/budget/queue_timeout."""
         nbytes = max(0, int(nbytes))
+        waited = False
         async with self._cond:
             while True:
                 now = time.monotonic()
                 if now >= deadline:
-                    return False, "budget"
+                    return False, ("queue_timeout" if waited else "budget")
                 if self._fits(nbytes):
                     self.inflight += 1
                     self.inflight_bytes += nbytes
@@ -338,6 +350,7 @@ class _AdmissionController:
                 if self.queued >= self.max_queue:
                     return False, "overload"
                 self.queued += 1
+                waited = True
                 try:
                     remaining = max(0.01, deadline - time.monotonic())
                     await asyncio.wait_for(
@@ -367,15 +380,23 @@ _ADMISSION = _AdmissionController(
 # are serialised.  Different users still run in parallel.
 _USER_LOCKS: Dict[str, threading.Lock] = {}
 _USER_LOCKS_GUARD = threading.Lock()
+_AML_MAX_USER_LOCKS = _env_int("AML_MAX_USER_LOCKS", 4096, minimum=32)
 
 
 def _user_lock(user_id: str) -> threading.Lock:
     key = str(user_id or "")
     with _USER_LOCKS_GUARD:
-        lock = _USER_LOCKS.get(key)
+        lock = _USER_LOCKS.pop(key, None)
         if lock is None:
             lock = threading.Lock()
-            _USER_LOCKS[key] = lock
+        _USER_LOCKS[key] = lock  # refresh insertion order (LRU-ish)
+        if len(_USER_LOCKS) > _AML_MAX_USER_LOCKS:
+            for old_key, old_lock in list(_USER_LOCKS.items()):
+                if old_key == key:
+                    continue
+                if not old_lock.locked():
+                    del _USER_LOCKS[old_key]
+                    break
         return lock
 
 
@@ -418,6 +439,91 @@ async def _run_in_worker(fn, *args):
     return await loop.run_in_executor(_get_executor(), fn, *args)
 
 
+class _BodyTooLarge(ValueError):
+    """Raised when the streamed body exceeds the raw HTTP byte cap."""
+
+
+async def _read_limited_body(request: Request, max_bytes: int) -> bytes:
+    """Read request bytes without ever letting an unbounded body into memory."""
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > int(max_bytes):
+            raise _BodyTooLarge(
+                f"request body exceeds {int(max_bytes)} bytes")
+        chunks.append(bytes(chunk))
+    return b"".join(chunks)
+
+
+async def _prepare_json_body(request: Request, deadline: float
+                             ) -> Tuple[Optional[Dict[str, Any]],
+                                        Optional[JSONResponse], int]:
+    """Admit+read+parse a JSON body before any request.json()/decoded image parse.
+
+    Review §2.6 / §4.7: the byte cap and admission must happen *before* the
+    body is materialised and JSON-decoded.  Content-Length is used as the
+    admission reservation when present; chunked bodies reserve the maximum
+    raw cap and are then stream-counted.
+
+    Returns (body, error_response, admitted_bytes).  On success the caller
+    owns the admission slot and must release `admitted_bytes` in a finally.
+    On error the slot has already been released (0 is returned).
+    """
+    raw_length = request.headers.get("content-length")
+    declared: Optional[int] = None
+    if raw_length is not None and str(raw_length).strip() != "":
+        try:
+            declared = int(str(raw_length).strip())
+        except (TypeError, ValueError):
+            return None, _bad(400, "invalid Content-Length"), 0
+        if declared < 0:
+            return None, _bad(400, "invalid Content-Length"), 0
+        if declared > AML_MAX_BODY_BYTES:
+            _p0_inc("body_too_large_413")
+            return None, _bad(413, "request body too large"), 0
+
+    reserved = declared if declared is not None else AML_MAX_BODY_BYTES
+    admitted, reason = await _ADMISSION.acquire(reserved, deadline)
+    if not admitted:
+        if reason == "overload":
+            _p0_inc("backpressure_503")
+            return None, JSONResponse(
+                {"detail": {"reason": "server overloaded; queue is full"}},
+                status_code=503, headers={"Retry-After": "1"}), 0
+        if reason == "queue_timeout":
+            _p0_inc("queue_timeout_503")
+            return None, JSONResponse(
+                {"detail": {"reason": "request queue wait timed out"}},
+                status_code=503, headers={"Retry-After": "1"}), 0
+        _p0_inc("budget_503")
+        return None, JSONResponse(
+            {"detail": {"reason": "request budget exceeded while queued"}},
+            status_code=503, headers={"Retry-After": "1"}), 0
+
+    try:
+        raw = await _read_limited_body(request, AML_MAX_BODY_BYTES)
+    except _BodyTooLarge:
+        await _ADMISSION.release(reserved)
+        _p0_inc("body_too_large_413")
+        return None, _bad(413, "request body too large"), 0
+    except Exception:
+        await _ADMISSION.release(reserved)
+        return None, _bad(400, "invalid request body"), 0
+
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except Exception:
+        await _ADMISSION.release(reserved)
+        return None, _bad(400, "invalid JSON body"), 0
+    if not isinstance(body, dict):
+        await _ADMISSION.release(reserved)
+        return None, _bad(400, "body must be a JSON object"), 0
+    return body, None, reserved
+
+
 # Snapshot fields are intentionally plain JSON types.  The health route must
 # never call into the storage/embedding layers or spawn subprocesses.
 _HEALTH_LOCK = threading.Lock()
@@ -435,6 +541,10 @@ _HEALTH_SNAPSHOT: Dict[str, Any] = {
     "embed_cache": {},
     "governance": {},
     "backpressure": {},
+    "db_identity": {},
+    "db_identity_mismatch": False,
+    "db_identity_mismatch_count": 0,
+    "db_identity_last_mismatch_at": None,
     "error": None,
 }
 _HEALTH_THREAD: Optional[threading.Thread] = None
@@ -486,6 +596,15 @@ def _probe_health_once() -> None:
                 error=_client_error)
             _p0_inc("health_probe_error")
             return
+        identity_info: Dict[str, Any] = {}
+        checker = getattr(client, "check_data_identity", None)
+        if callable(checker):
+            try:
+                got = checker()
+                if isinstance(got, dict):
+                    identity_info = got
+            except Exception as e:
+                identity_info = {"error": str(e)}
         try:
             storage = client.stats(all_sessions=True)
         except StorageBusyError as e:
@@ -519,6 +638,13 @@ def _probe_health_once() -> None:
             "embedding_gpu_resident": gpu.get("resident"),
             "embedding_gpu_status": gpu.get("detail", "unknown"),
             "embed_cache": _embed_cache_health(),
+            "db_identity": dict(identity_info.get("db_identity") or {}),
+            "db_identity_mismatch": bool(
+                identity_info.get("identity_mismatch", False)),
+            "db_identity_mismatch_count": int(
+                identity_info.get("identity_mismatch_count", 0) or 0),
+            "db_identity_last_mismatch_at": identity_info.get(
+                "identity_last_mismatch_at"),
             "error": None,
         }
         _health_set(**unified)
@@ -682,7 +808,7 @@ def _dedup_recall(client: ColdStoreClient, content: str,
     """Author-scoped dedup recall (isolation hard constraint)."""
     return client.recall_results(
         _dedup_query_text(content), top_k=_DEDUP_RECALL_TOP_K,
-        author_id=user_id)
+        author_id=user_id, bump=False)
 
 
 def _duplicate_fingerprint(text: str) -> str:
@@ -769,6 +895,88 @@ def _plan_fragment(client: ColdStoreClient, content: str,
     return {"action": "insert", "text": content, "result": None}
 
 
+def _plan_doc_texts(plans: List[Dict[str, Any]]) -> List[str]:
+    """Document texts a plan may embed during its write path."""
+    texts: List[str] = []
+    for plan in plans or []:
+        action = plan.get("action")
+        if action == "insert":
+            text = plan.get("text") or ""
+            if text:
+                texts.append(text)
+        elif action == "update":
+            text = plan.get("text") or ""
+            if text:
+                texts.append(text)
+            fallback = plan.get("fallback_text") or ""
+            if fallback:
+                texts.append(fallback)
+    return texts
+
+
+def _assert_plan_embeddings_cached(client: ColdStoreClient,
+                                   plans: List[Dict[str, Any]]) -> None:
+    """Fail before a write if any plan text is not already cache-resident.
+
+    This is the P0.5 write-phase guard requested by review §4.4: Phase A owns
+    all cache misses; Phase B must be a short SQLite-only section.  Clients
+    without the optional probe (test doubles, remote backend) are skipped so
+    the contract is unchanged for them.
+    """
+    checker = getattr(client, "assert_embeddings_cached", None)
+    if not callable(checker):
+        return
+    texts = _plan_doc_texts(plans)
+    if not texts:
+        return
+    try:
+        ok = bool(checker("doc", texts))
+    except Exception:
+        ok = False
+    if not ok:
+        raise _EmbeddingUnavailable(
+            "write-phase embedding cache miss; Phase A must precompute all "
+            "plan texts before entering the write phase")
+
+
+def _find_exact_memory(client: ColdStoreClient, content: str,
+                       user_id: str) -> Optional[str]:
+    """Return an existing same-content memory id if the backend can do so.
+
+    The P0.5 crash-window fix must not depend on recall recall-quality gates:
+    a fragment committed just before a crash can be absent from the dedup
+    recall candidate set (review probe_ledger_crash).  LocalBackend therefore
+    exposes a direct exact-content lookup used only before an insert/update.
+    """
+    finder = getattr(client, "find_exact", None)
+    if callable(finder):
+        try:
+            found = finder(content, author_id=user_id)
+        except Exception:
+            found = None
+        if found:
+            return str(found)
+    # Best-effort fallback for in-memory test/legacy backends that expose a
+    # plain row list but not the optional find_exact protocol.  Production
+    # LocalBackend uses its SQL find_exact above; this branch keeps crash-replay
+    # idempotency testable without depending on recall quality gates.
+    rows = getattr(client, "rows", None)
+    if not isinstance(rows, (list, tuple)):
+        rows = getattr(client, "memories", None)
+    if isinstance(rows, (list, tuple)):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("content") != content:
+                continue
+            row_author = row.get("author_id")
+            if user_id is None or row_author in (None, user_id):
+                rid = row.get("id")
+                if rid is not None:
+                    return str(rid)
+    return None
+
+
 def _execute_plan(client: ColdStoreClient, plan: Dict[str, Any],
                   content: str, user_id: str,
                   source: str = "conversation") -> Dict[str, Any]:
@@ -777,6 +985,14 @@ def _execute_plan(client: ColdStoreClient, plan: Dict[str, Any],
     if action in ("stale", "duplicate"):
         return dict(plan.get("result") or {})
     if action == "update":
+        planned_text = plan.get("text") or content
+        # Crash replay guard: if the merged text is already present, the
+        # previous attempt committed the update but crashed before its ledger
+        # checkpoint.  Do not bump/rewrite it.
+        existing = _find_exact_memory(client, planned_text, user_id)
+        if existing:
+            return {"status": "duplicate", "memory_id": existing}
+        _assert_plan_embeddings_cached(client, [plan])
         try:
             r = client.update(plan["memory_id"], plan["text"],
                               author_id=user_id)
@@ -786,6 +1002,17 @@ def _execute_plan(client: ColdStoreClient, plan: Dict[str, Any],
                         "detail": "merged into existing entry"}
         except Exception:
             pass  # update failed → fall through to fresh write
+        # Fallback write uses the original fragment text; it was warmed in
+        # Phase A specifically for this case.
+        existing = _find_exact_memory(client, content, user_id)
+        if existing:
+            return {"status": "duplicate", "memory_id": existing}
+    elif action == "insert":
+        # Crash replay guard independent of recall gates.
+        existing = _find_exact_memory(client, content, user_id)
+        if existing:
+            return {"status": "duplicate", "memory_id": existing}
+        _assert_plan_embeddings_cached(client, [plan])
     r = client.remember(content, importance=_FACT_IMPORTANCE, scope="global",
                         author_id=user_id, source=source)
     if r.get("status") == "stored":
@@ -828,9 +1055,11 @@ def _warm_embedding_cache(client: ColdStoreClient, kind: str,
             continue
         seen.add(text)
         ordered.append(text)
-    fn_name = "embed_queries" if kind == "query" else "embed_texts"
-    fn = getattr(client, fn_name, None)
-    if not callable(fn):
+    prefetch = getattr(client, "prefetch_embeddings", None)
+    use_prefetch = callable(prefetch)
+    fallback_fn_name = "embed_queries" if kind == "query" else "embed_texts"
+    fallback_fn = getattr(client, fallback_fn_name, None)
+    if not use_prefetch and not callable(fallback_fn):
         return 0
     submitted = 0
     batch_size = max(1, AML_EMBED_BATCH_SIZE)
@@ -839,10 +1068,14 @@ def _warm_embedding_cache(client: ColdStoreClient, kind: str,
         chunk = ordered[start:start + batch_size]
         _acquire_embed_gate(deadline)
         try:
-            result = fn(chunk)
+            if use_prefetch:
+                result = prefetch(kind, chunk)
+            else:
+                result = fallback_fn(chunk)
         finally:
             _release_embed_gate()
         if isinstance(result, list) and not result:
+            fn_name = "prefetch_embeddings" if use_prefetch else fallback_fn_name
             raise _EmbeddingUnavailable(
                 f"{fn_name} returned an empty result for {len(chunk)} text(s)")
         submitted += len(chunk)
@@ -854,15 +1087,39 @@ def _precompute_add_plans(client: ColdStoreClient,
                          fragments: List[Tuple[str, str]],
                          user_id: str,
                          deadline: float) -> List[Dict[str, Any]]:
-    """Phase A: query/doc batch warm-up + per-fragment decisions (no writes)."""
-    query_texts = [_dedup_query_text(text) for _role, text in fragments]
+    """Phase A: query/doc batch warm-up + per-fragment decisions (no writes).
+
+    P0.5 changes:
+      * classify before warming so STALE fragments issue no embeddings;
+      * only warm query/doc texts the plan may execute;
+      * every returned plan is verified cache-resident before Phase B.
+    """
+    if not fragments:
+        return []
+
+    # Pure, read-only stale pre-screen first.  classify() has no DB writes.
+    decisions: List[Dict[str, Any]] = []
+    query_texts: List[str] = []
+    for _role, text in fragments:
+        _check_deadline(deadline)
+        decision = classify(text, importance=_FACT_IMPORTANCE)
+        decisions.append(decision)
+        if decision["decision"] != STALE:
+            query_texts.append(_dedup_query_text(text))
     _warm_embedding_cache(client, "query", query_texts, deadline)
 
     plans: List[Dict[str, Any]] = []
     doc_texts: List[str] = []
-    for _role, text in fragments:
+    for (_role, text), decision in zip(fragments, decisions):
         _check_deadline(deadline)
-        plan = _plan_fragment(client, text, user_id)
+        if decision["decision"] == STALE:
+            plan = {"action": "stale",
+                    "result": {"status": "stale",
+                               "detail": decision.get("reason", "")}}
+        else:
+            # Reuse the pure classification decision; _plan_fragment mirrors
+            # this decision tree exactly for non-STALE content.
+            plan = _plan_fragment(client, text, user_id)
         _check_deadline(deadline)
         action = plan.get("action")
         if action == "insert":
@@ -870,11 +1127,13 @@ def _precompute_add_plans(client: ColdStoreClient,
         elif action == "update":
             # The write path may update, or fall back to remember() using the
             # original text; warm both so the write phase is cache-only.
+            plan["fallback_text"] = text
             doc_texts.append(plan.get("text") or "")
             doc_texts.append(text)
         plans.append(plan)
     _warm_embedding_cache(
         client, "doc", [t for t in doc_texts if t], deadline)
+    _assert_plan_embeddings_cached(client, plans)
     _check_deadline(deadline)
     return plans
 
@@ -1434,57 +1693,23 @@ def _git_commit() -> str:
 
 @mcp.custom_route("/add", methods=["POST"])
 async def aml_add(request: Request) -> JSONResponse:
-    """AML Add: HTTP admission then bounded-worker execution.
+    """AML Add: bounded admission/parse, then bounded-worker execution.
 
-    The event loop only parses/admits; the blocking storage+embedding work runs
-    in a bounded thread pool.  Health does not share this admission domain.
+    The event loop only reads/admits bytes and parses JSON.  Blocking
+    storage+embedding work runs in the worker pool; health is independent.
     """
     if not _check_auth(request):
         return _bad(401, "unauthorized")
 
-    raw_length = request.headers.get("content-length", "")
-    try:
-        body_bytes = int(raw_length) if raw_length else 0
-    except (TypeError, ValueError):
-        body_bytes = 0
-    if body_bytes > AML_MAX_BODY_BYTES:
-        _p0_inc("body_too_large_413")
-        return _bad(413, "request body too large")
-
     deadline = time.monotonic() + AML_REQUEST_BUDGET_S
-    try:
-        body = await request.json()
-    except Exception:
-        return _bad(400, "invalid JSON body")
-    if not isinstance(body, dict):
-        return _bad(400, "body must be a JSON object")
-
-    if not body_bytes:
-        try:
-            body_bytes = len(json.dumps(
-                body, ensure_ascii=False, separators=(",", ":")).encode())
-        except Exception:
-            body_bytes = 1
-    if body_bytes > AML_MAX_BODY_BYTES:
-        _p0_inc("body_too_large_413")
-        return _bad(413, "request body too large")
-
-    admitted, reason = await _ADMISSION.acquire(body_bytes, deadline)
-    if not admitted:
-        if reason == "overload":
-            _p0_inc("backpressure_503")
-            return JSONResponse(
-                {"detail": {"reason": "server overloaded; queue is full"}},
-                status_code=503, headers={"Retry-After": "1"})
-        _p0_inc("budget_503")
-        return JSONResponse(
-            {"detail": {"reason": "request budget exceeded while queued"}},
-            status_code=503, headers={"Retry-After": "1"})
+    body, err, admitted_bytes = await _prepare_json_body(request, deadline)
+    if err is not None:
+        return err
+    assert body is not None
     try:
         return await _run_in_worker(_aml_add_sync, body, deadline)
     finally:
-        await _ADMISSION.release(body_bytes)
-
+        await _ADMISSION.release(admitted_bytes)
 
 def _aml_add_sync(body: Dict[str, Any], deadline: float) -> JSONResponse:
     """Per-user serialisation wrapper for the blocking Add body."""
@@ -1553,6 +1778,7 @@ def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
         return _ledger_response(row)
 
     resume_completed = 0
+    checkpoint: Dict[str, Any] = {}
     if state == "resume":
         checkpoint = _ledger_parse_checkpoint(row[6] if len(row) > 6 else "{}")
         resume_completed = max(0, int(checkpoint.get("completed", 0) or 0))
@@ -1564,7 +1790,28 @@ def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
             for frag in _split_fragments(text):
                 fragments.append((role, frag))
     total_fragments = len(fragments)
-    resume_completed = min(resume_completed, total_fragments)
+    # A legal image-only Add persists one placeholder record.
+    effective_total = total_fragments if parsed_messages else 1
+    if state == "resume":
+        checkpoint_total = max(0, int(checkpoint.get("total", 0) or 0))
+        if checkpoint_total:
+            effective_total = checkpoint_total
+    resume_completed = min(resume_completed, effective_total)
+
+    # Review §4.2: a fully committed request must finalize/replay without
+    # touching _get_client(), Phase A, or an embedding service that may be down.
+    if state == "resume" and resume_completed >= effective_total:
+        response = {
+            "success": True,
+            "request_id": request_id,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
+        try:
+            _ledger_finalize(request_id, body_hash, 200, response)
+        except Exception as e:
+            logger.error("AML resume finalize failed: %s", e)
+        return JSONResponse(response, status_code=200)
 
     try:
         _check_deadline(deadline)
@@ -1583,36 +1830,50 @@ def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
     write_results: List[Dict[str, Any]] = []
     try:
         if not parsed_messages:
-            # Image-only request: precompute its placeholder doc embedding too.
+            # Image-only request: run the same two-phase plan/execute path so
+            # its placeholder embedding is warmed before any write.
             _check_deadline(deadline)
             placeholder = _placeholder_content(session_id, image_events_all)
-            _warm_embedding_cache(client, "doc", [placeholder], deadline)
+            remaining = [("image-only", placeholder)] if resume_completed == 0 else []
+            plans = _precompute_add_plans(client, remaining, user_id, deadline)
             if resume_completed == 0:
+                _ledger_mark_planned(request_id, body_hash, 1)
                 _ledger_mark_writing(request_id, body_hash, 0, 1)
-            result = _write_placeholder(
-                client, user_id, session_id, image_events_all)
-            if result.get("status") == "error":
-                if resume_completed == 0:
+                plan = plans[0] if plans else {
+                    "action": "insert", "text": placeholder}
+                result = _execute_plan(
+                    client, plan, placeholder, user_id, source="image-only")
+                status = str(result.get("status", "error"))
+                if status in ("stale", "filtered"):
+                    result = {"status": "error",
+                              "detail": f"placeholder metadata record was "
+                                        f"{status}: {result.get('detail', '')}"}
+                if result.get("status") == "error":
                     _ledger_abort(request_id, body_hash)
-                return _bad(500, f"placeholder write failed: "
-                                 f"{result.get('detail', result)}")
-            write_results.append(result)
-            _ledger_save_phase(
-                request_id, body_hash, "writing",
-                {"total": 1, "completed": 1})
+                    return _bad(500, f"placeholder write failed: "
+                                     f"{result.get('detail', result)}")
+                write_results.append(result)
+                _ledger_save_phase(
+                    request_id, body_hash, "writing",
+                    {"total": 1, "completed": 1})
         else:
-            # Phase A: no writes.  Budget/deadline may fire here safely.
-            _precompute_add_plans(client, fragments, user_id, deadline)
+            # Phase A: no writes.  Only remaining fragments are precomputed.
+            remaining = fragments[resume_completed:]
+            plans = _precompute_add_plans(client, remaining, user_id, deadline)
+            if len(plans) != len(remaining):
+                raise RuntimeError(
+                    f"plan count mismatch: {len(plans)} != {len(remaining)}")
             if resume_completed == 0:
                 _ledger_mark_planned(request_id, body_hash, total_fragments)
             _ledger_mark_writing(
                 request_id, body_hash, resume_completed, total_fragments)
             # Phase B: short write phase; no budget checks (safe checkpointed
-            # resume if a storage error aborts it).
-            for idx, (role, frag) in enumerate(fragments):
-                if idx < resume_completed:
-                    continue
-                result = _store_fragment(client, frag, user_id, source=role)
+            # resume if a storage error aborts it).  Reuse the Phase A plans.
+            for offset, ((role, frag), plan) in enumerate(
+                    zip(remaining, plans)):
+                idx = resume_completed + offset
+                result = _execute_plan(
+                    client, plan, frag, user_id, source=role)
                 if result.get("status") == "error":
                     completed = idx
                     if completed > 0:
@@ -1679,52 +1940,19 @@ def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
 
 @mcp.custom_route("/search", methods=["POST"])
 async def aml_search(request: Request) -> JSONResponse:
-    """AML Search: HTTP admission then bounded-worker execution."""
+    """AML Search: bounded admission/parse, then bounded-worker execution."""
     if not _check_auth(request):
         return _bad(401, "unauthorized")
 
-    raw_length = request.headers.get("content-length", "")
-    try:
-        body_bytes = int(raw_length) if raw_length else 0
-    except (TypeError, ValueError):
-        body_bytes = 0
-    if body_bytes > AML_MAX_BODY_BYTES:
-        _p0_inc("body_too_large_413")
-        return _bad(413, "request body too large")
-
     deadline = time.monotonic() + AML_REQUEST_BUDGET_S
-    try:
-        body = await request.json()
-    except Exception:
-        return _bad(400, "invalid JSON body")
-    if not isinstance(body, dict):
-        return _bad(400, "body must be a JSON object")
-    if not body_bytes:
-        try:
-            body_bytes = len(json.dumps(
-                body, ensure_ascii=False, separators=(",", ":")).encode())
-        except Exception:
-            body_bytes = 1
-    if body_bytes > AML_MAX_BODY_BYTES:
-        _p0_inc("body_too_large_413")
-        return _bad(413, "request body too large")
-
-    admitted, reason = await _ADMISSION.acquire(body_bytes, deadline)
-    if not admitted:
-        if reason == "overload":
-            _p0_inc("backpressure_503")
-            return JSONResponse(
-                {"detail": {"reason": "server overloaded; queue is full"}},
-                status_code=503, headers={"Retry-After": "1"})
-        _p0_inc("budget_503")
-        return JSONResponse(
-            {"detail": {"reason": "request budget exceeded while queued"}},
-            status_code=503, headers={"Retry-After": "1"})
+    body, err, admitted_bytes = await _prepare_json_body(request, deadline)
+    if err is not None:
+        return err
+    assert body is not None
     try:
         return await _run_in_worker(_aml_search_sync, body, deadline)
     finally:
-        await _ADMISSION.release(body_bytes)
-
+        await _ADMISSION.release(admitted_bytes)
 
 def _aml_search_sync(body: Dict[str, Any], deadline: float) -> JSONResponse:
     """Per-user serialisation wrapper for the blocking Search body."""

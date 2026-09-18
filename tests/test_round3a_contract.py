@@ -255,10 +255,11 @@ def test_b2_count_never_exceeds_top_k_and_empty_is_array(aml_http):
 def test_all_batch_filtered_add_returns_200_without_write(aml_http, monkeypatch):
     c, fake = aml_http
 
-    def filtered(client, content, user_id, source="conversation"):
-        return {"status": "stale", "detail": "filtered by test"}
+    def filtered_plan(client, content, user_id):
+        return {"action": "stale",
+                "result": {"status": "stale", "detail": "filtered by test"}}
 
-    monkeypatch.setattr(aml, "_store_fragment", filtered)
+    monkeypatch.setattr(aml, "_plan_fragment", filtered_plan)
     r = c.post("/add", json=_add_body(
         "r3a:filtered", "u", [{"role": "user", "content": "stale fact"}]))
     assert r.status_code == 200, r.text

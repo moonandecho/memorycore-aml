@@ -22,6 +22,21 @@ class _FakeColdClient:
     def stats(self, all_sessions=False):
         return {"total": len(self.memories)}
 
+    def remember(self, content, importance=0.6, scope="global",
+                 author_id=None, source=None, **kwargs):
+        mid = f"m{len(self.memories) + 1}"
+        self.memories.append({
+            "id": mid, "content": content, "author_id": author_id,
+            "dense_score": 0.9, "importance": importance, "source": source,
+        })
+        return {"status": "stored", "memory_id": mid}
+
+    def update(self, memory_id, content, author_id=None, **kwargs):
+        for m in self.memories:
+            if m.get("id") == memory_id:
+                m["content"] = content
+        return {"status": "updated", "memory_id": memory_id}
+
     def recall_results(self, query, top_k=5, author_id=None, **kwargs):
         if self.search_fn is not None:
             return self.search_fn(query, top_k=top_k, author_id=author_id)

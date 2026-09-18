@@ -82,16 +82,20 @@ TMPDIR=/tmp .venv/bin/python -m pytest tests/test_fix3c_recall_readonly.py -q
 
 ## 1. 改了什么，为什么
 
-给本地 `mnemosyne-memory==3.15.1` 的 embedding 调用加**线程安全、按模型指纹隔离、带双上限的进程内 LRU 缓存**：
+给本地 `mnemosyne-memory==3.15.1` 的 embedding 调用加**线程安全、按模型指纹隔离、带双上限的进程内 LRU 缓存**，并在 P0.5 补上“显式预取缓冲”来满足 G4/G6：
 
 | 模块/函数 | 改动 |
 |---|---|
 | `mnemosyne/core/embeddings.py` | 新增 `_embed_cache_key()` / `_embed_cached_batch()` / `cache_stats()` / `cache_clear()`；`embed()` 与 `embed_query()` 统一走缓存；新增 `embed_queries()`（一次批量 query-embedding，供适配层预热） |
+| P0.5 显式预取 | 新增 `prefetch_embeddings()` / `prime_embeddings()` / `embeddings_cached()` / `clear_prefetch_cache()`；预取缓冲与普通 LRU 独立、仍有条目/字节上限，并且在 `MNEMOSYNE_EMBED_CACHE_SIZE=0` 时仍可复用 Phase A 向量 |
+| P0.5 query 缓存 | 删除 `embed_query` 外层的 `@lru_cache`。旧实现只按 raw text 缓存且会缓存 `None`；一次瞬时失败会让同一 query 在本进程内永久 miss。现在只由统一的有界 cache 缓存成功向量 |
+| P0.5 cache key | `_model_fingerprint()` 自身缓存 key 纳入 `model`、`url`、`dim`、`digest`、`num_ctx`、`num_gpu`、`ollama_version`；任一环境/模型 fingerprint 变化都不会错误复用旧向量 |
+| P0.5 write-path 标记 | `embed()` / `embed_query()` 带 `_mnemosyne_prefetch_aware` 标记；`ColdStoreClient.assert_embeddings_cached()` 会检查它。若下游把公开入口替换成不查预取缓冲的函数，Phase A 会先失败，不会进入 Phase B 写一半才出现 `memory_embeddings=0` |
 | `_embed_api` 调用计数 | 用 `_API_CALL_COUNT_LOCK` 保护 `_API_CALL_COUNT += 1` |
 | 缓存键 | `sha256(model fingerprint + URL + prefix_kind + prefix + text)`；fingerprint 含 `model`、`url`、`dim`、`digest`、`num_ctx`、`num_gpu`、`ollama_version`（由 `MNEMOSYNE_EMBED_MODEL_DIGEST` / `MNEMOSYNE_EMBED_NUM_CTX` / `MNEMOSYNE_EMBED_NUM_GPU` 提供；可选 `MNEMOSYNE_EMBED_FINGERPRINT_FETCH=1` 时尝试 `/api/show` + `/api/ps`） |
 | 值 | `np.ndarray(dtype=float32)`；不存 Python `list[float]` |
-| 上限 | `MNEMOSYNE_EMBED_CACHE_SIZE`（默认 8192 条）+ `MNEMOSYNE_EMBED_CACHE_BYTES`（默认 64 MiB）；两者任一超出即 LRU 淘汰 |
-| 一键回退 | `MNEMOSYNE_EMBED_CACHE_SIZE=0` 完全关闭缓存，行为回到逐次网络调用 |
+| 上限 | `MNEMOSYNE_EMBED_CACHE_SIZE`（默认 8192 条）+ `MNEMOSYNE_EMBED_CACHE_BYTES`（默认 64 MiB）；显式预取缓冲另有 `MNEMOSYNE_EMBED_PREFETCH_SIZE`（默认 4096 条）+ `MNEMOSYNE_EMBED_PREFETCH_BYTES`（默认 64 MiB） |
+| 一键回退 | `MNEMOSYNE_EMBED_CACHE_SIZE=0` 关闭普通 LRU；显式 `prefetch_embeddings()` 仍按 P0.5 语义工作，保证 Add 写阶段 cache-only |
 | 统计 | `cache_stats()` 返回 `enabled/entries/bytes/max_entries/max_bytes/hits/misses/model_fingerprint`，由 AML `/health` 的 `embed_cache` 字段暴露 |
 
 ## 2. 为什么
@@ -99,6 +103,7 @@ TMPDIR=/tmp .venv/bin/python -m pytest tests/test_fix3c_recall_readonly.py -q
 - 一次 Add(20 消息) 原先 60 次 embedding HTTP，其中 20 次是同一 doc 文本被 BEAM 与 legacy 双写重复嵌入；缓存命中后，doc 文本由适配层批量预热一次，后续单条库调用不再发 HTTP。
 - 批量 query 预热同样只改变“何时算”和“算一次还是多次”，同键返回同一 float32 向量；实测 batch16 与单条 `max_abs_diff = 0.0`。
 - 模型指纹必须包含 tag/digest/num_ctx/num_gpu/维度，否则同一进程切换 alias/参数后可能错误复用不同语义的向量。
+- P0.5 评审缺口：`embed_query` 的旧 `@lru_cache` 缓存 `None`、跨模型误命中；写阶段第二次 embedding 失败会造成 200 写入但 `memory_embeddings=0`。本补丁用成功-only/指纹-keyed 的统一缓存和显式预取缓冲消除这两类问题。
 
 ## 3. 如何对干净 mnemosyne 3.15.1 应用
 
@@ -122,9 +127,12 @@ patch -p1 -d /path/to/site-packages < patches/mnemosyne-embed-cache.patch
 
 ```bash
 cd /home/echo/D/memorycore-aml
-TMPDIR=/tmp .venv/bin/python -m pytest tests/test_p0_concurrency_safety.py -q
+TMPDIR=/tmp .venv/bin/python -m pytest tests/test_p05_g4_g6.py tests/test_p0_concurrency_safety.py -q
 ```
 
-其中 `test_p0_embedding_cache_batch_matches_single` 验证缓存命中/未命中、
-batch/单条向量完全一致；`tests/test_p0_concurrency_safety.py` 的 G4/G3/G5
-用例验证适配层调用方在预算、假 ollama、背压场景下的行为。
+其中：
+
+- `test_phase_a_dedup_recall_passes_bump_false` / `test_phase_b_reuses_phase_a_plan` 覆盖 AML 两阶段；
+- `test_prefetch_survives_disabled_normal_cache` 覆盖 `MNEMOSYNE_EMBED_CACHE_SIZE=0` 下的显式预取；
+- `test_embed_query_does_not_cache_none` / `test_model_fingerprint_cache_key_includes_digest` 覆盖 query LRU 与 fingerprint key；
+- `test_p0_embedding_cache_batch_matches_single` 验证普通 cache 的 batch/单条向量一致。

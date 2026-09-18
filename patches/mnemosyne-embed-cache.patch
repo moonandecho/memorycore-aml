@@ -8,18 +8,18 @@
  import json
  import os
  import random
-@@ -12,8 +13,10 @@
+@@ -12,8 +13,9 @@
  import time
  import urllib.error
  import urllib.request
 +from collections import OrderedDict
  from typing import List, Optional
- from functools import lru_cache
+-from functools import lru_cache
 +import threading
  
  try:
      import numpy as np
-@@ -71,6 +74,250 @@
+@@ -71,6 +73,403 @@
  _embedding_model = None
  _API_CALL_COUNT = 0
  
@@ -35,6 +35,13 @@
 +_API_CALL_COUNT_LOCK = threading.Lock()
 +_MODEL_FINGERPRINT_CACHE = None
 +_MODEL_FINGERPRINT_KEY = None
++
++# P0.5 explicit Phase-A prefetch buffer.  Unlike the normal LRU it is populated
++# only by prefetch_embeddings(), so a caller can reuse vectors even when
++# MNEMOSYNE_EMBED_CACHE_SIZE=0 disables the normal cache.
++_EMBED_PREFETCH_LOCK = threading.RLock()
++_EMBED_PREFETCH: "OrderedDict[str, np.ndarray]" = OrderedDict()
++_EMBED_PREFETCH_BYTES = 0
 +
 +
 +def _env_int(name: str, default: int) -> int:
@@ -115,10 +122,16 @@
 +    """Return a stable dict that changes whenever vector semantics change."""
 +    global _MODEL_FINGERPRINT_CACHE, _MODEL_FINGERPRINT_KEY
 +    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-+    key = (str(_DEFAULT_MODEL), str(base_url), str(EMBEDDING_DIM))
++    meta = _ollama_meta_from_env()
++    # Review §2.7: the fingerprint cache key itself must include digest,
++    # num_ctx, num_gpu and URL so an env/model reload cannot reuse stale
++    # vectors until process restart.
++    key = (str(_DEFAULT_MODEL), str(base_url), str(EMBEDDING_DIM),
++           str(meta.get("digest") or ""), str(meta.get("num_ctx") or ""),
++           str(meta.get("num_gpu") or ""),
++           str(meta.get("ollama_version") or ""))
 +    if _MODEL_FINGERPRINT_CACHE is not None and _MODEL_FINGERPRINT_KEY == key:
 +        return dict(_MODEL_FINGERPRINT_CACHE)
-+    meta = _ollama_meta_from_env()
 +    fetched = _fetch_ollama_meta(str(_DEFAULT_MODEL), str(base_url))
 +    for k, v in fetched.items():
 +        if v and not meta.get(k):
@@ -181,6 +194,148 @@
 +            _EMBED_CACHE_BYTES = max(0, _EMBED_CACHE_BYTES - int(old_vec.nbytes) - len(_old_key) - 64)
 +
 +
++def _embed_prefetch_max_entries() -> int:
++    return max(1, _env_int("MNEMOSYNE_EMBED_PREFETCH_SIZE", 4096))
++
++
++def _embed_prefetch_max_bytes() -> int:
++    return max(1, _env_int(
++        "MNEMOSYNE_EMBED_PREFETCH_BYTES", 64 * 1024 * 1024))
++
++
++def _prefetch_get(key: str):
++    with _EMBED_PREFETCH_LOCK:
++        vec = _EMBED_PREFETCH.get(key)
++        if vec is None:
++            return None
++        _EMBED_PREFETCH.move_to_end(key)
++        return vec
++
++
++def _prefetch_put(key: str, vec: np.ndarray) -> None:
++    global _EMBED_PREFETCH_BYTES
++    arr = np.asarray(vec, dtype=np.float32)
++    with _EMBED_PREFETCH_LOCK:
++        old = _EMBED_PREFETCH.get(key)
++        if old is not None:
++            _EMBED_PREFETCH_BYTES = max(
++                0, _EMBED_PREFETCH_BYTES - int(old.nbytes))
++            _EMBED_PREFETCH.move_to_end(key)
++        _EMBED_PREFETCH[key] = arr
++        _EMBED_PREFETCH_BYTES += int(arr.nbytes) + len(key) + 64
++        max_entries = _embed_prefetch_max_entries()
++        max_bytes = _embed_prefetch_max_bytes()
++        while _EMBED_PREFETCH and (
++                len(_EMBED_PREFETCH) > max_entries
++                or _EMBED_PREFETCH_BYTES > max_bytes):
++            old_key, old_vec = _EMBED_PREFETCH.popitem(last=False)
++            _EMBED_PREFETCH_BYTES = max(
++                0, _EMBED_PREFETCH_BYTES - int(old_vec.nbytes)
++                - len(old_key) - 64)
++
++
++def prefetch_embeddings(texts: List[str], kind: str = "doc"):
++    """Explicitly precompute vectors and retain them outside the normal LRU.
++
++    This is the P0.5 hook that lets Phase A own all embedding HTTP even when
++    MNEMOSYNE_EMBED_CACHE_SIZE=0.  Normal ``embed()``/``embed_query()`` calls
++    consult the prefetch buffer first, so the write phase is cache-only.
++    """
++    if not texts:
++        return None
++    raw_texts = list(texts)
++    if _is_disabled():
++        return None
++    prefix = _get_prefix(kind)
++    keys = [_embed_cache_key(t, kind, prefix) for t in raw_texts]
++    missing = []
++    for text, key in zip(raw_texts, keys):
++        if _prefetch_get(key) is not None:
++            continue
++        if _embed_cache_max_entries() > 0:
++            cached = _cache_get(key)
++            if cached is not None:
++                _prefetch_put(key, cached)
++                continue
++        missing.append(text)
++    if missing:
++        # This call performs the actual HTTP/local embedding.  Its normal
++        # destination may be disabled, so we cache the result explicitly.
++        raw = _embed_cached_batch(missing, kind)
++        if raw is None:
++            return None
++        raw_arr = np.asarray(raw, dtype=np.float32)
++        if raw_arr.ndim == 1:
++            raw_arr = raw_arr.reshape(1, -1)
++        if len(raw_arr) != len(missing):
++            return None
++        for text, vec in zip(missing, raw_arr):
++            _prefetch_put(_embed_cache_key(text, kind, prefix), vec)
++    out = []
++    for text, key in zip(raw_texts, keys):
++        vec = _prefetch_get(key)
++        if vec is None and _embed_cache_max_entries() > 0:
++            vec = _cache_get(key)
++        if vec is None:
++            return None
++        out.append(np.asarray(vec, dtype=np.float32))
++    try:
++        return np.stack(out)
++    except Exception:
++        return None
++
++
++def prime_embeddings(texts: List[str], vectors, kind: str = "doc") -> Optional[np.ndarray]:
++    """Retain already-computed vectors in the explicit Phase-A buffer.
++
++    Adapters with their own embedding transport (or tests that monkeypatch
++    embed_queries/embed) can precompute vectors without going through
++    _embed_cached_batch, then prime the same buffer so the write phase stays
++    cache-only even when MNEMOSYNE_EMBED_CACHE_SIZE=0.
++    """
++    if not texts:
++        return None
++    try:
++        arr = np.asarray(vectors, dtype=np.float32)
++    except Exception:
++        return None
++    if arr.ndim == 1:
++        arr = arr.reshape(1, -1)
++    if len(arr) != len(texts):
++        return None
++    prefix = _get_prefix(kind)
++    for text, vec in zip(texts, arr):
++        key = _embed_cache_key(text, kind, prefix)
++        _prefetch_put(key, vec)
++        if _embed_cache_max_entries() > 0:
++            _cache_put(key, vec)
++    return arr
++
++
++def embeddings_cached(texts: List[str], kind: str = "doc") -> bool:
++    """True when every text is in the prefetch buffer or the normal cache."""
++    if not texts:
++        return True
++    if _is_disabled():
++        return False
++    prefix = _get_prefix(kind)
++    for text in texts:
++        key = _embed_cache_key(text, kind, prefix)
++        if _prefetch_get(key) is not None:
++            continue
++        if _embed_cache_max_entries() > 0 and _cache_get(key) is not None:
++            continue
++        return False
++    return True
++
++
++def clear_prefetch_cache() -> None:
++    global _EMBED_PREFETCH_BYTES
++    with _EMBED_PREFETCH_LOCK:
++        _EMBED_PREFETCH.clear()
++        _EMBED_PREFETCH_BYTES = 0
++
++
 +def _embed_cached_batch(texts: List[str], kind: str) -> Optional[np.ndarray]:
 +    """Embed raw texts with prefix kind, reusing/updating the process cache."""
 +    global _API_CALL_COUNT
@@ -194,19 +349,16 @@
 +    keys = [_embed_cache_key(t, kind, prefix) for t in raw_texts]
 +    found = {}
 +    misses = []
-+    if use_cache:
-+        with _EMBED_CACHE_LOCK:
-+            for i, key in enumerate(keys):
-+                v = _EMBED_CACHE.get(key)
-+                if v is not None:
-+                    _EMBED_CACHE.move_to_end(key)
-+                    global _EMBED_CACHE_HITS
-+                    _EMBED_CACHE_HITS += 1
-+                    found[i] = v
-+                else:
-+                    misses.append((i, raw_texts[i]))
-+    else:
-+        misses = list(enumerate(raw_texts))
++    for i, key in enumerate(keys):
++        # Explicit Phase-A prefetch is always checked first, even when the
++        # normal LRU is disabled (MNEMOSYNE_EMBED_CACHE_SIZE=0).
++        v = _prefetch_get(key)
++        if v is None and use_cache:
++            v = _cache_get(key)
++        if v is not None:
++            found[i] = v
++        else:
++            misses.append((i, raw_texts[i]))
 +    if not misses:
 +        try:
 +            return np.stack([np.asarray(found[i], dtype=np.float32) for i in range(len(raw_texts))])
@@ -266,11 +418,12 @@
 +        _EMBED_CACHE_BYTES = 0
 +        _EMBED_CACHE_HITS = 0
 +        _EMBED_CACHE_MISSES = 0
++    clear_prefetch_cache()
 +
  # (1) Prefix support — read at call time so env changes and test fixtures take effect
  # without a module reload. The _PREFIXES_LOGGED guard suppresses log spam.
  _PREFIXES_LOGGED = False
-@@ -298,7 +545,8 @@
+@@ -298,7 +697,8 @@
              with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
                  data = json.loads(resp.read())
              embeddings = [item["embedding"] for item in data["data"]]
@@ -280,7 +433,7 @@
              return np.array(embeddings, dtype=np.float32)
          except urllib.error.HTTPError as exc:
              # Retry rate limits and transient server failures, but surface
-@@ -355,22 +603,22 @@
+@@ -355,22 +755,31 @@
      """Encode a single query text into a dense vector."""
      if not text:
          return None
@@ -288,15 +441,24 @@
 +    return _embed_query_cached(text)
  
  
- @lru_cache(maxsize=512)
+-@lru_cache(maxsize=512)
 -def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
 -    if _is_api_model(_DEFAULT_MODEL):
 -        result = _embed_api([prefixed])
 -        return result[0] if result is not None else None
--
++embed_query._mnemosyne_prefetch_aware = True  # type: ignore[attr-defined]
+ 
 -    model = _get_model()
 -    if model is None or model == "api":
++
 +def _embed_query_cached(text: str) -> Optional[np.ndarray]:
++    """Query wrapper; caching is unified in _embed_cached_batch.
++
++    P0.5 review §2.7: the old @lru_cache could key by raw text only and would
++    poison a query to permanent None after one transient failure.  Do not add
++    any result cache here; only successful vectors are kept by the unified
++    bounded cache.
++    """
 +    result = _embed_cached_batch([text], kind="query")
 +    if result is None or len(result) == 0:
          return None
@@ -314,22 +476,26 @@
  
  
  # (3) embed: apply DOC prefix to every text. Removed the single-text delegation to
-@@ -379,17 +627,7 @@
+@@ -379,17 +788,13 @@
      """Encode texts (documents) into dense vectors."""
      if not texts:
          return None
 -    doc_prefix = _get_prefix("doc")
 -    prefixed = [doc_prefix + t for t in texts]
--
++    return _embed_cached_batch(list(texts), kind="doc")
+ 
 -    if _is_api_model(_DEFAULT_MODEL):
 -        return _embed_api(prefixed)
--
+ 
 -    model = _get_model()
 -    if model is None or model == "api":
 -        return None
 -    vectors = list(model.embed(prefixed))
 -    return np.stack(vectors).astype(np.float32)
-+    return _embed_cached_batch(list(texts), kind="doc")
++# Marker used by LocalBackend.assert_embeddings_cached(): if a test or
++# deployment replaces the public embed() entry point, the adapter cannot
++# assume the prefetch/cache checks still run during Phase B.
++embed._mnemosyne_prefetch_aware = True  # type: ignore[attr-defined]
  
  
  def serialize(vec: np.ndarray) -> str:

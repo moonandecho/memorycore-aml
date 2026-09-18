@@ -634,10 +634,16 @@ async def aml_search(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return _bad(400, "body must be a JSON object")
 
-    query = _require_str(body, "query")
     user_id = _require_str(body, "user_id")
-    if not query or not user_id:
+    if not user_id:
         return _bad(400, "query / user_id are required strings")
+
+    query_texts, img_count, oversize_count, qerr = _extract_texts(
+        body.get("query"), "query")
+    if qerr:
+        return _validation_error(qerr)
+    _log_multimodal_counts(img_count, oversize_count)
+    query = " ".join(query_texts)
 
     top_k = body.get("top_k", _MAX_TOP_K)
     try:
@@ -666,6 +672,10 @@ async def aml_search(request: Request) -> JSONResponse:
                 for r in extra:
                     if r.get("id") not in seen:
                         results.append(r)
+        # Spec: return count must never exceed top_k, even after the fallback
+        # append.  Truncate before decay ranking so the primary recall stays
+        # the evidence-priority prefix.
+        results = results[:top_k]
         results = _apply_decay(results)
     except Exception as e:
         return _bad(500, f"recall failed: {e}")
@@ -687,12 +697,15 @@ async def aml_search(request: Request) -> JSONResponse:
             "score": score,
             "created_at": _iso_z(r.get("timestamp")),
         })
+    # Final safety net: response order is retrieval evidence priority order
+    # and count is always bounded by top_k.
+    data = data[:top_k]
     return JSONResponse({"data": data}, status_code=200)
 
 
 @mcp.custom_route("/health", methods=["GET"])
 async def aml_health(request: Request) -> JSONResponse:
-    """AML Health: 2xx = alive. Reports storage state without failing."""
+    """AML Health: unauthenticated 2xx, with version/commit for verification."""
     state = "ok"
     detail: Dict[str, Any] = {}
     client = _get_client()

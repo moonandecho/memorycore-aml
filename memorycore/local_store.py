@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 ENTRY_DELIMITER = "\n§\n"
-MEMORY_DIR = Path(os.path.expanduser("~/.hermes/memories"))
+MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", os.path.expanduser("~/.memorycore/memories")))
 MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 USER_FILE = MEMORY_DIR / "USER.md"
 

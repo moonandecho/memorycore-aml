@@ -20,7 +20,7 @@ HARD_THRESHOLD = 0.80   # 80% = 4000 chars, 强制溢流
 TARGET_RATIO = 0.40     # 溢流目标 ≤40% = 2000 chars
 
 # ---- 热层路径 (Hermes 本地 memory) ----
-MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", os.path.expanduser("~/.hermes/memories")))
+MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", os.path.expanduser("~/.memorycore/memories")))
 MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 USER_FILE = MEMORY_DIR / "USER.md"
 

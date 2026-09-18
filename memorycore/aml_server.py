@@ -80,8 +80,13 @@ _DEDUP_RECALL_TOP_K = 5    # 写入前查重召回数 (比 overflow 的 3 更宽
 _MAX_FRAGMENT_CHARS = 300  # 长消息按句切分后的片段上限
 _SENTENCE_SPLIT_RE = re.compile(r"[。！？；;\n]")
 _MAX_TOP_K = 100           # AML 协议固定 top_k 上限
-_MAX_IMAGE_DECODED_BYTES = 10 * 1024 * 1024  # spec: 10 MiB decoded per image
+# spec line 1428: "up to 10 MiB decoded per image and 30 MiB per Add request."
+_MAX_IMAGE_DECODED_BYTES = 10 * 1024 * 1024
+_MAX_TOTAL_IMAGE_DECODED_BYTES = 30 * 1024 * 1024
+# Recall candidates must be wider than top_k so decay+truncation is honest.
+_RECALL_CANDIDATE_POOL_MIN = 30
 _SUPPORTED_IMAGE_MIMES = {"jpeg", "jpg", "png", "webp"}
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
 
 # request_id idempotency ledger bounds (persistent SQLite, restart-safe)
 _LEDGER_MAX_ROWS = 5000
@@ -209,6 +214,57 @@ def _iso_z(ts: Optional[str]) -> Optional[str]:
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except (ValueError, TypeError):
         return None
+
+
+def _finite_number(value: Any, default: float = 0.0) -> float:
+    """Coerce a candidate score to a finite float (C4: never 500/NaN)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return number
+
+
+def _sanitize_candidates(results: Any) -> List[Dict[str, Any]]:
+    """Copy candidate dicts into a score-safe shape before decay/ranking.
+
+    NaN/Infinity/huge-int scores become their defaults, and non-string
+    timestamp fields become None so _apply_decay can never raise on them.
+    """
+    safe: List[Dict[str, Any]] = []
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        rr = dict(r)
+        rr["dense_score"] = _finite_number(rr.get("dense_score", 0.0), 0.0)
+        rr["importance"] = _finite_number(rr.get("importance", 0.5), 0.5)
+        for key in ("last_recalled", "timestamp"):
+            if rr.get(key) is not None and not isinstance(rr.get(key), str):
+                rr[key] = None
+        safe.append(rr)
+    return safe
+
+
+def _dedup_candidates(results: Any) -> List[Dict[str, Any]]:
+    """Keep first occurrence of each candidate id, preserving source order."""
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        rid = r.get("id")
+        if rid in seen:
+            continue
+        seen.add(rid)
+        out.append(r)
+    return out
+
+
+def _candidate_pool_size(top_k: int) -> int:
+    """Recall candidate pool: wider than top_k but bounded by the AML cap."""
+    return min(max(int(top_k), _RECALL_CANDIDATE_POOL_MIN), _MAX_TOP_K)
 
 
 def _split_fragments(content: str, max_chars: int = _MAX_FRAGMENT_CHARS) -> List[str]:
@@ -785,8 +841,15 @@ async def aml_search(request: Request) -> JSONResponse:
     if client is None:
         return _bad(500, "storage backend unavailable (embedding service down?)")
 
+    # B2 / fix-round3a: request a candidate pool wider than top_k so decay can
+    # promote a candidate that lexical/semantic recall ranked outside top_k.
+    # The same pool size is used for the primary and options-fallback recalls,
+    # then the merged/deduplicated pool is decay-ranked before truncation.
+    pool_k = _candidate_pool_size(top_k)
     try:
-        results = client.recall_results(query, top_k=top_k, author_id=user_id)
+        primary_results = client.recall_results(
+            query, top_k=pool_k, author_id=user_id)
+        extra_results: List[Dict[str, Any]] = []
         # options-aware fallback (单次兑底, 非迭代搜索):
         # 协议示例查询如 "Which answer best matches the memory?" 本身不携带
         # 事实词, 存储层词法门禁会返回空; 把 options 拼进检索查询可找回证据。
@@ -795,37 +858,37 @@ async def aml_search(request: Request) -> JSONResponse:
         if isinstance(options, list) and options:
             opt_text = " ".join(str(o) for o in options if isinstance(o, str))
             if opt_text:
-                extra = client.recall_results(
-                    query + " " + opt_text, top_k=top_k, author_id=user_id)
-                seen = {r.get("id") for r in results}
-                for r in extra:
-                    if r.get("id") not in seen:
-                        results.append(r)
-        # Spec: data is a relevance-ordered array; the response order is the
-        # evidence-priority order.  Decay the whole candidate pool first
-        # (primary recall + options fallback, deduplicated), then cap the
-        # result count at top_k.  Capping before decay could return an entry
-        # whose reported score is lower than a discarded candidate's score.
-        results = _apply_decay(results)
+                extra_results = client.recall_results(
+                    query + " " + opt_text, top_k=pool_k,
+                    author_id=user_id)
+        candidates = _dedup_candidates(
+            list(primary_results or []) + list(extra_results or []))
+        # C4: make every candidate score finite before decay.  NaN/Infinity/
+        # huge-int scores are normalized to 0.0, never allowed to reach
+        # JSONResponse (which uses allow_nan=False).
+        candidates = _sanitize_candidates(candidates)
+        results = _apply_decay(candidates)
         results = results[:top_k]
     except Exception as e:
         return _bad(500, f"recall failed: {e}")
 
     data = []
     for r in results:
-        content = (r.get("content") or "").strip()
+        if not isinstance(r, dict):
+            continue
+        raw_content = r.get("content")
+        content = raw_content.strip() if isinstance(raw_content, str) else ""
         rid = r.get("id")
         if not content or not rid:
             continue
-        score = r.get("final_score", r.get("dense_score", 0))
-        try:
-            score = round(float(score), 6)
-        except (TypeError, ValueError):
-            score = 0.0
+        # Spec §05: score is an optional number.  C4 keeps it finite even if a
+        # backend/candidate leaks NaN/Infinity.
+        score = _finite_number(
+            r.get("final_score", r.get("dense_score", 0.0)), 0.0)
         data.append({
             "id": str(rid),
             "content": content,
-            "score": score,
+            "score": round(score, 6),
             "created_at": _iso_z(r.get("timestamp")),
         })
     # Final safety net: response order is retrieval evidence priority order

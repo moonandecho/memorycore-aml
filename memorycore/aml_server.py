@@ -345,9 +345,10 @@ def _extract_texts(content: Any, where: str) -> Tuple[List[str], int, int, Optio
         else:
             return [], image_count, oversize_count, (
                 f"{where}[{idx}].type must be 'text' or 'image_url'")
-    if not texts:
-        return [], image_count, oversize_count, (
-            f"{where} must contain at least one non-empty text part")
+    # Spec ContentPart[]: every part must have a valid type; type=text must
+    # be non-empty.  There is no requirement that the array contain a text
+    # part, so an image-only array is valid input.  Callers decide what a
+    # textless request means (Add: valid/no write; Search: valid/no results).
     return texts, image_count, oversize_count, None
 
 
@@ -580,8 +581,10 @@ async def aml_add(request: Request) -> JSONResponse:
     if state == "replay":
         return _ledger_response(row)
 
-    client = _get_client()
-    if client is None:
+    # Image-only (or all-oversize-image) requests are legal but have no text
+    # to write; they still go through the idempotency ledger and return 200.
+    client = _get_client() if parsed_messages else None
+    if parsed_messages and client is None:
         _ledger_abort(request_id, body_hash)
         return _bad(500, "storage backend unavailable (embedding service down?)")
 
@@ -599,10 +602,11 @@ async def aml_add(request: Request) -> JSONResponse:
         return _bad(500, f"write failed: {e}")
 
     # A successful Add must leave the requested content stored/updated, or
-    # match an existing searchable memory.  Governance-filtered-only requests
-    # are not a 200 success.
-    if not any(r.get("status") in ("stored", "updated", "duplicate")
-               for r in write_results):
+    # match an existing searchable memory.  (Governance-filtered-only requests
+    # are handled in fix-round2 I-1.)  Textless image-only requests are valid.
+    if parsed_messages and not any(
+            r.get("status") in ("stored", "updated", "duplicate")
+            for r in write_results):
         _ledger_abort(request_id, body_hash)
         return _validation_error(
             "messages were filtered by memory governance and no memory was written")
@@ -651,6 +655,10 @@ async def aml_search(request: Request) -> JSONResponse:
     except (TypeError, ValueError):
         return _bad(400, "top_k must be an integer")
     top_k = max(1, min(top_k, _MAX_TOP_K))
+
+    # Image-only query: legal ContentPart[], but there is no text to search.
+    if not query_texts:
+        return JSONResponse({"data": []}, status_code=200)
 
     client = _get_client()
     if client is None:

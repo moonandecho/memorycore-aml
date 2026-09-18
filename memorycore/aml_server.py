@@ -538,44 +538,93 @@ async def aml_add(request: Request) -> JSONResponse:
     request_id = _require_str(body, "request_id")
     user_id = _require_str(body, "user_id")
     session_id = _require_str(body, "session_id")
-    messages = body.get("messages")
     if not request_id or not user_id or not session_id:
         return _bad(400, "request_id / user_id / session_id are required strings")
+
+    messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
-        return _bad(400, "messages must be a non-empty array")
+        return _validation_error("messages must be a non-empty array")
+
+    # validate every message before any write, so one bad message cannot leave
+    # a partially-written request behind.
+    parsed_messages: List[Tuple[str, str]] = []
+    total_images = 0
+    total_oversize = 0
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            return _validation_error(f"messages[{idx}] must be an object")
+        role = msg.get("role")
+        if not isinstance(role, str) or not role.strip():
+            return _validation_error(f"messages[{idx}].role must be a non-empty string")
+        texts, img_count, oversize_count, err = _extract_texts(
+            msg.get("content"), f"messages[{idx}].content")
+        if err:
+            return _validation_error(err)
+        total_images += img_count
+        total_oversize += oversize_count
+        for text in texts:
+            parsed_messages.append((role.strip(), text))
+
+    _log_multimodal_counts(total_images, total_oversize)
+
+    body_hash = _body_hash(body)
+    try:
+        state, row = _ledger_begin(request_id, body_hash)
+    except Exception as e:
+        return _bad(500, f"idempotency ledger unavailable: {e}")
+
+    if state == "conflict":
+        return _bad(409, "request_id already used with a different request body")
+    if state == "busy":
+        return _bad(409, "request_id is currently being processed; retry the same body")
+    if state == "replay":
+        return _ledger_response(row)
 
     client = _get_client()
     if client is None:
+        _ledger_abort(request_id, body_hash)
         return _bad(500, "storage backend unavailable (embedding service down?)")
 
-    total_fragments = 0
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        role = msg.get("role")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        source = role if isinstance(role, str) and role else "conversation"
-        for frag in _split_fragments(content):
-            try:
-                client_result = _store_fragment(client, frag, user_id,
-                                                source=source)
-                total_fragments += 1
-            except Exception as e:
-                return _bad(500, f"write failed: {e}")
+    write_results: List[Dict[str, Any]] = []
+    try:
+        for role, text in parsed_messages:
+            for frag in _split_fragments(text):
+                result = _store_fragment(client, frag, user_id, source=role)
+                if result.get("status") == "error":
+                    _ledger_abort(request_id, body_hash)
+                    return _bad(500, f"write failed: {result.get('detail', result)}")
+                write_results.append(result)
+    except Exception as e:
+        _ledger_abort(request_id, body_hash)
+        return _bad(500, f"write failed: {e}")
 
-    return JSONResponse({
+    # A successful Add must leave the requested content stored/updated, or
+    # match an existing searchable memory.  Governance-filtered-only requests
+    # are not a 200 success.
+    if not any(r.get("status") in ("stored", "updated", "duplicate")
+               for r in write_results):
+        _ledger_abort(request_id, body_hash)
+        return _validation_error(
+            "messages were filtered by memory governance and no memory was written")
+
+    response = {
         "success": True,
         "request_id": request_id,
         "user_id": user_id,
         "session_id": session_id,
-    }, status_code=200)
+    }
+    try:
+        _ledger_finalize(request_id, body_hash, 200, response)
+    except Exception as e:
+        # The memory write is already committed; do not turn it into a retry
+        # that may duplicate.  Log the ledger degradation.
+        logger.error("AML request_id ledger finalize failed: %s", e)
+    return JSONResponse(response, status_code=200)
 
 
 @mcp.custom_route("/search", methods=["POST"])
 async def aml_search(request: Request) -> JSONResponse:
-    """AML Search: author-scoped recall, decay-ranked, AML response format."""
+    """AML Search: author-scoped recall, strict top_k, AML response format."""
     if not _check_auth(request):
         return _bad(401, "unauthorized")
     try:

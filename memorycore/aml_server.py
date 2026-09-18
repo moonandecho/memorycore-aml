@@ -23,6 +23,7 @@ Env:
   MEMORYCORE_EMBED_MODEL— embedding model (default qwen3-embedding:0.6b)
   AML_API_KEY           — optional shared key for Add/Search
 """
+import asyncio
 import hashlib
 import json
 import logging
@@ -32,12 +33,14 @@ import re
 import tempfile
 import secrets
 import sqlite3
+import contextlib
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,7 +70,7 @@ except ImportError as _e:
 from starlette.requests import Request  # noqa: E402
 from starlette.responses import JSONResponse  # noqa: E402
 
-from .cold_store_client import ColdStoreClient  # noqa: E402
+from .cold_store_client import ColdStoreClient, StorageBusyError  # noqa: E402
 from .core.classifier import classify, STALE  # noqa: E402
 from .core.overflow import _find_best_match, _merge_two_entries  # noqa: E402
 from .core.decay import _apply_decay  # noqa: E402
@@ -95,6 +98,93 @@ _LEDGER_MAX_ROWS = 5000
 _LEDGER_TTL_SECONDS = 30 * 24 * 3600
 _LEDGER_INFLIGHT_STALE_SECONDS = 300
 _LEDGER_LOCK = threading.Lock()
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+# P0 concurrency / capacity knobs (all env-configurable; defaults chosen for
+# the 64-Add platform shape and the MX150 GPU model).
+AML_WORKERS = _env_int("AML_WORKERS", 4, minimum=1)
+AML_EMBED_CONCURRENCY = _env_int("AML_EMBED_CONCURRENCY", 4, minimum=1)
+AML_EMBED_BATCH_SIZE = _env_int("AML_EMBED_BATCH_SIZE", 16, minimum=1)
+AML_REQUEST_BUDGET_S = _env_float("AML_REQUEST_BUDGET_S", 600.0, minimum=0.1)
+AML_MAX_INFLIGHT = _env_int("AML_MAX_INFLIGHT", 128, minimum=1)
+AML_MAX_QUEUE = _env_int("AML_MAX_QUEUE", 256, minimum=0)
+AML_MAX_INFLIGHT_BYTES = _env_int(
+    "AML_MAX_INFLIGHT_BYTES", 256 * 1024 * 1024, minimum=1)
+AML_MAX_BODY_BYTES = _env_int(
+    "AML_MAX_BODY_BYTES", 30 * 1024 * 1024, minimum=1)
+AML_HEALTH_PROBE_INTERVAL_S = _env_float(
+    "AML_HEALTH_PROBE_INTERVAL_S", 5.0, minimum=0.2)
+AML_STARTUP_SELF_CHECK = os.environ.get(
+    "AML_STARTUP_SELF_CHECK", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+_EMBED_GATE = threading.BoundedSemaphore(AML_EMBED_CONCURRENCY)
+
+_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    global _EXECUTOR
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR = ThreadPoolExecutor(
+                max_workers=AML_WORKERS, thread_name_prefix="aml-worker")
+        return _EXECUTOR
+
+
+class _BudgetExceeded(RuntimeError):
+    """Raised by the cooperative deadline checks before any write starts."""
+
+
+class _EmbeddingUnavailable(RuntimeError):
+    """Raised when the pre-write warm-up proves the embedding API is unusable."""
+
+
+# Counters surfaced through /health; never used for response bodies.
+_P0_LOCK = threading.Lock()
+_P0_COUNTS: Dict[str, int] = {
+    "backpressure_503": 0,
+    "queue_timeout_503": 0,
+    "budget_503": 0,
+    "embedding_unavailable_503": 0,
+    "storage_busy_503": 0,
+    "body_too_large_413": 0,
+    "health_probe_ok": 0,
+    "health_probe_error": 0,
+}
+
+
+def _p0_inc(name: str, delta: int = 1) -> None:
+    with _P0_LOCK:
+        _P0_COUNTS[name] = int(_P0_COUNTS.get(name, 0)) + int(delta)
+
+
+def _p0_snapshot() -> Dict[str, int]:
+    with _P0_LOCK:
+        return dict(_P0_COUNTS)
 
 _MNEMOSYNE_DATA_DIR_REQUIRED_MSG = (
     "MNEMOSYNE_DATA_DIR must be explicitly set; "
@@ -202,6 +292,258 @@ def _get_client() -> Optional[ColdStoreClient]:
                 _client_error = str(e)
                 return None
         return _client
+
+
+# ---- P0 admission / deadline / health snapshot -----------------------------
+#
+# The event loop only does protocol parsing and admission.  All blocking work
+# runs in a bounded ThreadPoolExecutor.  Health never touches _get_client(),
+# SQLite, or subprocesses; it only reads the snapshot maintained by a separate
+# daemon probe thread.
+
+class _AdmissionController:
+    """Byte-weighted in-flight/queue limiter for business requests.
+
+    Health is deliberately not a client of this controller.  Queue waits are
+    part of the caller's request deadline, so a request cannot queue forever
+    and then still get a full processing budget.
+    """
+
+    def __init__(self, max_inflight: int, max_queue: int, max_bytes: int):
+        self.max_inflight = max(1, int(max_inflight))
+        self.max_queue = max(0, int(max_queue))
+        self.max_bytes = max(1, int(max_bytes))
+        self._lock = asyncio.Lock()
+        self._cond = asyncio.Condition(self._lock)
+        self.inflight = 0
+        self.queued = 0
+        self.inflight_bytes = 0
+
+    def _fits(self, nbytes: int) -> bool:
+        return (self.inflight < self.max_inflight
+                and self.inflight_bytes + max(0, nbytes) <= self.max_bytes)
+
+    async def acquire(self, nbytes: int, deadline: float):
+        """Return (ok, reason). reason is overload/budget/timeout."""
+        nbytes = max(0, int(nbytes))
+        async with self._cond:
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    return False, "budget"
+                if self._fits(nbytes):
+                    self.inflight += 1
+                    self.inflight_bytes += nbytes
+                    return True, ""
+                if self.queued >= self.max_queue:
+                    return False, "overload"
+                self.queued += 1
+                try:
+                    remaining = max(0.01, deadline - time.monotonic())
+                    await asyncio.wait_for(
+                        self._cond.wait(),
+                        timeout=min(0.25, remaining))
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    self.queued -= 1
+                    # Wake one waiter in case acquire capacity changed.
+                    self._cond.notify_all()
+
+    async def release(self, nbytes: int) -> None:
+        async with self._cond:
+            self.inflight = max(0, self.inflight - 1)
+            self.inflight_bytes = max(
+                0, self.inflight_bytes - max(0, int(nbytes)))
+            self._cond.notify_all()
+
+
+_ADMISSION = _AdmissionController(
+    AML_MAX_INFLIGHT, AML_MAX_QUEUE, AML_MAX_INFLIGHT_BYTES)
+
+
+# Per-user serialisation: the storage engine is not re-entrant across a
+# single user's plan/write/merge sequence even though individual SQL calls
+# are serialised.  Different users still run in parallel.
+_USER_LOCKS: Dict[str, threading.Lock] = {}
+_USER_LOCKS_GUARD = threading.Lock()
+
+
+def _user_lock(user_id: str) -> threading.Lock:
+    key = str(user_id or "")
+    with _USER_LOCKS_GUARD:
+        lock = _USER_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _USER_LOCKS[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _user_guard(user_id: str):
+    with _user_lock(user_id):
+        yield
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, float(deadline) - time.monotonic())
+
+
+def _check_deadline(deadline: float) -> None:
+    if time.monotonic() > float(deadline):
+        raise _BudgetExceeded(
+            f"request budget exceeded ({AML_REQUEST_BUDGET_S:.0f}s)")
+
+
+def _acquire_embed_gate(deadline: float) -> None:
+    """Blocking embedding semaphore acquire with deadline awareness."""
+    while True:
+        _check_deadline(deadline)
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            raise _BudgetExceeded("request budget exceeded while waiting for embed gate")
+        if _EMBED_GATE.acquire(timeout=min(0.25, remaining)):
+            return
+
+
+def _release_embed_gate() -> None:
+    try:
+        _EMBED_GATE.release()
+    except ValueError:
+        pass
+
+
+async def _run_in_worker(fn, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_executor(), fn, *args)
+
+
+# Snapshot fields are intentionally plain JSON types.  The health route must
+# never call into the storage/embedding layers or spawn subprocesses.
+_HEALTH_LOCK = threading.Lock()
+_HEALTH_SNAPSHOT: Dict[str, Any] = {
+    "status": "starting",
+    "storage": "starting",
+    "updated_at": 0.0,
+    "health_probe_epoch": 0,
+    "embedding_model": os.environ.get(
+        "MEMORYCORE_EMBED_MODEL",
+        os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "")),
+    "embedding_url": os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", ""),
+    "embedding_gpu_resident": None,
+    "embedding_gpu_status": "unknown",
+    "embed_cache": {},
+    "governance": {},
+    "backpressure": {},
+    "error": None,
+}
+_HEALTH_THREAD: Optional[threading.Thread] = None
+_HEALTH_STOP = threading.Event()
+_GPU_STARTUP_STATUS: Dict[str, Any] = {
+    "model": os.environ.get(
+        "MEMORYCORE_EMBED_MODEL",
+        os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "")),
+    "resident": None,
+    "detail": "not_checked",
+    "checked_at": 0.0,
+}
+
+
+def _health_set(**kwargs) -> None:
+    with _HEALTH_LOCK:
+        _HEALTH_SNAPSHOT.update(kwargs)
+
+
+def _health_snapshot() -> Dict[str, Any]:
+    with _HEALTH_LOCK:
+        snap = dict(_HEALTH_SNAPSHOT)
+    snap["governance"] = _governance_snapshot()
+    snap["backpressure"] = _p0_snapshot()
+    snap["version"] = SERVICE_VERSION
+    snap["commit"] = _COMMIT_CACHE or "unknown"
+    return snap
+
+
+def _embed_cache_health() -> Dict[str, Any]:
+    try:
+        from mnemosyne.core import embeddings as _emb  # noqa: E402
+        if hasattr(_emb, "cache_stats"):
+            return _emb.cache_stats()
+    except Exception as e:
+        return {"enabled": False, "error": str(e)}
+    return {"enabled": False, "error": "cache_stats unavailable"}
+
+
+def _probe_health_once() -> None:
+    """Synchronous snapshot refresh; runs only on the daemon probe thread."""
+    now = time.time()
+    try:
+        client = _get_client()
+        if client is None:
+            _health_set(
+                status="degraded", storage="unavailable",
+                updated_at=now, health_probe_epoch=now,
+                error=_client_error)
+            _p0_inc("health_probe_error")
+            return
+        try:
+            storage = client.stats(all_sessions=True)
+        except StorageBusyError as e:
+            storage = {"error": f"storage busy: {e}"}
+        except Exception as e:
+            storage = {"error": str(e)}
+        gpu = dict(_GPU_STARTUP_STATUS)
+        # Best-effort live ollama ps check inside the probe thread only.
+        try:
+            gpu.update(_ollama_ps_status(gpu.get("model") or ""))
+        except Exception:
+            pass
+        configured_model = os.environ.get(
+            "MEMORYCORE_EMBED_MODEL",
+            os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", gpu.get("model", "")))
+        probe_status = "ok"
+        if isinstance(storage, dict) and storage.get("error"):
+            probe_status = "degraded"
+        if configured_model and gpu.get("resident") is not True:
+            # The model tag is configured but ollama ps does not show it as
+            # 100% GPU.  Keep serving, but advertise the degraded residency so
+            # operators see the throughput risk.
+            probe_status = "degraded"
+        unified = {
+            "status": probe_status,
+            "storage": storage,
+            "updated_at": now,
+            "health_probe_epoch": now,
+            "embedding_model": configured_model,
+            "embedding_url": os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", ""),
+            "embedding_gpu_resident": gpu.get("resident"),
+            "embedding_gpu_status": gpu.get("detail", "unknown"),
+            "embed_cache": _embed_cache_health(),
+            "error": None,
+        }
+        _health_set(**unified)
+        _p0_inc("health_probe_ok")
+    except Exception as e:
+        _health_set(status="degraded", storage="unavailable",
+                    updated_at=now, health_probe_epoch=now, error=str(e))
+        _p0_inc("health_probe_error")
+
+
+def _health_probe_loop() -> None:
+    while not _HEALTH_STOP.is_set():
+        _probe_health_once()
+        _HEALTH_STOP.wait(AML_HEALTH_PROBE_INTERVAL_S)
+
+
+def _start_health_probe_thread() -> None:
+    global _HEALTH_THREAD
+    with _HEALTH_LOCK:
+        if _HEALTH_THREAD is not None and _HEALTH_THREAD.is_alive():
+            return
+        _HEALTH_STOP.clear()
+        _HEALTH_THREAD = threading.Thread(
+            target=_health_probe_loop, name="aml-health-probe", daemon=True)
+        _HEALTH_THREAD.start()
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -316,9 +658,8 @@ def _split_fragments(content: str, max_chars: int = _MAX_FRAGMENT_CHARS) -> List
         frags.append(buf)
     return frags or [text]
 
-def _dedup_recall(client: ColdStoreClient, content: str,
-                  user_id: str) -> List[Dict[str, Any]]:
-    """Author-scoped dedup recall (isolation hard constraint).
+def _dedup_query_text(content: str) -> str:
+    """Query text used by the author-scoped dedup recall.
 
     查询用首句截断 (CJK ≤16 字 / 英文 ≤6 词): mnemosyne 的词法门禁对长查询
     更严 (≥4 token → min_relevance 0.3, 实测多一个 "替代 Redis" 尾巴就会
@@ -333,8 +674,15 @@ def _dedup_recall(client: ColdStoreClient, content: str,
         query = " ".join(words[:6])
     if not query:
         query = content[:16]
-    return client.recall_results(query, top_k=_DEDUP_RECALL_TOP_K,
-                                 author_id=user_id)
+    return query
+
+
+def _dedup_recall(client: ColdStoreClient, content: str,
+                  user_id: str) -> List[Dict[str, Any]]:
+    """Author-scoped dedup recall (isolation hard constraint)."""
+    return client.recall_results(
+        _dedup_query_text(content), top_k=_DEDUP_RECALL_TOP_K,
+        author_id=user_id)
 
 
 def _duplicate_fingerprint(text: str) -> str:
@@ -380,18 +728,20 @@ def _aml_match_level(content: str, cand_content: str, dense: float) -> Optional[
     return None
 
 
-def _store_fragment(client: ColdStoreClient, content: str, user_id: str,
-                    source: str = "conversation") -> Dict[str, Any]:
-    """Write one fact fragment with online governance (差异化核心).
+def _plan_fragment(client: ColdStoreClient, content: str,
+                   user_id: str) -> Dict[str, Any]:
+    """Precompute one fragment's governance decision without any write.
 
-    1. stale filter  — 过时状态记录 (≤80字含"已修复"式标记) 不写入
-    2. semantic dedup/merge — 同一事实跳过; 相似事实合并进同一条
-       ("方案A" + "方案A改为B" → 一条, 不是两条)
-    3. remember with author_id = user_id (隔离硬约束)
+    This mirrors _store_fragment's decision tree exactly, but only reads
+    (classify + read-only dedup recall).  It is safe to call before the
+    request's write phase; a budget deadline may fire here and return a
+    retryable 5xx with zero side effects.
     """
     decision = classify(content, importance=_FACT_IMPORTANCE)
     if decision["decision"] == STALE:
-        return {"status": "stale", "detail": decision.get("reason", "")}
+        return {"action": "stale",
+                "result": {"status": "stale",
+                           "detail": decision.get("reason", "")}}
 
     try:
         existing = _dedup_recall(client, content, user_id)
@@ -399,25 +749,43 @@ def _store_fragment(client: ColdStoreClient, content: str, user_id: str,
         existing = []
 
     if existing:
-        # 复用 _find_best_match 选候选 (combined 打分), level 用 AML 侧严门禁重判
         matched = _find_best_match(content, existing)
         if matched:
             level = _aml_match_level(content, matched["content"],
                                      matched.get("dense_score", 0))
             if level == "same":
-                return {"status": "duplicate", "memory_id": matched["id"]}
+                return {"action": "duplicate",
+                        "memory_id": matched["id"],
+                        "result": {"status": "duplicate",
+                                   "memory_id": matched["id"]}}
             if level == "similar":
                 merged = _merge_two_entries(content, matched["content"])
-                if isinstance(merged, str) and merged.strip() != matched["content"].strip():
-                    try:
-                        r = client.update(matched["id"], merged, author_id=user_id)
-                        if r.get("status") == "updated":
-                            return {"status": "updated",
-                                    "memory_id": matched["id"],
-                                    "detail": "merged into existing entry"}
-                    except Exception:
-                        pass  # update failed → fall through to fresh write
+                if (isinstance(merged, str)
+                        and merged.strip() != matched["content"].strip()):
+                    return {"action": "update",
+                            "memory_id": matched["id"],
+                            "text": merged,
+                            "result": None}
+    return {"action": "insert", "text": content, "result": None}
 
+
+def _execute_plan(client: ColdStoreClient, plan: Dict[str, Any],
+                  content: str, user_id: str,
+                  source: str = "conversation") -> Dict[str, Any]:
+    """Execute a precomputed plan; fall back to a fresh write exactly as before."""
+    action = plan.get("action")
+    if action in ("stale", "duplicate"):
+        return dict(plan.get("result") or {})
+    if action == "update":
+        try:
+            r = client.update(plan["memory_id"], plan["text"],
+                              author_id=user_id)
+            if r.get("status") == "updated":
+                return {"status": "updated",
+                        "memory_id": plan["memory_id"],
+                        "detail": "merged into existing entry"}
+        except Exception:
+            pass  # update failed → fall through to fresh write
     r = client.remember(content, importance=_FACT_IMPORTANCE, scope="global",
                         author_id=user_id, source=source)
     if r.get("status") == "stored":
@@ -427,6 +795,91 @@ def _store_fragment(client: ColdStoreClient, content: str, user_id: str,
     return {"status": "error", "detail": str(r)}
 
 
+def _store_fragment(client: ColdStoreClient, content: str, user_id: str,
+                    source: str = "conversation") -> Dict[str, Any]:
+    """Write one fact fragment with online governance (差异化核心).
+
+    1. stale filter  — 过时状态记录 (≤80字含"已修复"式标记) 不写入
+    2. semantic dedup/merge — 同一事实跳过; 相似事实合并进同一条
+       ("方案A" + "方案A改为B" → 一条, 不是两条)
+    3. remember with author_id = user_id (隔离硬约束)
+    """
+    plan = _plan_fragment(client, content, user_id)
+    return _execute_plan(client, plan, content, user_id, source)
+
+
+def _warm_embedding_cache(client: ColdStoreClient, kind: str,
+                          texts: List[str], deadline: float) -> int:
+    """Warm the mnemosyne embedding cache in bounded batches.
+
+    returns the number of texts submitted.  Raises _EmbeddingUnavailable when
+    a real backend explicitly returns an empty list for non-empty input, which
+    is the library's "embedding call failed" signal.  Test doubles that do not
+    expose the warm-up method are treated as "unknown, continue" so contract
+    tests keep their deterministic local fakes.
+    """
+    if not texts:
+        return 0
+    # Preserve order while removing duplicates (same text => same cache key).
+    seen = set()
+    ordered: List[str] = []
+    for text in texts:
+        if text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    fn_name = "embed_queries" if kind == "query" else "embed_texts"
+    fn = getattr(client, fn_name, None)
+    if not callable(fn):
+        return 0
+    submitted = 0
+    batch_size = max(1, AML_EMBED_BATCH_SIZE)
+    for start in range(0, len(ordered), batch_size):
+        _check_deadline(deadline)
+        chunk = ordered[start:start + batch_size]
+        _acquire_embed_gate(deadline)
+        try:
+            result = fn(chunk)
+        finally:
+            _release_embed_gate()
+        if isinstance(result, list) and not result:
+            raise _EmbeddingUnavailable(
+                f"{fn_name} returned an empty result for {len(chunk)} text(s)")
+        submitted += len(chunk)
+        _check_deadline(deadline)
+    return submitted
+
+
+def _precompute_add_plans(client: ColdStoreClient,
+                         fragments: List[Tuple[str, str]],
+                         user_id: str,
+                         deadline: float) -> List[Dict[str, Any]]:
+    """Phase A: query/doc batch warm-up + per-fragment decisions (no writes)."""
+    query_texts = [_dedup_query_text(text) for _role, text in fragments]
+    _warm_embedding_cache(client, "query", query_texts, deadline)
+
+    plans: List[Dict[str, Any]] = []
+    doc_texts: List[str] = []
+    for _role, text in fragments:
+        _check_deadline(deadline)
+        plan = _plan_fragment(client, text, user_id)
+        _check_deadline(deadline)
+        action = plan.get("action")
+        if action == "insert":
+            doc_texts.append(plan.get("text") or text)
+        elif action == "update":
+            # The write path may update, or fall back to remember() using the
+            # original text; warm both so the write phase is cache-only.
+            doc_texts.append(plan.get("text") or "")
+            doc_texts.append(text)
+        plans.append(plan)
+    _warm_embedding_cache(
+        client, "doc", [t for t in doc_texts if t], deadline)
+    _check_deadline(deadline)
+    return plans
+
+
+# ---- helpers ---------------------------------------------------------------
 def _check_auth(request: Request) -> bool:
     if not AML_API_KEY:
         return True  # smoke mode: no auth configured
@@ -732,18 +1185,41 @@ def _ledger_connect() -> "sqlite3.Connection":
         os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10.0)
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS aml_request_ledger (
-            request_id TEXT PRIMARY KEY,
-            body_hash TEXT NOT NULL,
-            status_code INTEGER NOT NULL DEFAULT 0,
-            response_json TEXT NOT NULL DEFAULT '',
-            updated_at REAL NOT NULL
+    # Schema creation/migration is a process-wide setup step; serialise it so
+    # concurrent first requests cannot both issue the same ALTER TABLE.
+    with _LEDGER_LOCK:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS aml_request_ledger (
+                request_id TEXT PRIMARY KEY,
+                body_hash TEXT NOT NULL,
+                status_code INTEGER NOT NULL DEFAULT 0,
+                response_json TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL
+            )
+            """
         )
-        """
-    )
+        # P0 migration: phase/checkpoint are additive and safe on existing ledgers.
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(aml_request_ledger)").fetchall()}
+        if "phase" not in cols:
+            conn.execute(
+                "ALTER TABLE aml_request_ledger "
+                "ADD COLUMN phase TEXT NOT NULL DEFAULT 'reserved'")
+        if "checkpoint" not in cols:
+            conn.execute(
+                "ALTER TABLE aml_request_ledger "
+                "ADD COLUMN checkpoint TEXT NOT NULL DEFAULT '{}'")
+        conn.commit()
     return conn
+
+
+def _ledger_parse_checkpoint(raw: Any) -> Dict[str, Any]:
+    try:
+        data = json.loads(raw or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _body_hash(body: Dict[str, Any]) -> str:
@@ -753,18 +1229,19 @@ def _body_hash(body: Dict[str, Any]) -> str:
 
 
 def _ledger_begin(request_id: str, body_hash: str):
-    """Reserve/replay a request_id atomically in SQLite.
+    """Reserve/replay/resume a request_id atomically in SQLite.
 
-    Returns (state, row) where state is new/replay/conflict/busy.  A short
-    global lock plus BEGIN IMMEDIATE makes check-and-reserve atomic within the
-    process (and safe enough for the single-worker service contract).
+    Returns (state, row) where state is new/replay/resume/conflict/busy.
+    A resume row carries a non-zero checkpoint; the caller skips that many
+    already-committed fragments instead of replaying them.
     """
     conn = _ledger_connect()
     try:
         with _LEDGER_LOCK:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT request_id, body_hash, status_code, response_json, updated_at "
+                "SELECT request_id, body_hash, status_code, response_json, "
+                "updated_at, phase, checkpoint "
                 "FROM aml_request_ledger WHERE request_id = ?",
                 (request_id,),
             ).fetchone()
@@ -772,25 +1249,42 @@ def _ledger_begin(request_id: str, body_hash: str):
                 if row[1] != body_hash:
                     conn.execute("ROLLBACK")
                     return "conflict", row
-                if row[2] and row[3]:
+                phase = str(row[5] or "reserved")
+                checkpoint = _ledger_parse_checkpoint(row[6])
+                completed = max(0, int(checkpoint.get("completed", 0) or 0))
+                if phase == "done" and row[2] and row[3]:
                     conn.execute("ROLLBACK")
                     return "replay", row
-                # Crash/stale in-flight reservation: allow a bounded retry.
-                if time.time() - float(row[4] or 0) < _LEDGER_INFLIGHT_STALE_SECONDS:
+                if phase == "retryable_partial":
                     conn.execute("ROLLBACK")
-                    return "busy", row
-                conn.execute(
-                    "DELETE FROM aml_request_ledger WHERE request_id = ?",
-                    (request_id,),
-                )
+                    return "resume", row
+                if phase in ("reserved", "planned", "writing"):
+                    age = time.time() - float(row[4] or 0)
+                    if age < _LEDGER_INFLIGHT_STALE_SECONDS:
+                        conn.execute("ROLLBACK")
+                        return "busy", row
+                    if completed > 0:
+                        # Crashed mid-write: resume from the saved checkpoint.
+                        conn.execute("ROLLBACK")
+                        return "resume", row
+                    conn.execute(
+                        "DELETE FROM aml_request_ledger WHERE request_id = ?",
+                        (request_id,))
+                elif row[2] and row[3]:
+                    conn.execute("ROLLBACK")
+                    return "replay", row
+                else:
+                    conn.execute(
+                        "DELETE FROM aml_request_ledger WHERE request_id = ?",
+                        (request_id,))
             now = time.time()
             conn.execute(
                 "INSERT OR REPLACE INTO aml_request_ledger "
-                "(request_id, body_hash, status_code, response_json, updated_at) "
-                "VALUES (?, ?, 0, '', ?)",
+                "(request_id, body_hash, status_code, response_json, "
+                "updated_at, phase, checkpoint) "
+                "VALUES (?, ?, 0, '', ?, 'reserved', '{}')",
                 (request_id, body_hash, now),
             )
-            # Bound the ledger by TTL, then keep only the most recent N rows.
             conn.execute(
                 "DELETE FROM aml_request_ledger WHERE updated_at < ?",
                 (now - _LEDGER_TTL_SECONDS,),
@@ -816,27 +1310,86 @@ def _ledger_begin(request_id: str, body_hash: str):
         conn.close()
 
 
-def _ledger_finalize(request_id: str, body_hash: str, status_code: int,
-                     response: Dict[str, Any]) -> None:
+def _ledger_save_phase(request_id: str, body_hash: str, phase: str,
+                       checkpoint: Optional[Dict[str, Any]] = None,
+                       status_code: Optional[int] = None,
+                       response: Optional[Dict[str, Any]] = None) -> None:
+    """Persist the request phase/checkpoint.  Small, bounded SQLite write."""
     conn = _ledger_connect()
     try:
         with _LEDGER_LOCK:
+            sets = ["phase = ?", "updated_at = ?"]
+            params: List[Any] = [phase, time.time()]
+            if checkpoint is not None:
+                sets.append("checkpoint = ?")
+                params.append(json.dumps(checkpoint, ensure_ascii=False))
+            if status_code is not None:
+                sets.append("status_code = ?")
+                params.append(int(status_code))
+            if response is not None:
+                sets.append("response_json = ?")
+                params.append(json.dumps(response, ensure_ascii=False))
+            params.extend([request_id, body_hash])
             conn.execute(
-                "UPDATE aml_request_ledger SET status_code = ?, "
-                "response_json = ?, updated_at = ? "
+                f"UPDATE aml_request_ledger SET {', '.join(sets)} "
                 "WHERE request_id = ? AND body_hash = ?",
-                (status_code, json.dumps(response, ensure_ascii=False),
-                 time.time(), request_id, body_hash),
+                tuple(params),
             )
             conn.commit()
     finally:
         conn.close()
 
 
+def _ledger_mark_planned(request_id: str, body_hash: str, total: int) -> None:
+    _ledger_save_phase(
+        request_id, body_hash, "planned",
+        {"total": int(total), "completed": 0})
+
+
+def _ledger_mark_writing(request_id: str, body_hash: str,
+                         completed: int, total: int) -> None:
+    _ledger_save_phase(
+        request_id, body_hash, "writing",
+        {"total": int(total), "completed": int(completed)})
+
+
+def _ledger_mark_retryable_partial(request_id: str, body_hash: str,
+                                   completed: int, total: int,
+                                   detail: str) -> None:
+    _ledger_save_phase(
+        request_id, body_hash, "retryable_partial",
+        {"total": int(total), "completed": int(completed),
+         "detail": str(detail)[:500]})
+
+
+def _ledger_finalize(request_id: str, body_hash: str, status_code: int,
+                     response: Dict[str, Any]) -> None:
+    _ledger_save_phase(
+        request_id, body_hash, "done",
+        {"completed": None}, status_code=status_code, response=response)
+
+
 def _ledger_abort(request_id: str, body_hash: str) -> None:
+    """Delete only zero-side-effect reservations.
+
+    A request that reached the write phase must never use this path; it keeps
+    its checkpoint so a retry can resume rather than replay committed work.
+    """
     conn = _ledger_connect()
     try:
         with _LEDGER_LOCK:
+            row = conn.execute(
+                "SELECT status_code, checkpoint FROM aml_request_ledger "
+                "WHERE request_id = ? AND body_hash = ?",
+                (request_id, body_hash),
+            ).fetchone()
+            if row is None:
+                return
+            if int(row[0] or 0) != 0:
+                return
+            checkpoint = _ledger_parse_checkpoint(row[1])
+            if int(checkpoint.get("completed", 0) or 0) > 0:
+                return
             conn.execute(
                 "DELETE FROM aml_request_ledger "
                 "WHERE request_id = ? AND body_hash = ? AND status_code = 0",
@@ -881,9 +1434,24 @@ def _git_commit() -> str:
 
 @mcp.custom_route("/add", methods=["POST"])
 async def aml_add(request: Request) -> JSONResponse:
-    """AML Add: validate, idempotently ingest, then return success."""
+    """AML Add: HTTP admission then bounded-worker execution.
+
+    The event loop only parses/admits; the blocking storage+embedding work runs
+    in a bounded thread pool.  Health does not share this admission domain.
+    """
     if not _check_auth(request):
         return _bad(401, "unauthorized")
+
+    raw_length = request.headers.get("content-length", "")
+    try:
+        body_bytes = int(raw_length) if raw_length else 0
+    except (TypeError, ValueError):
+        body_bytes = 0
+    if body_bytes > AML_MAX_BODY_BYTES:
+        _p0_inc("body_too_large_413")
+        return _bad(413, "request body too large")
+
+    deadline = time.monotonic() + AML_REQUEST_BUDGET_S
     try:
         body = await request.json()
     except Exception:
@@ -891,6 +1459,42 @@ async def aml_add(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return _bad(400, "body must be a JSON object")
 
+    if not body_bytes:
+        try:
+            body_bytes = len(json.dumps(
+                body, ensure_ascii=False, separators=(",", ":")).encode())
+        except Exception:
+            body_bytes = 1
+    if body_bytes > AML_MAX_BODY_BYTES:
+        _p0_inc("body_too_large_413")
+        return _bad(413, "request body too large")
+
+    admitted, reason = await _ADMISSION.acquire(body_bytes, deadline)
+    if not admitted:
+        if reason == "overload":
+            _p0_inc("backpressure_503")
+            return JSONResponse(
+                {"detail": {"reason": "server overloaded; queue is full"}},
+                status_code=503, headers={"Retry-After": "1"})
+        _p0_inc("budget_503")
+        return JSONResponse(
+            {"detail": {"reason": "request budget exceeded while queued"}},
+            status_code=503, headers={"Retry-After": "1"})
+    try:
+        return await _run_in_worker(_aml_add_sync, body, deadline)
+    finally:
+        await _ADMISSION.release(body_bytes)
+
+
+def _aml_add_sync(body: Dict[str, Any], deadline: float) -> JSONResponse:
+    """Per-user serialisation wrapper for the blocking Add body."""
+    user_id = _require_str(body, "user_id") or ""
+    with _user_guard(user_id):
+        return _aml_add_sync_locked(body, deadline)
+
+
+def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
+    """Blocking Add body: validate → two-phase plan → checkpointed write."""
     request_id = _require_str(body, "request_id")
     user_id = _require_str(body, "user_id")
     session_id = _require_str(body, "session_id")
@@ -948,42 +1552,115 @@ async def aml_add(request: Request) -> JSONResponse:
     if state == "replay":
         return _ledger_response(row)
 
-    # B1 / fix-round3a: every legal Add that would otherwise have no text to
-    # write (image-only, all-oversize-image, all-invalid-image) must persist a
-    # metadata-only placeholder before a 200 is returned.  The storage client
-    # is required even for these requests because success now implies a write.
+    resume_completed = 0
+    if state == "resume":
+        checkpoint = _ledger_parse_checkpoint(row[6] if len(row) > 6 else "{}")
+        resume_completed = max(0, int(checkpoint.get("completed", 0) or 0))
+
+    # Flatten into (role, fragment) pairs exactly like the old per-fragment loop.
+    fragments: List[Tuple[str, str]] = []
+    if parsed_messages:
+        for role, text in parsed_messages:
+            for frag in _split_fragments(text):
+                fragments.append((role, frag))
+    total_fragments = len(fragments)
+    resume_completed = min(resume_completed, total_fragments)
+
+    try:
+        _check_deadline(deadline)
+    except _BudgetExceeded as e:
+        if resume_completed == 0:
+            _ledger_abort(request_id, body_hash)
+        _p0_inc("budget_503")
+        return _bad(503, str(e))
+
     client = _get_client()
     if client is None:
-        _ledger_abort(request_id, body_hash)
+        if resume_completed == 0:
+            _ledger_abort(request_id, body_hash)
         return _bad(500, "storage backend unavailable (embedding service down?)")
 
     write_results: List[Dict[str, Any]] = []
     try:
         if not parsed_messages:
+            # Image-only request: precompute its placeholder doc embedding too.
+            _check_deadline(deadline)
+            placeholder = _placeholder_content(session_id, image_events_all)
+            _warm_embedding_cache(client, "doc", [placeholder], deadline)
+            if resume_completed == 0:
+                _ledger_mark_writing(request_id, body_hash, 0, 1)
             result = _write_placeholder(
                 client, user_id, session_id, image_events_all)
             if result.get("status") == "error":
-                _ledger_abort(request_id, body_hash)
+                if resume_completed == 0:
+                    _ledger_abort(request_id, body_hash)
                 return _bad(500, f"placeholder write failed: "
                                  f"{result.get('detail', result)}")
             write_results.append(result)
+            _ledger_save_phase(
+                request_id, body_hash, "writing",
+                {"total": 1, "completed": 1})
         else:
-            for role, text in parsed_messages:
-                for frag in _split_fragments(text):
-                    result = _store_fragment(client, frag, user_id, source=role)
-                    if result.get("status") == "error":
-                        _ledger_abort(request_id, body_hash)
-                        return _bad(500, f"write failed: "
+            # Phase A: no writes.  Budget/deadline may fire here safely.
+            _precompute_add_plans(client, fragments, user_id, deadline)
+            if resume_completed == 0:
+                _ledger_mark_planned(request_id, body_hash, total_fragments)
+            _ledger_mark_writing(
+                request_id, body_hash, resume_completed, total_fragments)
+            # Phase B: short write phase; no budget checks (safe checkpointed
+            # resume if a storage error aborts it).
+            for idx, (role, frag) in enumerate(fragments):
+                if idx < resume_completed:
+                    continue
+                result = _store_fragment(client, frag, user_id, source=role)
+                if result.get("status") == "error":
+                    completed = idx
+                    if completed > 0:
+                        _ledger_mark_retryable_partial(
+                            request_id, body_hash, completed,
+                            total_fragments, str(result.get("detail", result)))
+                        return _bad(503, f"write failed; retry to resume: "
                                          f"{result.get('detail', result)}")
-                    write_results.append(result)
+                    _ledger_abort(request_id, body_hash)
+                    return _bad(500, f"write failed: "
+                                     f"{result.get('detail', result)}")
+                write_results.append(result)
+                _ledger_mark_writing(
+                    request_id, body_hash, idx + 1, total_fragments)
+    except _BudgetExceeded as e:
+        # Pre-write phase only; safe to abort/replay.
+        if resume_completed == 0:
+            _ledger_abort(request_id, body_hash)
+        _p0_inc("budget_503")
+        return _bad(503, str(e))
+    except _EmbeddingUnavailable as e:
+        if resume_completed == 0:
+            _ledger_abort(request_id, body_hash)
+        _p0_inc("embedding_unavailable_503")
+        return _bad(503, f"embedding service unavailable: {e}")
+    except StorageBusyError as e:
+        completed = resume_completed + len(write_results)
+        if completed > 0:
+            _ledger_mark_retryable_partial(
+                request_id, body_hash, completed, total_fragments, str(e))
+            _p0_inc("storage_busy_503")
+            return _bad(503, f"storage busy; retry to resume: {e}")
+        if resume_completed == 0:
+            _ledger_abort(request_id, body_hash)
+        _p0_inc("storage_busy_503")
+        return _bad(503, f"storage busy: {e}")
     except Exception as e:
-        _ledger_abort(request_id, body_hash)
+        completed = resume_completed + len(write_results)
+        if completed > 0:
+            _ledger_mark_retryable_partial(
+                request_id, body_hash, completed, total_fragments, str(e))
+            return _bad(503, f"write interrupted; retry to resume: {e}")
+        if resume_completed == 0:
+            _ledger_abort(request_id, body_hash)
         return _bad(500, f"write failed: {e}")
 
     # I-1: policy filtering is not a malformed request.  A legal Add returns
-    # 200 success=true even when governance writes zero memories
-    # (stale/filtered/duplicate-only).  Requests with no text still wrote the
-    # B1 metadata placeholder above.
+    # 200 success=true even when governance writes zero memories.
     _record_governance(request_id, parsed_messages, write_results,
                        media_counts)
 
@@ -996,24 +1673,68 @@ async def aml_add(request: Request) -> JSONResponse:
     try:
         _ledger_finalize(request_id, body_hash, 200, response)
     except Exception as e:
-        # The memory write is already committed; do not turn it into a retry
-        # that may duplicate.  Log the ledger degradation.
         logger.error("AML request_id ledger finalize failed: %s", e)
     return JSONResponse(response, status_code=200)
 
 
 @mcp.custom_route("/search", methods=["POST"])
 async def aml_search(request: Request) -> JSONResponse:
-    """AML Search: author-scoped recall, strict top_k, AML response format."""
+    """AML Search: HTTP admission then bounded-worker execution."""
     if not _check_auth(request):
         return _bad(401, "unauthorized")
+
+    raw_length = request.headers.get("content-length", "")
+    try:
+        body_bytes = int(raw_length) if raw_length else 0
+    except (TypeError, ValueError):
+        body_bytes = 0
+    if body_bytes > AML_MAX_BODY_BYTES:
+        _p0_inc("body_too_large_413")
+        return _bad(413, "request body too large")
+
+    deadline = time.monotonic() + AML_REQUEST_BUDGET_S
     try:
         body = await request.json()
     except Exception:
         return _bad(400, "invalid JSON body")
     if not isinstance(body, dict):
         return _bad(400, "body must be a JSON object")
+    if not body_bytes:
+        try:
+            body_bytes = len(json.dumps(
+                body, ensure_ascii=False, separators=(",", ":")).encode())
+        except Exception:
+            body_bytes = 1
+    if body_bytes > AML_MAX_BODY_BYTES:
+        _p0_inc("body_too_large_413")
+        return _bad(413, "request body too large")
 
+    admitted, reason = await _ADMISSION.acquire(body_bytes, deadline)
+    if not admitted:
+        if reason == "overload":
+            _p0_inc("backpressure_503")
+            return JSONResponse(
+                {"detail": {"reason": "server overloaded; queue is full"}},
+                status_code=503, headers={"Retry-After": "1"})
+        _p0_inc("budget_503")
+        return JSONResponse(
+            {"detail": {"reason": "request budget exceeded while queued"}},
+            status_code=503, headers={"Retry-After": "1"})
+    try:
+        return await _run_in_worker(_aml_search_sync, body, deadline)
+    finally:
+        await _ADMISSION.release(body_bytes)
+
+
+def _aml_search_sync(body: Dict[str, Any], deadline: float) -> JSONResponse:
+    """Per-user serialisation wrapper for the blocking Search body."""
+    user_id = _require_str(body, "user_id") or ""
+    with _user_guard(user_id):
+        return _aml_search_sync_locked(body, deadline)
+
+
+def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
+    """Blocking Search body."""
     user_id = _require_str(body, "user_id")
     if not user_id:
         return _bad(400, "query / user_id are required strings")
@@ -1026,9 +1747,6 @@ async def aml_search(request: Request) -> JSONResponse:
     query = " ".join(query_texts)
 
     # Spec §05: top_k is required; the response count must never exceed it.
-    # Accept only JSON integers.  bool is an int subclass; reject it
-    # explicitly.  Floats (including Infinity/NaN), strings, null, missing
-    # and negative values are field-validation errors (422), not 500/400.
     if "top_k" not in body:
         return _validation_error("top_k is required and must be an integer")
     raw_top_k = body["top_k"]
@@ -1039,28 +1757,24 @@ async def aml_search(request: Request) -> JSONResponse:
     top_k = min(raw_top_k, _MAX_TOP_K)
     if top_k == 0:
         return JSONResponse({"data": []}, status_code=200)
-
-    # Image-only query: legal ContentPart[], but there is no text to search.
     if not query_texts:
         return JSONResponse({"data": []}, status_code=200)
 
+    try:
+        _check_deadline(deadline)
+    except _BudgetExceeded as e:
+        _p0_inc("budget_503")
+        return _bad(503, str(e))
     client = _get_client()
     if client is None:
         return _bad(500, "storage backend unavailable (embedding service down?)")
 
-    # B2 / fix-round3a: request a candidate pool wider than top_k so decay can
-    # promote a candidate that lexical/semantic recall ranked outside top_k.
-    # The same pool size is used for the primary and options-fallback recalls,
-    # then the merged/deduplicated pool is decay-ranked before truncation.
     pool_k = _candidate_pool_size(top_k)
     try:
         primary_results = client.recall_results(
             query, top_k=pool_k, author_id=user_id, bump=False)
+        _check_deadline(deadline)
         extra_results: List[Dict[str, Any]] = []
-        # options-aware fallback (单次兑底, 非迭代搜索):
-        # 协议示例查询如 "Which answer best matches the memory?" 本身不携带
-        # 事实词, 存储层词法门禁会返回空; 把 options 拼进检索查询可找回证据。
-        # options 只用于检索上下文, 不写入记忆、不生成答案。
         options = body.get("options")
         if isinstance(options, list) and options:
             opt_text = " ".join(str(o) for o in options if isinstance(o, str))
@@ -1068,14 +1782,18 @@ async def aml_search(request: Request) -> JSONResponse:
                 extra_results = client.recall_results(
                     query + " " + opt_text, top_k=pool_k,
                     author_id=user_id, bump=False)
+                _check_deadline(deadline)
         candidates = _dedup_candidates(
             list(primary_results or []) + list(extra_results or []))
-        # C4: make every candidate score finite before decay.  NaN/Infinity/
-        # huge-int scores are normalized to 0.0, never allowed to reach
-        # JSONResponse (which uses allow_nan=False).
         candidates = _sanitize_candidates(candidates)
         results = _apply_decay(candidates)
         results = results[:top_k]
+    except _BudgetExceeded as e:
+        _p0_inc("budget_503")
+        return _bad(503, str(e))
+    except StorageBusyError as e:
+        _p0_inc("storage_busy_503")
+        return _bad(503, f"storage busy: {e}")
     except Exception as e:
         return _bad(500, f"recall failed: {e}")
 
@@ -1088,8 +1806,6 @@ async def aml_search(request: Request) -> JSONResponse:
         rid = r.get("id")
         if not content or not rid:
             continue
-        # Spec §05: score is an optional number.  C4 keeps it finite even if a
-        # backend/candidate leaks NaN/Infinity.
         score = _finite_number(
             r.get("final_score", r.get("dense_score", 0.0)), 0.0)
         data.append({
@@ -1098,30 +1814,82 @@ async def aml_search(request: Request) -> JSONResponse:
             "score": round(score, 6),
             "created_at": _iso_z(r.get("timestamp")),
         })
-    # Final safety net: response order is retrieval evidence priority order
-    # and count is always bounded by top_k.
     data = data[:top_k]
     return JSONResponse({"data": data}, status_code=200)
 
 
+def _ollama_ps_status(model: str) -> Dict[str, Any]:
+    """Read `ollama ps` (read-only) and classify GPU residency for *model*."""
+    if not model:
+        return {"resident": None, "detail": "model_env_unset", "checked_at": time.time()}
+    bin_path = os.environ.get("OLLAMA_BIN", "").strip()
+    if not bin_path:
+        candidate = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "ollama-bin", "ollama")
+        bin_path = candidate if os.path.exists(candidate) else "ollama"
+    try:
+        proc = subprocess.run(
+            [bin_path, "ps"], capture_output=True, text=True,
+            timeout=3.0, check=False)
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    except Exception as e:
+        return {"resident": None, "detail": f"ollama_ps_failed: {e}",
+                "checked_at": time.time()}
+    if proc.returncode != 0:
+        return {"resident": None,
+                "detail": f"ollama_ps_exit_{proc.returncode}",
+                "checked_at": time.time()}
+    target = model.strip()
+    for line in output.splitlines():
+        if target and target not in line:
+            # ollama ps may display "model:latest" while env has bare tag
+            if not target.startswith(line.split()[0] if line.split() else ""):
+                continue
+        lowered = line.lower()
+        if "100% gpu" in lowered:
+            return {"resident": True, "detail": "100% GPU",
+                    "checked_at": time.time(), "line": line.strip()}
+        if "cpu/gpu" in lowered or "gpu" in lowered:
+            return {"resident": False, "detail": line.strip(),
+                    "checked_at": time.time(), "line": line.strip()}
+    return {"resident": False,
+            "detail": "model not resident in ollama ps (will load on first call)",
+            "checked_at": time.time()}
+
+
+def _run_startup_gpu_selfcheck() -> None:
+    """Warn/degrade in logs+health if the configured model is not 100% GPU."""
+    if not AML_STARTUP_SELF_CHECK:
+        return
+    model = os.environ.get(
+        "MEMORYCORE_EMBED_MODEL",
+        os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "")).strip()
+    status = _ollama_ps_status(model)
+    with _HEALTH_LOCK:
+        _GPU_STARTUP_STATUS.update(status)
+        _GPU_STARTUP_STATUS["model"] = model
+    if status.get("resident") is not True:
+        logger.warning(
+            "AML GPU self-check: model=%r is not 100%% GPU (%s). "
+            "Embedding will still be used, but throughput may degrade and "
+            "/health is marked degraded until the model is resident on GPU. "
+            "Hint: set MEMORYCORE_EMBED_MODEL / MNEMOSYNE_EMBEDDING_MODEL=%s.",
+            model, status.get("detail"), model or "qwen3-embedding-aml-ctx1024")
+        _health_set(status="degraded",
+                    embedding_gpu_resident=status.get("resident"),
+                    embedding_gpu_status=status.get("detail", "unknown"))
+    else:
+        _health_set(embedding_gpu_resident=True,
+                    embedding_gpu_status="100% GPU")
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def aml_health(request: Request) -> JSONResponse:
-    """AML Health: unauthenticated 2xx, with version/commit for verification."""
-    state = "ok"
-    detail: Dict[str, Any] = {}
-    client = _get_client()
-    if client is None:
-        state = "degraded"
-        detail["storage"] = "unavailable"
-    else:
-        try:
-            detail["storage"] = client.stats(all_sessions=True)
-        except Exception:
-            state = "degraded"
-            detail["storage"] = "unavailable"
-    payload = {"status": state, **detail,
-               "version": SERVICE_VERSION, "commit": _git_commit(),
-               "governance": _governance_snapshot()}
+    """AML Health: fast memory-snapshot only (never touches SQLite/embedding)."""
+    payload = _health_snapshot()
+    # Snapshot status may be "degraded" for GPU residency; storage liveness is
+    # reflected in payload["storage"].
     return JSONResponse(payload, status_code=200)
 
 
@@ -1133,6 +1901,10 @@ def main() -> None:
     except RuntimeError as e:
         sys.stderr.write(f"[memorycore] 启动失败: {e}\n")
         raise SystemExit(2)
+    # Precompute commit/subprocess once; /health must never spawn git.
+    _git_commit()
+    _start_health_probe_thread()
+    _run_startup_gpu_selfcheck()
     host = os.environ.get("AML_HOST", "0.0.0.0")
     port = int(os.environ.get("AML_PORT", "8000"))
     import uvicorn

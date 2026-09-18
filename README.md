@@ -13,18 +13,21 @@ This repository is the **Agent Memory Leaderboard (AML) submission**. It runs Me
 
 Upstream open-source project: [moonandecho/origin-memorycore](https://github.com/moonandecho/origin-memorycore) (MIT). This repo adds the AML HTTP adapter `memorycore/aml_server.py` and author-scoped identity passthrough on top of it.
 
+**Cycle 2 submission form**: this entry is served from a **participant-hosted public Add/Search endpoint** (Cycle 2 does not accept repository- or Docker-only submissions — see [AML-COMPETITION.md](AML-COMPETITION.md) §2). Track: **textual memory** only; the multimodal and code tracks are not entered this cycle.
+
+
 **Full method disclosure, deployment notes, reproducible tests and honest known-boundaries section: [AML-COMPETITION.md](AML-COMPETITION.md)** (English: [AML-COMPETITION.en.md](AML-COMPETITION.en.md)).
 
 ## Quick start
 
-### Docker (recommended)
+### Docker (optional — local reproduction only)
 
 ```bash
 docker build -t memorycore-aml .
 docker run -p 8000:8000 -v aml-data:/data memorycore-aml
 ```
 
-> The image preloads the embedding model (`qwen3-embedding:0.6b`, ~639 MB) at build time — container startup needs no network. The entrypoint keeps a fallback that pulls the model at runtime only if it is missing (e.g. a custom `MEMORYCORE_EMBED_MODEL`). The data volume `/data` persists the SQLite memory store across restarts.
+> The image preloads the embedding model (`qwen3-embedding:0.6b`, ~639 MB) at build time — container startup needs no network. The entrypoint keeps a fallback that pulls the model at runtime only if it is missing (e.g. a custom `MEMORYCORE_EMBED_MODEL`). The data volume `/data` persists the SQLite memory store across restarts. Cycle 2 requires a participant-hosted endpoint, so this image is provided for local reproduction only.
 
 Smoke test:
 
@@ -242,7 +245,7 @@ Verified synthetic baselines:
 
 ```bash
 # Full regression suite (isolated temp runtime, no production paths):
-.venv/bin/python -m pytest tests/ -q          # 490 passed
+.venv/bin/python -m pytest tests/ -q          # 【待填：全量测试数】 passed
 
 # Fixture-backed acceptance (no ollama required: frozen silver fixture):
 .venv/bin/python tools/replay_fault_rate.py \
@@ -260,6 +263,10 @@ MNEMOSYNE_DATA_DIR=$(mktemp -d) python3 tests/test_aml.py
 28 assertions cover: cross-user isolation (A writes, B cannot see), second write of the same fact deduplicated, "plan A → changed to B" merged into one memory, full HTTP path for `/add` `/search` `/health`, options fallback recall, long-message splitting, and error codes.
 
 ## Known boundaries (honest disclosure)
+- Long messages are split into self-contained fact fragments capped at **300 characters** each — every fragment stays independently retrievable, at the cost of very long evidence being split across fragments.
+- `/search` returns at most **2000 characters** of evidence per item by default (override with `MEMORYCORE_CONTENT_MAX_CHARS`).
+- Recall is **read-only**: repeated identical searches return byte-identical results, because retrieval does not refresh a memory's recency state (requires the storage-layer patch disclosed in AML-COMPETITION.md §4.3).
+- Multimodal and code tracks are not entered this cycle; a message's own `timestamp` is not used as event time (ranking uses the persisted write time).
 
 - Retrieval uses the storage engine's lexical+vector hybrid ranking; the engine applies a lexical-relevance gate on long queries. The options-fallback recall covers multiple-choice scenes; open-ended English natural questions were verified to recall normally.
 - Message-supplied `timestamp` is treated as reference only; ranking uses the persisted write time. `created_at` in responses returns the persisted time (the protocol's "source/persisted time").

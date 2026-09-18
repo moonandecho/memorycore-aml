@@ -13,18 +13,21 @@
 
 上游开源项目: [moonandecho/origin-memorycore](https://github.com/moonandecho/origin-memorycore)(MIT)。本仓库在其之上新增 AML HTTP 适配层 `memorycore/aml_server.py` 与按身份( author_id )的透传隔离。
 
+**第二期提交形态**: 本参赛系统通过**参赛方自托管的公开 Add/Search 端点**接入(第二期不接受仅提交仓库或 Docker 镜像、由平台代为部署的形式, 见 [AML-COMPETITION.md](AML-COMPETITION.md) §2)。参评赛道: **仅文本记忆**; 本期不报多模态与代码赛道。
+
+
 **完整方法披露 / 部署说明 / 可复现测试 / 诚实边界声明: [AML-COMPETITION.md](AML-COMPETITION.md)**(英文版: [AML-COMPETITION.en.md](AML-COMPETITION.en.md))。
 
 ## 快速开始
 
-### Docker(推荐)
+### Docker(可选 — 仅用于本地复现)
 
 ```bash
 docker build -t memorycore-aml .
 docker run -p 8000:8000 -v aml-data:/data memorycore-aml
 ```
 
-> 镜像已在构建期预置 embedding 模型(`qwen3-embedding:0.6b`, 约 639MB)——容器启动无需联网。entrypoint 保留兜底: 仅当模型缺失(如自定义 `MEMORYCORE_EMBED_MODEL`)时才在运行时联网拉取。数据卷 `/data` 持久化 SQLite 记忆库, 重启不丢。
+> 镜像已在构建期预置 embedding 模型(`qwen3-embedding:0.6b`, 约 639MB)——容器启动无需联网。entrypoint 保留兜底: 仅当模型缺失(如自定义 `MEMORYCORE_EMBED_MODEL`)时才在运行时联网拉取。数据卷 `/data` 持久化 SQLite 记忆库, 重启不丢。第二期要求参赛方自托管端点, 故本镜像仅用于本地复现。
 
 冒烟:
 
@@ -212,7 +215,7 @@ origin-memorycore 的 R1–R3 治理内核。AML 的 `/add` 与 `/search` 本来
 
 ```bash
 # 全量回归(隔离临时运行时, 不碰生产路径):
-.venv/bin/python -m pytest tests/ -q          # 490 passed
+.venv/bin/python -m pytest tests/ -q          # 【待填：全量测试数】 passed
 
 # 夹具验收(无需 ollama, 只读冻结 silver fixture):
 .venv/bin/python tools/replay_fault_rate.py \
@@ -230,6 +233,10 @@ MNEMOSYNE_DATA_DIR=$(mktemp -d) python3 tests/test_aml.py
 28 项断言覆盖: 跨 user_id 隔离(A 写 B 查不到)、同一事实二次写入去重、"方案 A → 改为 B"合并为一条、/add /search /health HTTP 全链路、options 兜底召回、长消息切分、错误码。
 
 ## 已知边界(诚实声明)
+- 超长消息会被切分为**每条上限 300 字符**的自包含事实片段——好处是每个片段都能被独立检索到, 代价是超长证据会被切散。
+- `/search` 单条证据默认最多返回 **2000 字符**(可用 `MEMORYCORE_CONTENT_MAX_CHARS` 覆盖)。
+- 检索是**只读**的: 同一问题反复检索结果逐字一致(检索不刷新记忆的活性时间戳; 需应用 AML-COMPETITION.md §4.3 披露的存储层补丁)。
+- 本期不报多模态与代码赛道; 消息自带 `timestamp` 不作为事件时间(排序使用持久化写入时间)。
 
 - 检索走存储层词法+向量混合排序, 存储层对长查询有词法相关性门禁; 选择题场景由 options 兜底召回覆盖, 开放题(英文自然问句)实测可正常召回。
 - 消息自带 timestamp 仅作参考, 排序使用持久化时间(写入时间); created_at 返回持久化时间(协议允许的"来源/持久化时间")。

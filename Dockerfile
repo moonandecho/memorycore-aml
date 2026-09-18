@@ -25,7 +25,7 @@ COPY ollama-bin/ollama /usr/local/bin/ollama
 COPY ollama-lib/ /usr/local/lib/ollama/
 
 # 构建期拉取 embedding 模型: 启动 ollama → 等待就绪 → pull (3 次重试)。
-# 失败即构建失败 (评测平台构建阶段网络通常可用; 若此处失败, 问题暴露在构建期而非评测期)。
+# 失败即构建失败 (本镜像用于本地/自托管复现; 构建机需能访问模型源, 或预先准备好 ollama-bin/ollama-lib 与模型目录)。
 RUN (ollama serve &) && \
     READY=0; \
     for _ in $(seq 1 30); do \

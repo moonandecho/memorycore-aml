@@ -680,11 +680,13 @@ async def aml_search(request: Request) -> JSONResponse:
                 for r in extra:
                     if r.get("id") not in seen:
                         results.append(r)
-        # Spec: return count must never exceed top_k, even after the fallback
-        # append.  Truncate before decay ranking so the primary recall stays
-        # the evidence-priority prefix.
-        results = results[:top_k]
+        # Spec: data is a relevance-ordered array; the response order is the
+        # evidence-priority order.  Decay the whole candidate pool first
+        # (primary recall + options fallback, deduplicated), then cap the
+        # result count at top_k.  Capping before decay could return an entry
+        # whose reported score is lower than a discarded candidate's score.
         results = _apply_decay(results)
+        results = results[:top_k]
     except Exception as e:
         return _bad(500, f"recall failed: {e}")
 

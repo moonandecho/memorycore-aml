@@ -75,3 +75,56 @@ TMPDIR=/tmp .venv/bin/python -m pytest tests/test_fix3c_recall_readonly.py -q
 `fix-3c-20260919/evidence/unpatched_new_tests.txt`，
 补丁应用性自查见
 `fix-3c-20260919/evidence/patch_apply_dryrun.txt`。
+
+---
+
+# mnemosyne-embed-cache.patch
+
+## 1. 改了什么，为什么
+
+给本地 `mnemosyne-memory==3.15.1` 的 embedding 调用加**线程安全、按模型指纹隔离、带双上限的进程内 LRU 缓存**：
+
+| 模块/函数 | 改动 |
+|---|---|
+| `mnemosyne/core/embeddings.py` | 新增 `_embed_cache_key()` / `_embed_cached_batch()` / `cache_stats()` / `cache_clear()`；`embed()` 与 `embed_query()` 统一走缓存；新增 `embed_queries()`（一次批量 query-embedding，供适配层预热） |
+| `_embed_api` 调用计数 | 用 `_API_CALL_COUNT_LOCK` 保护 `_API_CALL_COUNT += 1` |
+| 缓存键 | `sha256(model fingerprint + URL + prefix_kind + prefix + text)`；fingerprint 含 `model`、`url`、`dim`、`digest`、`num_ctx`、`num_gpu`、`ollama_version`（由 `MNEMOSYNE_EMBED_MODEL_DIGEST` / `MNEMOSYNE_EMBED_NUM_CTX` / `MNEMOSYNE_EMBED_NUM_GPU` 提供；可选 `MNEMOSYNE_EMBED_FINGERPRINT_FETCH=1` 时尝试 `/api/show` + `/api/ps`） |
+| 值 | `np.ndarray(dtype=float32)`；不存 Python `list[float]` |
+| 上限 | `MNEMOSYNE_EMBED_CACHE_SIZE`（默认 8192 条）+ `MNEMOSYNE_EMBED_CACHE_BYTES`（默认 64 MiB）；两者任一超出即 LRU 淘汰 |
+| 一键回退 | `MNEMOSYNE_EMBED_CACHE_SIZE=0` 完全关闭缓存，行为回到逐次网络调用 |
+| 统计 | `cache_stats()` 返回 `enabled/entries/bytes/max_entries/max_bytes/hits/misses/model_fingerprint`，由 AML `/health` 的 `embed_cache` 字段暴露 |
+
+## 2. 为什么
+
+- 一次 Add(20 消息) 原先 60 次 embedding HTTP，其中 20 次是同一 doc 文本被 BEAM 与 legacy 双写重复嵌入；缓存命中后，doc 文本由适配层批量预热一次，后续单条库调用不再发 HTTP。
+- 批量 query 预热同样只改变“何时算”和“算一次还是多次”，同键返回同一 float32 向量；实测 batch16 与单条 `max_abs_diff = 0.0`。
+- 模型指纹必须包含 tag/digest/num_ctx/num_gpu/维度，否则同一进程切换 alias/参数后可能错误复用不同语义的向量。
+
+## 3. 如何对干净 mnemosyne 3.15.1 应用
+
+在包含 `mnemosyne/` 包的 `site-packages` 目录执行：
+
+```bash
+patch -p1 -d /path/to/site-packages < patches/mnemosyne-embed-cache.patch
+```
+
+本仓库参赛版 venv 对应目录：
+
+```text
+/home/echo/D/memorycore-aml/.venv/lib/python3.12/site-packages/
+```
+
+补丁头为 `a/mnemosyne/...` / `b/mnemosyne/...`，`-p1` 后落到
+`mnemosyne/core/embeddings.py`。该文件未被 `mnemosyne-recall-readonly.patch`
+改动，两个补丁可独立/顺序应用。
+
+## 4. 如何验证生效
+
+```bash
+cd /home/echo/D/memorycore-aml
+TMPDIR=/tmp .venv/bin/python -m pytest tests/test_p0_concurrency_safety.py -q
+```
+
+其中 `test_p0_embedding_cache_batch_matches_single` 验证缓存命中/未命中、
+batch/单条向量完全一致；`tests/test_p0_concurrency_safety.py` 的 G4/G3/G5
+用例验证适配层调用方在预算、假 ollama、背压场景下的行为。

@@ -1,0 +1,335 @@
+--- a/mnemosyne/core/embeddings.py
++++ b/mnemosyne/core/embeddings.py
+@@ -5,6 +5,7 @@
+ """
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import os
+ import random
+@@ -12,8 +13,10 @@
+ import time
+ import urllib.error
+ import urllib.request
++from collections import OrderedDict
+ from typing import List, Optional
+ from functools import lru_cache
++import threading
+ 
+ try:
+     import numpy as np
+@@ -71,6 +74,250 @@
+ _embedding_model = None
+ _API_CALL_COUNT = 0
+ 
++# ── P0 embedding cache (2026-09-19) ────────────────────────────────────────
++# Key = sha256(model fingerprint + api url + prefix kind + prefix + text).
++# Value is float32 np.ndarray.  Both entry count and byte size are bounded.
++# MNEMOSYNE_EMBED_CACHE_SIZE=0 disables the cache and restores old behaviour.
++_EMBED_CACHE_LOCK = threading.RLock()
++_EMBED_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
++_EMBED_CACHE_BYTES = 0
++_EMBED_CACHE_HITS = 0
++_EMBED_CACHE_MISSES = 0
++_API_CALL_COUNT_LOCK = threading.Lock()
++_MODEL_FINGERPRINT_CACHE = None
++_MODEL_FINGERPRINT_KEY = None
++
++
++def _env_int(name: str, default: int) -> int:
++    raw = os.environ.get(name)
++    if raw is None or str(raw).strip() == "":
++        return default
++    try:
++        return int(str(raw).strip())
++    except (TypeError, ValueError):
++        return default
++
++
++def _embed_cache_max_entries() -> int:
++    return max(0, _env_int("MNEMOSYNE_EMBED_CACHE_SIZE", 8192))
++
++
++def _embed_cache_max_bytes() -> int:
++    return max(0, _env_int("MNEMOSYNE_EMBED_CACHE_BYTES", 64 * 1024 * 1024))
++
++
++def _ollama_meta_from_env() -> dict:
++    return {
++        "digest": os.environ.get("MNEMOSYNE_EMBED_MODEL_DIGEST", ""),
++        "num_ctx": os.environ.get("MNEMOSYNE_EMBED_NUM_CTX", ""),
++        "num_gpu": os.environ.get("MNEMOSYNE_EMBED_NUM_GPU", ""),
++        "ollama_version": os.environ.get("MNEMOSYNE_OLLAMA_VERSION", ""),
++    }
++
++
++def _fetch_ollama_meta(model: str, base_url: str) -> dict:
++    """Best-effort /api/show + /api/ps probe; disabled unless explicitly enabled.
++
++    The production launcher sets the env values directly; this hook is for
++    operators and tests that want the patch to discover the real tag/digest/
++    num_ctx/num_gpu instead of trusting hand-written values.
++    """
++    if os.environ.get("MNEMOSYNE_EMBED_FINGERPRINT_FETCH", "").strip().lower() not in ("1", "true", "yes", "on"):
++        return {}
++    origin = (base_url or "").rstrip("/")
++    if origin.endswith("/v1"):
++        origin = origin[:-3]
++    if not origin:
++        return {}
++    out = {}
++    try:
++        req = urllib.request.Request(
++            origin + "/api/show",
++            data=json.dumps({"name": model}).encode(),
++            headers={"Content-Type": "application/json"},
++            method="POST",
++        )
++        with urllib.request.urlopen(req, timeout=1.0) as resp:
++            data = json.loads(resp.read())
++        details = data.get("details") or {}
++        model_info = data.get("model_info") or {}
++        out["digest"] = str(data.get("digest") or "")
++        out["num_ctx"] = str(details.get("context_length") or model_info.get("general.context_length") or "")
++        # num_gpu is a Modelfile parameter, not exposed by /api/show in all
++        # versions; keep env override authoritative when present.
++        out["num_gpu"] = os.environ.get("MNEMOSYNE_EMBED_NUM_GPU", "")
++        out["ollama_version"] = str(data.get("version") or os.environ.get("MNEMOSYNE_OLLAMA_VERSION", ""))
++    except Exception:
++        pass
++    try:
++        with urllib.request.urlopen(origin + "/api/ps", timeout=1.0) as resp:
++            data = json.loads(resp.read())
++        for item in data.get("models", []):
++            if item.get("name") == model or item.get("model") == model:
++                out["num_gpu"] = str(item.get("num_gpu", out.get("num_gpu", "")))
++                out["gpu_percent"] = str(item.get("processor", ""))
++                break
++    except Exception:
++        pass
++    return out
++
++
++def _model_fingerprint() -> dict:
++    """Return a stable dict that changes whenever vector semantics change."""
++    global _MODEL_FINGERPRINT_CACHE, _MODEL_FINGERPRINT_KEY
++    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
++    key = (str(_DEFAULT_MODEL), str(base_url), str(EMBEDDING_DIM))
++    if _MODEL_FINGERPRINT_CACHE is not None and _MODEL_FINGERPRINT_KEY == key:
++        return dict(_MODEL_FINGERPRINT_CACHE)
++    meta = _ollama_meta_from_env()
++    fetched = _fetch_ollama_meta(str(_DEFAULT_MODEL), str(base_url))
++    for k, v in fetched.items():
++        if v and not meta.get(k):
++            meta[k] = v
++    fp = {
++        "model": str(_DEFAULT_MODEL),
++        "url": str(base_url),
++        "dim": int(EMBEDDING_DIM),
++        "digest": str(meta.get("digest") or ""),
++        "num_ctx": str(meta.get("num_ctx") or ""),
++        "num_gpu": str(meta.get("num_gpu") or ""),
++        "ollama_version": str(meta.get("ollama_version") or ""),
++    }
++    _MODEL_FINGERPRINT_CACHE = dict(fp)
++    _MODEL_FINGERPRINT_KEY = key
++    return dict(fp)
++
++
++def _embed_cache_key(text: str, kind: str, prefix: str) -> str:
++    fp = _model_fingerprint()
++    payload = json.dumps({
++        "fingerprint": fp,
++        "prefix_kind": kind,
++        "prefix": prefix,
++        "text": text,
++    }, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
++    return hashlib.sha256(payload).hexdigest()
++
++
++def _cache_get(key: str):
++    global _EMBED_CACHE_BYTES, _EMBED_CACHE_HITS
++    if _embed_cache_max_entries() <= 0:
++        return None
++    with _EMBED_CACHE_LOCK:
++        vec = _EMBED_CACHE.get(key)
++        if vec is None:
++            return None
++        _EMBED_CACHE.move_to_end(key)
++        _EMBED_CACHE_HITS += 1
++        return vec
++
++
++def _cache_put(key: str, vec: np.ndarray) -> None:
++    global _EMBED_CACHE_BYTES, _EMBED_CACHE_MISSES
++    if _embed_cache_max_entries() <= 0:
++        return
++    arr = np.asarray(vec, dtype=np.float32)
++    with _EMBED_CACHE_LOCK:
++        _EMBED_CACHE_MISSES += 1
++        old = _EMBED_CACHE.get(key)
++        if old is not None:
++            _EMBED_CACHE_BYTES = max(0, _EMBED_CACHE_BYTES - int(old.nbytes))
++            _EMBED_CACHE.move_to_end(key)
++        _EMBED_CACHE[key] = arr
++        _EMBED_CACHE_BYTES += int(arr.nbytes) + len(key) + 64
++        max_entries = _embed_cache_max_entries()
++        max_bytes = _embed_cache_max_bytes()
++        while _EMBED_CACHE and (len(_EMBED_CACHE) > max_entries or _EMBED_CACHE_BYTES > max_bytes):
++            _old_key, old_vec = _EMBED_CACHE.popitem(last=False)
++            _EMBED_CACHE_BYTES = max(0, _EMBED_CACHE_BYTES - int(old_vec.nbytes) - len(_old_key) - 64)
++
++
++def _embed_cached_batch(texts: List[str], kind: str) -> Optional[np.ndarray]:
++    """Embed raw texts with prefix kind, reusing/updating the process cache."""
++    global _API_CALL_COUNT
++    if not texts:
++        return None
++    raw_texts = list(texts)
++    if _is_disabled():
++        return None
++    prefix = _get_prefix(kind)
++    use_cache = _embed_cache_max_entries() > 0
++    keys = [_embed_cache_key(t, kind, prefix) for t in raw_texts]
++    found = {}
++    misses = []
++    if use_cache:
++        with _EMBED_CACHE_LOCK:
++            for i, key in enumerate(keys):
++                v = _EMBED_CACHE.get(key)
++                if v is not None:
++                    _EMBED_CACHE.move_to_end(key)
++                    global _EMBED_CACHE_HITS
++                    _EMBED_CACHE_HITS += 1
++                    found[i] = v
++                else:
++                    misses.append((i, raw_texts[i]))
++    else:
++        misses = list(enumerate(raw_texts))
++    if not misses:
++        try:
++            return np.stack([np.asarray(found[i], dtype=np.float32) for i in range(len(raw_texts))])
++        except Exception:
++            return None
++    miss_texts = [t for _i, t in misses]
++    prefixed = [prefix + t for t in miss_texts]
++    if _is_api_model(_DEFAULT_MODEL):
++        raw = _embed_api(prefixed)
++    else:
++        model = _get_model()
++        if model is None or model == "api":
++            return None
++        try:
++            raw = np.stack(list(model.embed(prefixed))).astype(np.float32)
++        except Exception:
++            return None
++    if raw is None:
++        return None
++    try:
++        raw_arr = np.asarray(raw, dtype=np.float32)
++    except Exception:
++        return None
++    if raw_arr.ndim == 1:
++        raw_arr = raw_arr.reshape(1, -1)
++    if len(raw_arr) != len(miss_texts):
++        return None
++    for j, (i, _text) in enumerate(misses):
++        found[i] = raw_arr[j]
++        if use_cache:
++            _cache_put(keys[i], raw_arr[j])
++    try:
++        return np.stack([np.asarray(found[i], dtype=np.float32) for i in range(len(raw_texts))])
++    except Exception:
++        return None
++
++
++def cache_stats() -> dict:
++    """Expose cache state to /health without importing service internals."""
++    with _EMBED_CACHE_LOCK:
++        return {
++            "enabled": _embed_cache_max_entries() > 0,
++            "entries": len(_EMBED_CACHE),
++            "bytes": int(_EMBED_CACHE_BYTES),
++            "max_entries": _embed_cache_max_entries(),
++            "max_bytes": _embed_cache_max_bytes(),
++            "hits": int(_EMBED_CACHE_HITS),
++            "misses": int(_EMBED_CACHE_MISSES),
++            "model_fingerprint": _model_fingerprint(),
++        }
++
++
++def cache_clear() -> None:
++    global _EMBED_CACHE_BYTES, _EMBED_CACHE_HITS, _EMBED_CACHE_MISSES
++    with _EMBED_CACHE_LOCK:
++        _EMBED_CACHE.clear()
++        _EMBED_CACHE_BYTES = 0
++        _EMBED_CACHE_HITS = 0
++        _EMBED_CACHE_MISSES = 0
++
+ # (1) Prefix support — read at call time so env changes and test fixtures take effect
+ # without a module reload. The _PREFIXES_LOGGED guard suppresses log spam.
+ _PREFIXES_LOGGED = False
+@@ -298,7 +545,8 @@
+             with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                 data = json.loads(resp.read())
+             embeddings = [item["embedding"] for item in data["data"]]
+-            _API_CALL_COUNT += 1
++            with _API_CALL_COUNT_LOCK:
++                _API_CALL_COUNT += 1
+             return np.array(embeddings, dtype=np.float32)
+         except urllib.error.HTTPError as exc:
+             # Retry rate limits and transient server failures, but surface
+@@ -355,22 +603,22 @@
+     """Encode a single query text into a dense vector."""
+     if not text:
+         return None
+-    return _embed_query_cached(_get_prefix("query") + text)
++    return _embed_query_cached(text)
+ 
+ 
+ @lru_cache(maxsize=512)
+-def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
+-    if _is_api_model(_DEFAULT_MODEL):
+-        result = _embed_api([prefixed])
+-        return result[0] if result is not None else None
+-
+-    model = _get_model()
+-    if model is None or model == "api":
++def _embed_query_cached(text: str) -> Optional[np.ndarray]:
++    result = _embed_cached_batch([text], kind="query")
++    if result is None or len(result) == 0:
+         return None
+-    vectors = list(model.embed([prefixed]))
+-    if not vectors:
++    return np.asarray(result[0], dtype=np.float32)
++
++
++def embed_queries(texts: List[str]) -> Optional[np.ndarray]:
++    """Encode query texts in one batch while applying the query prefix."""
++    if not texts:
+         return None
+-    return vectors[0].astype(np.float32)
++    return _embed_cached_batch(list(texts), kind="query")
+ 
+ 
+ # (3) embed: apply DOC prefix to every text. Removed the single-text delegation to
+@@ -379,17 +627,7 @@
+     """Encode texts (documents) into dense vectors."""
+     if not texts:
+         return None
+-    doc_prefix = _get_prefix("doc")
+-    prefixed = [doc_prefix + t for t in texts]
+-
+-    if _is_api_model(_DEFAULT_MODEL):
+-        return _embed_api(prefixed)
+-
+-    model = _get_model()
+-    if model is None or model == "api":
+-        return None
+-    vectors = list(model.embed(prefixed))
+-    return np.stack(vectors).astype(np.float32)
++    return _embed_cached_batch(list(texts), kind="doc")
+ 
+ 
+ def serialize(vec: np.ndarray) -> str:

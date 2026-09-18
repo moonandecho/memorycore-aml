@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
@@ -79,6 +80,7 @@ _FACT_IMPORTANCE = 0.6     # 事实默认重要度: 不触发热关键词 → �
 _DEDUP_RECALL_TOP_K = 5    # 写入前查重召回数 (比 overflow 的 3 更宽, 候选池更全)
 _MAX_FRAGMENT_CHARS = 300  # 长消息按句切分后的片段上限
 _SENTENCE_SPLIT_RE = re.compile(r"[。！？；;\n]")
+_SENTENCE_SPLIT_KEEP_RE = re.compile(r"([。！？；;\n])")
 _MAX_TOP_K = 100           # AML 协议固定 top_k 上限
 # spec line 1428: "up to 10 MiB decoded per image and 30 MiB per Add request."
 _MAX_IMAGE_DECODED_BYTES = 10 * 1024 * 1024
@@ -272,30 +274,47 @@ def _candidate_pool_size(top_k: int) -> int:
 def _split_fragments(content: str, max_chars: int = _MAX_FRAGMENT_CHARS) -> List[str]:
     """Split one message into fact fragments at sentence boundaries.
 
-    Short messages stay whole; long messages are split on sentence
-    terminators and re-packed into chunks ≤ max_chars so each fragment is
-    a self-contained factual unit for dedup/merge.
+    2026-09-19 round-3B: previous implementation stripped separators and
+    re-joined parts with ``"。"``, which corrupted code/commands and produced
+    ``。。`` when the source already used Chinese periods.  This version keeps
+    each boundary character attached to the preceding piece, so joining all
+    fragments reproduces the original text byte-for-byte.  Pieces are then
+    packed without exceeding ``max_chars``.
     """
-    text = (content or "").strip()
-    if not text:
+    text = content or ""
+    if not text.strip():
         return []
+    max_chars = max(1, int(max_chars))
     if len(text) <= max_chars:
         return [text]
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
-    if not parts:
-        return [text]
+
+    parts = _SENTENCE_SPLIT_KEEP_RE.split(text)
+    pieces: List[str] = []
+    for i in range(0, len(parts), 2):
+        body = parts[i]
+        delim = parts[i + 1] if i + 1 < len(parts) else ""
+        if body or delim:
+            pieces.append(body + delim)
+    if not pieces:
+        pieces = [text]
+
     frags: List[str] = []
     buf = ""
-    for p in parts:
-        if buf and len(buf) + len(p) + 1 > max_chars:
+    for piece in pieces:
+        if len(piece) > max_chars:
+            if buf:
+                frags.append(buf)
+                buf = ""
+            for i in range(0, len(piece), max_chars):
+                frags.append(piece[i:i + max_chars])
+            continue
+        if buf and len(buf) + len(piece) > max_chars:
             frags.append(buf)
-            buf = p
-        else:
-            buf = f"{buf}。{p}" if buf else p
+            buf = ""
+        buf += piece
     if buf:
         frags.append(buf)
     return frags or [text]
-
 
 def _dedup_recall(client: ColdStoreClient, content: str,
                   user_id: str) -> List[Dict[str, Any]]:
@@ -318,24 +337,46 @@ def _dedup_recall(client: ColdStoreClient, content: str,
                                  author_id=user_id)
 
 
-def _aml_match_level(content: str, cand_content: str, dense: float) -> Optional[str]:
-    """AML 侧合并门禁 (比 overflow._find_best_match 的 level 更严)。
-
-    实测: qwen3 对同词汇域中文短句的 dense 分数普遍虚高 (0.9+),
-    两个无关事实 ("缓存方案" vs "部署方案") 也能拿到 0.95 ——
-    语义信号不可靠, 以字面相似度为主信号:
-      ratio >= 0.75                → "same"    (几乎逐字相同, 跳过)
-      ratio >= 0.45 且 dense >= 0.5 → "similar" (同主题不同细节, 合并)
-      否则                          → None      (不匹配, 新写)
-
-    注意不能直接用 _find_best_match 的 level: 它的 combined>=0.8 门限会把
-    "方案A" 与 "方案A改为B" 判成 same 而跳过, 丢失更新。
+def _duplicate_fingerprint(text: str) -> str:
+    """Normalize to a near-verbatim fingerprint: case/width/space/punctuation
+    insensitive, but entity, number and unique-marker characters remain.
     """
-    ratio = SequenceMatcher(None, content, cand_content).ratio()
-    if ratio >= 0.75:
+    normalized = unicodedata.normalize("NFKC", text or "").casefold()
+    return re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
+
+
+_UPDATE_MARKERS = (
+    "改为", "改成", "更新为", "修正为", "替换为", "换成", "改用",
+    "不再", "停止使用", "弃用", "替代",
+)
+
+
+def _aml_match_level(content: str, cand_content: str, dense: float) -> Optional[str]:
+    """AML 侧合并门禁 (2026-09-19 round-3B 收紧).
+
+    duplicate 只对“接近逐字重复”生效: 原文 strip 后相等, 或 NFKC/casefold/
+    去空白标点后的 fingerprint 相等。不同实体/数字/唯一标记会改变
+    fingerprint, 因此不会判 duplicate。显式更新/反转措辞 (如 A→改为B)
+    继续走 similar → merge, 保住更新语义。
+    """
+    a = (content or "").strip()
+    b = (cand_content or "").strip()
+    if not a or not b:
+        return None
+    if a == b:
         return "same"
-    if ratio >= 0.45 and (dense or 0) >= 0.50:
-        return "similar"
+    fa = _duplicate_fingerprint(a)
+    fb = _duplicate_fingerprint(b)
+    if fa and fa == fb:
+        return "same"
+
+    # Explicit update/reversal language preserves the old A → 改为 B merge
+    # contract.  The keyword has to be in the newer content; otherwise two
+    # same-template records with different unique markers fall through to a
+    # fresh write instead of being merged/duplicated.
+    if any(marker in a for marker in _UPDATE_MARKERS):
+        if (dense or 0) >= 0.50:
+            return "similar"
     return None
 
 
@@ -1014,7 +1055,7 @@ async def aml_search(request: Request) -> JSONResponse:
     pool_k = _candidate_pool_size(top_k)
     try:
         primary_results = client.recall_results(
-            query, top_k=pool_k, author_id=user_id)
+            query, top_k=pool_k, author_id=user_id, bump=False)
         extra_results: List[Dict[str, Any]] = []
         # options-aware fallback (单次兑底, 非迭代搜索):
         # 协议示例查询如 "Which answer best matches the memory?" 本身不携带
@@ -1026,7 +1067,7 @@ async def aml_search(request: Request) -> JSONResponse:
             if opt_text:
                 extra_results = client.recall_results(
                     query + " " + opt_text, top_k=pool_k,
-                    author_id=user_id)
+                    author_id=user_id, bump=False)
         candidates = _dedup_candidates(
             list(primary_results or []) + list(extra_results or []))
         # C4: make every candidate score finite before decay.  NaN/Infinity/

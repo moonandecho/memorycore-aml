@@ -2002,31 +2002,66 @@ def _find_best_match(entry: str,
     return best
 
 
-def _merge_two_entries(local: str, cold: str) -> str:
-    """合并本地新条目与冷层已有条目。冲突取最新(本地 newer)。"""
-    base = local
-    # P8 修复 (2026-09): 过滤 split 产生的空串成员 — 句末标点结尾时
-    # re.split 会产出 "", 而 "" in s 恒 True 使冷层所有新句子被误判重复,
-    # 合并结果丢失冷层独有细节 (实测 "A记录。"+"B记录。新增信息。" → "A记录。")。
-    base_sentences = {s for s in re.split(r"[。！？;；\n]", base) if s.strip()}
+_UNIT_SPLIT_RE = re.compile(r"([。！？;；\n])")
 
-    extra = []
-    for s in re.split(r"[。！？;；\n]", cold):
-        s = s.strip()
+
+def _iter_content_units(text: str):
+    """Yield (body, delimiter) pairs while preserving original separators.
+
+    ``re.split`` keeps the matched separators in the odd slots.  Callers can
+    rebuild the input exactly with ``"".join(body + delim ...)``; this is what
+    keeps newlines/semicolons lossless during merge.
+    """
+    parts = _UNIT_SPLIT_RE.split(text or "")
+    for i in range(0, len(parts), 2):
+        body = parts[i]
+        delim = parts[i + 1] if i + 1 < len(parts) else ""
+        if body or delim:
+            yield body, delim
+
+
+def _merge_two_entries(local: str, cold: str) -> str:
+    """合并本地新条目与冷层已有条目。冲突取最新(本地 newer)。
+
+    2026-09-19 round-3B: 旧实现用 ``rstrip("。！？;；\n") + "。"`` 重拼，
+    会把代码/命令里的换行和分号改写成中文句号，也会制造 ``。。``。
+    现在只追加“冷层独有句段”，并保留该句段自带的原始分隔符；新增句段
+    之间用中性换行衔接。合并结果对中文是换行分段，对代码保持语法有效。
+    """
+    base = local if isinstance(local, str) else ""
+    cold_text = cold if isinstance(cold, str) else ""
+    if not base.strip():
+        return cold_text
+    if not cold_text.strip():
+        return base
+
+    # 句段级去重仍以规范化后完全相等为界，避免把“同模板 + 唯一标记”
+    # 的旧句（如唯一订单号/实体名）误吞掉。
+    local_norms = [_norm_sentence(body) for body, _ in _iter_content_units(base)]
+    local_norms = [n for n in local_norms if n]
+
+    additions = []
+    for body, delim in _iter_content_units(cold_text):
+        s = body.strip()
         if not s:
             continue
-        is_new = True
-        for bs in base_sentences:
-            if (s in bs or bs in s or
-                    difflib.SequenceMatcher(None, s, bs).ratio() > 0.8):
-                is_new = False
-                break
-        if is_new:
-            extra.append(s)
+        sn = _norm_sentence(s)
+        if not sn:
+            continue
+        if any(sn == ln for ln in local_norms):
+            continue
+        additions.append(body + delim)
 
-    if extra:
-        base = base.rstrip("。！？;；\n") + "。" + "。".join(extra) + "。"
-    return base
+    if not additions:
+        return base
+
+    out = base
+    for add in additions:
+        # Base already carries a structural separator (newline/semicolon) in
+        # code-like text; otherwise use a neutral newline, never a period.
+        sep = "" if out.endswith(("\n", ";", "；")) else "\n"
+        out = out + sep + add
+    return out
 
 
 def _cold_write_with_dedup(client, entry: str) -> Tuple[bool, str]:

@@ -26,8 +26,10 @@ Env:
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import tempfile
 import secrets
 import sqlite3
 import subprocess
@@ -139,12 +141,52 @@ def _require_data_dir() -> str:
     return data_dir
 
 
+def _validate_data_dir() -> str:
+    """Fail closed unless MNEMOSYNE_DATA_DIR is creatable and truly writable.
+
+    G4 / fix-round3a: an os.access() check is not sufficient (root, read-only
+    mounts and /proc pseudo paths can lie).  Perform a real create + write +
+    fsync + unlink probe before the HTTP listener is allowed to start.
+    """
+    data_dir = _require_data_dir()
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"MNEMOSYNE_DATA_DIR not creatable: {data_dir!r} ({e})"
+        ) from e
+    if not os.path.isdir(data_dir):
+        raise RuntimeError(
+            f"MNEMOSYNE_DATA_DIR is not a directory: {data_dir!r}"
+        )
+
+    probe_path = None
+    try:
+        fd, probe_path = tempfile.mkstemp(
+            prefix=".aml_write_probe_", dir=data_dir)
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"memorycore-aml-write-probe")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        raise RuntimeError(
+            f"MNEMOSYNE_DATA_DIR not writable: {data_dir!r} ({e})"
+        ) from e
+    finally:
+        if probe_path:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+    return data_dir
+
+
 def _get_client() -> Optional[ColdStoreClient]:
     global _client, _client_error
     with _client_lock:
         if _client is None:
             try:
-                _require_data_dir()
+                _validate_data_dir()
                 _client = ColdStoreClient()
                 _client_error = None
             except Exception as e:  # embedding unreachable etc.
@@ -817,7 +859,7 @@ def main() -> None:
     # T3: fail closed before binding the port when the operator did not set
     # the data directory explicitly.
     try:
-        _require_data_dir()
+        _validate_data_dir()
     except RuntimeError as e:
         sys.stderr.write(f"[memorycore] 启动失败: {e}\n")
         raise SystemExit(2)

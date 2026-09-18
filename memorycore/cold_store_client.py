@@ -18,6 +18,7 @@ Multi-tenant isolation (AML per-user engines):
   is unchanged.
 """
 import json
+import logging
 import os
 import threading
 import urllib.error
@@ -26,6 +27,101 @@ from typing import Any, Dict, List, Optional
 from .core.config import COLD_BACKEND, MNEMOSYNE_URL  # noqa: E402
 
 TIMEOUT = 10.0
+
+# Search response content cap.  The AML text-track evidence is often a long
+# conversation/BEAM fragment, so the old 500-character cut dropped answer
+# evidence.  Keep a module-level default plus a testable env resolver.
+_DEFAULT_CONTENT_MAX_CHARS = 2000
+
+
+def _get_content_max_chars() -> int:
+    """Return the effective recall content cap.
+
+    ``MEMORYCORE_CONTENT_MAX_CHARS`` overrides the default.  Missing values
+    use the default; invalid values (non-integer, <= 0, empty) fall back to
+    the default with an explicit warning instead of failing silently.
+    """
+    raw = os.environ.get("MEMORYCORE_CONTENT_MAX_CHARS")
+    if raw is None:
+        return _DEFAULT_CONTENT_MAX_CHARS
+    try:
+        value = int(raw.strip())
+        if value <= 0:
+            raise ValueError("value must be a positive integer")
+        return value
+    except (TypeError, ValueError):
+        logging.getLogger("memorycore.cold_store").warning(
+            "Invalid MEMORYCORE_CONTENT_MAX_CHARS=%r; expected a positive "
+            "integer; falling back to %d",
+            raw,
+            _DEFAULT_CONTENT_MAX_CHARS,
+        )
+        return _DEFAULT_CONTENT_MAX_CHARS
+
+
+def _hydrate_full_contents(engine: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Restore full stored content for recall rows.
+
+    Some mnemosyne-memory releases apply their own hard ``[:500]`` cut inside
+    ``BeamMemory.recall`` before returning rows.  The AML client must surface
+    the stored text so the configured content cap, not a hidden engine 500
+    cut, is the only limit.  This is best-effort: engines without a readable
+    ``conn`` (or test doubles) keep their original payloads.
+    """
+    if not items:
+        return items
+    # A 500-char row is the only shape that can have been silently cut by
+    # the upstream engine; skip the extra query for ordinary short rows.
+    if not any(
+        isinstance(it, dict)
+        and isinstance(it.get("content"), str)
+        and len(it["content"]) >= 500
+        for it in items
+    ):
+        return items
+
+    ids: List[Any] = []
+    seen = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        rid = it.get("id")
+        if rid is None or rid in seen:
+            continue
+        seen.add(rid)
+        ids.append(rid)
+    if not ids:
+        return items
+
+    conn = getattr(engine, "conn", None)
+    if conn is None:
+        return items
+
+    lookup: Dict[Any, str] = {}
+    placeholders = ",".join("?" * len(ids))
+    for table in ("working_memory", "episodic_memory"):
+        try:
+            rows = conn.execute(
+                f"SELECT id, content FROM {table}"
+                f" WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        except Exception:
+            continue
+        for row in rows:
+            if row and row[0] not in lookup:
+                lookup[row[0]] = row[1]
+
+    if not lookup:
+        return items
+
+    hydrated: List[Dict[str, Any]] = []
+    for it in items:
+        if isinstance(it, dict) and it.get("id") in lookup:
+            it = dict(it)
+            it["content"] = lookup[it["id"]]
+        hydrated.append(it)
+    return hydrated
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -263,11 +359,13 @@ class LocalBackend:
             except TypeError:
                 # stock mnemosyne-memory lacks bump_recalled → degrade
                 items = self._engine.recall(query, top_k=top_k, **kwargs)
+        items = _hydrate_full_contents(self._engine, items)
+        content_max_chars = _get_content_max_chars()
         results = []
         for it in items:
             results.append({
                 "id": it.get("id", ""),
-                "content": it.get("content", "")[:500],
+                "content": it.get("content", "")[:content_max_chars],
                 "dense_score": round(it.get("dense_score", 0.0), 4),
                 "keyword_score": round(it.get("keyword_score", 0.0), 4),
                 "fts_score": round(it.get("fts_score", 0.0), 4),

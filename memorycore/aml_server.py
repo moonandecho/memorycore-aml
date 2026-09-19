@@ -148,11 +148,6 @@ _RRF_K = _env_int("AML_RRF_K", 60, minimum=1)
 _RECALL_FUSION_MIN_DENSE = _env_float(
     "AML_RECALL_FUSION_MIN_DENSE", 0.3, minimum=0.0)
 
-# E2(2026-09-19): 事件时间衰减 opt-in。默认 off = 现状；仅显式真值开启，
-# 空/未知/拼写错误一律保持 off（fail-safe，不引入隐式行为）。
-_DECAY_EVENT_TIME = os.environ.get(
-    "AML_DECAY_EVENT_TIME", "0").strip().lower() in ("1", "true", "yes", "on")
-
 # E3(2026-09-19): 字面/关键词信号重排 opt-in。默认 off = 现状；仅显式真值开启。
 # 权重默认按「字面优先、dense 保底」给：keyword=0.4 / fts=0.4 / dense=0.2。
 # 归一化可用 AML_RERANK_NORM=minmax|rank 选择（默认 minmax）。
@@ -868,54 +863,6 @@ def _fallback_write_time_days(r: Dict[str, Any], now: datetime) -> int:
     return 365
 
 
-def _apply_decay_event_time(
-        results: List[Dict[str, Any]], now: Optional[datetime] = None
-) -> List[Dict[str, Any]]:
-    """AML 适配层的事件时间衰减（只改基准时间，公式与 core 完全一致）。
-
-    对照 ``core.decay._apply_decay``：
-      - importance >= 0.8：final_score = dense_score（保护线，不衰减）；
-      - 否则 final_score = dense_score × 0.5 ** (days / 90)；
-      - days = max(delta.days, 0)；解析失败 fallback 365；
-      - 稳定排序：final_score 降序，同分保持输入顺序。
-    唯一差异：days 的首选来源是 content 的 `[YYYY-MM-DD HH:MM]` 事件时间；
-    解析失败才回退现行为（last_recalled → timestamp → 365）。
-
-    ``now`` 仅测试注入；生产调用保持 core 的 datetime.now(timezone.utc)。
-    """
-    if not results:
-        return results
-    if now is None:
-        now = datetime.now(timezone.utc)
-
-    for r in results:
-        base_score = r.get("dense_score", 0)
-        importance = r.get("importance", 0.5)
-
-        # protected line: importance >= 0.8 never decays
-        if importance >= 0.8:
-            r["final_score"] = base_score
-            continue
-
-        event_dt = _event_time_from_content(r.get("content"))
-        if event_dt is not None:
-            days = max((now - event_dt).days, 0)
-        else:
-            days = _fallback_write_time_days(r, now)
-
-        factor = 0.5 ** (days / 90)
-        r["final_score"] = base_score * factor
-
-    # stable sort: final_score descending（与 core 完全一致）
-    results.sort(key=lambda x: x.get("final_score", 0), reverse=True)
-    return results
-
-
-def _apply_recall_decay(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """E2 排序入口：off = core.decay._apply_decay（逐字节现状）；on = 事件时间基准。"""
-    if _DECAY_EVENT_TIME:
-        return _apply_decay_event_time(results)
-    return _apply_decay(results)
 
 
 def _dedup_candidates(results: Any) -> List[Dict[str, Any]]:
@@ -1174,7 +1121,7 @@ def _lexical_weighted_scores(
 def _rerank_path_lexical(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """E3: 用加权字面分 × 既有衰减对一路内部重排。
 
-    先把归一化加权分临时放进 ``dense_score``，复用 ``_apply_recall_decay``
+    先把归一化加权分临时放进 ``dense_score``，复用 ``_apply_decay``
     （含 E2 事件时间开关）得到该路顺序；再恢复原始 dense_score，因为
     ``_rrf_fuse`` 的 min_dense 门槛仍必须按存储层语义判断。加权分只在
     pre-RRF 路径内部决定名次，最终分值仍由 E1 的 RRF×decay 统一计算。
@@ -1196,7 +1143,7 @@ def _rerank_path_lexical(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         scaled.append(rr)
     if not scaled:
         return []
-    decayed = _apply_recall_decay(scaled)
+    decayed = _apply_decay(scaled)
     for rr in decayed:
         # 恢复原始 dense_score：RRF 的单路 min_dense 门槛仍按存储层
         # 语义判断；E3 加权分只决定该路内部名次。
@@ -2632,7 +2579,7 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
                 cand["_dense_score_raw"] = cand.get("dense_score", 0.0)
                 cand["dense_score"] = _finite_number(
                     cand.get("rrf_score"), 0.0)
-            results = _apply_recall_decay(fused)
+            results = _apply_decay(fused)
         else:
             # 默认路径：与改前逐字节一致的「并集去重 + sanitize + decay」；
             # E3 开启但未开 RRF 时，对并集做同一套字面加权 × 衰减排序。
@@ -2641,7 +2588,7 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
             if _RERANK_LEXICAL:
                 results = _rerank_path_lexical(candidates)
             else:
-                results = _apply_recall_decay(candidates)
+                results = _apply_decay(candidates)
 
         results = results[:top_k]
     except _BudgetExceeded as e:

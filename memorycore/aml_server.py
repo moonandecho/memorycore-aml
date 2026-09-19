@@ -623,11 +623,13 @@ def _probe_health_once() -> None:
         probe_status = "ok"
         if isinstance(storage, dict) and storage.get("error"):
             probe_status = "degraded"
+        gpu_warning = None
         if configured_model and gpu.get("resident") is not True:
-            # The model tag is configured but ollama ps does not show it as
-            # 100% GPU.  Keep serving, but advertise the degraded residency so
-            # operators see the throughput risk.
-            probe_status = "degraded"
+            # 2026-09-19: 模型"未驻留"（闲置未加载 / 被其它模型挤出）不是服务故障——
+            # 首次调用会自动加载（实测冷启动单条 Add 0.57 s），规范也只要求 health 返回 2xx。
+            # 因此只记 capacity_warning，不再把 status 标成 degraded（旧行为会误导监控与告警）。
+            gpu_warning = ("embedding model not GPU-resident (loads on first call): "
+                           + str(gpu.get("detail", "unknown")))
         unified = {
             "status": probe_status,
             "storage": storage,
@@ -637,6 +639,7 @@ def _probe_health_once() -> None:
             "embedding_url": os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", ""),
             "embedding_gpu_resident": gpu.get("resident"),
             "embedding_gpu_status": gpu.get("detail", "unknown"),
+            "capacity_warning": gpu_warning,
             "embed_cache": _embed_cache_health(),
             "db_identity": dict(identity_info.get("db_identity") or {}),
             "db_identity_mismatch": bool(
@@ -2104,9 +2107,11 @@ def _run_startup_gpu_selfcheck() -> None:
             "/health is marked degraded until the model is resident on GPU. "
             "Hint: set MEMORYCORE_EMBED_MODEL / MNEMOSYNE_EMBEDDING_MODEL=%s.",
             model, status.get("detail"), model or "qwen3-embedding-aml-ctx1024")
-        _health_set(status="degraded",
-                    embedding_gpu_resident=status.get("resident"),
-                    embedding_gpu_status=status.get("detail", "unknown"))
+        _health_set(embedding_gpu_resident=status.get("resident"),
+                    embedding_gpu_status=status.get("detail", "unknown"),
+                    capacity_warning=("embedding model not GPU-resident "
+                                      "(loads on first call): "
+                                      + str(status.get("detail", "unknown"))))
     else:
         _health_set(embedding_gpu_resident=True,
                     embedding_gpu_status="100% GPU")
@@ -2116,8 +2121,8 @@ def _run_startup_gpu_selfcheck() -> None:
 async def aml_health(request: Request) -> JSONResponse:
     """AML Health: fast memory-snapshot only (never touches SQLite/embedding)."""
     payload = _health_snapshot()
-    # Snapshot status may be "degraded" for GPU residency; storage liveness is
-    # reflected in payload["storage"].
+    # 2026-09-19: status 只反映真故障（存储不可用 / 数据目录身份不一致 / 探测异常）；
+    # 模型未驻留是容量提示，见 payload["capacity_warning"]（规范：health 返回 2xx 即为正常）。
     return JSONResponse(payload, status_code=200)
 
 

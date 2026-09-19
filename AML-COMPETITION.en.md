@@ -71,7 +71,6 @@ AML **write (Add) and retrieval (Search) paths**.
 | Add, 64 concurrent x 20 messages (re-measured 2026-09-19 evening: probe instance, E3 trio on) | **216.2 s wall, 100% success**, p50 116.1 s, p95 214.1 s | paired control (pre-E3 code, switches off): 213.9 s / 113.7 s / 211.6 s -> **no regression on the Add path (+1.1%, within noise)**; 20 messages per request (5 of them >300 chars, 25 fragments/request), direct local client; the 1200 s platform timeout leaves ~5.6x headroom |
 | Search, 32 concurrent x 3 rounds (same setup, E3 on) | wall **10.3 / 1.3 / 1.3 s**, 100% success, p50 6.02 / 0.66 / 0.72 s | control 8.3 / 0.5 / 0.5 s; first round cold; largest response **2.1 KB** (0.008% of the 28 MiB guard); E3 makes each retrieval heavier (pool x2 + narrow-token routes) while staying well inside seconds |
 > Measurement note: the earlier figures (Add 64 concurrent 103.5 s via the public endpoint / 109.5 s direct) came from an older, lighter load script with a remote client. The table above is a **paired experiment** from one harness (`scripts/bench_capacity.py`, same machine, same message mix); the two sets are **not directly comparable** - use this table.
-| Same, internal network | 109.5 s wall, p50 60.0 s, p95 107.1 s | local re-run |
 | Single Add (20 messages) | 3.4–4.5 s | ~4 embedding HTTP calls per request (batched) |
 | Single Search | 0.28 s | top_k=3 over the public endpoint; top_k=100 returns 155.7 KB (0.5% of the 30 MiB limit) |
 | Health check | millisecond-level (always < 1 s) | in-memory snapshot, never touches storage |

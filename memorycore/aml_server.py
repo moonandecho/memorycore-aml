@@ -147,6 +147,11 @@ _RECALL_FUSION_ON = _RECALL_FUSION_MODE == "rrf"
 _RRF_K = _env_int("AML_RRF_K", 60, minimum=1)
 _RECALL_FUSION_MIN_DENSE = _env_float(
     "AML_RECALL_FUSION_MIN_DENSE", 0.3, minimum=0.0)
+
+# E2(2026-09-19): 事件时间衰减 opt-in。默认 off = 现状；仅显式真值开启，
+# 空/未知/拼写错误一律保持 off（fail-safe，不引入隐式行为）。
+_DECAY_EVENT_TIME = os.environ.get(
+    "AML_DECAY_EVENT_TIME", "0").strip().lower() in ("1", "true", "yes", "on")
 _RECALL_STOPWORDS = frozenset(
     "a an the is are was were be been do does did what when where which who"
     " whom whose why how many much of in on at to for with about and or but if"
@@ -747,6 +752,113 @@ def _sanitize_candidates(results: Any) -> List[Dict[str, Any]]:
                 rr[key] = None
         safe.append(rr)
     return safe
+
+
+
+_EVENT_TIME_PREFIX_RE = re.compile(
+    r"^\[(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?\]")
+
+
+def _event_time_from_content(content: Any) -> Optional[datetime]:
+    """E2: 从 L1 证据前缀 `[YYYY-MM-DD HH:MM]` 解析事件时间（UTC）。
+
+    解析失败返回 None；调用方回退写入时间（与 core.decay._apply_decay 同口径）。
+    """
+    if not isinstance(content, str):
+        return None
+    m = _EVENT_TIME_PREFIX_RE.match(content)
+    if not m:
+        return None
+    try:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hour, minute = int(m.group(4)), int(m.group(5))
+        second = int(m.group(6)) if m.group(6) is not None else 0
+        return datetime(year, month, day, hour, minute, second,
+                        tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decay_days_from_iso(value: Any, now: datetime) -> int:
+    """与 core.decay._apply_decay 逐字同口径：ISO 解析、UTC 补齐、clamp>=0。
+
+    解析失败/类型不对返回 365（core 的保守 fallback）。
+    """
+    if not value:
+        return 365
+    try:
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max((now - dt).days, 0)
+    except (ValueError, TypeError, AttributeError):
+        return 365
+
+
+def _fallback_write_time_days(r: Dict[str, Any], now: datetime) -> int:
+    """事件时间缺失时的现行为：last_recalled 优先，其次写入 timestamp，最后 365 天。
+
+    注意 core 语义：last_recalled 存在但不可解析时直接用 365，不再回退 timestamp；
+    timestamp 存在但不可解析时同样 365。
+    """
+    last_str = r.get("last_recalled")
+    if last_str:
+        return _decay_days_from_iso(last_str, now)
+    ts_str = r.get("timestamp")
+    if ts_str:
+        return _decay_days_from_iso(ts_str, now)
+    return 365
+
+
+def _apply_decay_event_time(
+        results: List[Dict[str, Any]], now: Optional[datetime] = None
+) -> List[Dict[str, Any]]:
+    """AML 适配层的事件时间衰减（只改基准时间，公式与 core 完全一致）。
+
+    对照 ``core.decay._apply_decay``：
+      - importance >= 0.8：final_score = dense_score（保护线，不衰减）；
+      - 否则 final_score = dense_score × 0.5 ** (days / 90)；
+      - days = max(delta.days, 0)；解析失败 fallback 365；
+      - 稳定排序：final_score 降序，同分保持输入顺序。
+    唯一差异：days 的首选来源是 content 的 `[YYYY-MM-DD HH:MM]` 事件时间；
+    解析失败才回退现行为（last_recalled → timestamp → 365）。
+
+    ``now`` 仅测试注入；生产调用保持 core 的 datetime.now(timezone.utc)。
+    """
+    if not results:
+        return results
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    for r in results:
+        base_score = r.get("dense_score", 0)
+        importance = r.get("importance", 0.5)
+
+        # protected line: importance >= 0.8 never decays
+        if importance >= 0.8:
+            r["final_score"] = base_score
+            continue
+
+        event_dt = _event_time_from_content(r.get("content"))
+        if event_dt is not None:
+            days = max((now - event_dt).days, 0)
+        else:
+            days = _fallback_write_time_days(r, now)
+
+        factor = 0.5 ** (days / 90)
+        r["final_score"] = base_score * factor
+
+    # stable sort: final_score descending（与 core 完全一致）
+    results.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+    return results
+
+
+def _apply_recall_decay(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """E2 排序入口：off = core.decay._apply_decay（逐字节现状）；on = 事件时间基准。"""
+    if _DECAY_EVENT_TIME:
+        return _apply_decay_event_time(results)
+    return _apply_decay(results)
 
 
 def _dedup_candidates(results: Any) -> List[Dict[str, Any]]:
@@ -2162,18 +2274,19 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
                     cand["_dense_score_raw"] = cand.get("dense_score", 0.0)
                     cand["dense_score"] = _finite_number(
                         cand.get("rrf_score"), 0.0)
-                results = _apply_decay(fused)
+                results = _apply_recall_decay(fused)
             else:
                 # 门槛把所有路的候选都滤空时退回并集 + 衰减（默认 off 口径），
                 # 避免融合开关把响应变成 0 条；低分候选没有贡献任何 RRF 分。
                 candidates = _sanitize_candidates(_dedup_candidates(
                     [c for path in paths for c in path]))
-                results = _apply_decay(candidates)
+                results = _apply_recall_decay(candidates)
         else:
             # 默认路径：与改前逐字节一致的「并集去重 + sanitize + decay」。
             candidates = _sanitize_candidates(_dedup_candidates(
                 [c for path in paths for c in path]))
-            results = _apply_decay(candidates)
+            results = _apply_recall_decay(candidates)
+
         results = results[:top_k]
     except _BudgetExceeded as e:
         _p0_inc("budget_503")

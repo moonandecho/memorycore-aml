@@ -139,6 +139,14 @@ AML_MAX_INFLIGHT_BYTES = _env_int(
 _RECALL_POOL_MULT = _env_int("AML_RECALL_POOL_MULT", 1, minimum=1)
 _RECALL_POOL_CAP = _env_int("AML_RECALL_POOL_CAP", 500, minimum=100)
 _RECALL_MULTI_QUERY = min(1, _env_int("AML_RECALL_MULTI_QUERY", 0, minimum=0))
+
+# E1(2026-09-19): 跨查询路由 RRF 融合。默认 off = 现状（多路并集 + decay），
+# 仅显式 AML_RECALL_FUSION=rrf 时启用；未知值一律 off（fail-safe，不引入隐式行为）。
+_RECALL_FUSION_MODE = os.environ.get("AML_RECALL_FUSION", "off").strip().lower()
+_RECALL_FUSION_ON = _RECALL_FUSION_MODE == "rrf"
+_RRF_K = _env_int("AML_RRF_K", 60, minimum=1)
+_RECALL_FUSION_MIN_DENSE = _env_float(
+    "AML_RECALL_FUSION_MIN_DENSE", 0.3, minimum=0.0)
 _RECALL_STOPWORDS = frozenset(
     "a an the is are was were be been do does did what when where which who"
     " whom whose why how many much of in on at to for with about and or but if"
@@ -754,6 +762,70 @@ def _dedup_candidates(results: Any) -> List[Dict[str, Any]]:
         seen.add(rid)
         out.append(r)
     return out
+
+
+def _rrf_fuse(
+        paths: Any, k: int = 60, min_dense: float = 0.3) -> List[Dict[str, Any]]:
+    """E1: 跨查询路由的 Reciprocal Rank Fusion（纯函数）。
+
+    ``paths`` 是每路的**有序候选列表**（rank 1 = 列表首位）。对每个唯一
+    candidate id 求 RRF 分 = Σ_path 1/(k + rank)。语义：
+
+    - 同一路内重复 id 只取第一次出现；
+    - 单路内 ``dense_score``（有限化后）< ``min_dense`` 的候选不参与该路，
+      且不占用名次（通过门槛的候选按 1..n 重新排名）；
+    - 缺 id / 非 dict / 空 id 跳过；
+    - 返回新的 dict 列表，按 RRF 分降序（分数相同保序：先出现的路先）；
+    - **不修改入参**，也不删 candidate 的业务字段。
+
+    k 默认 60（RRF 常用值，冻结为 AML_RRF_K 默认），min_dense 默认 0.3
+    （与 AML_RECALL_FUSION_MIN_DENSE 默认一致）；只使用名次，
+    与 dense 量纲无关。
+    """
+    try:
+        kk = float(k)
+    except (TypeError, ValueError):
+        kk = 60.0
+    if not math.isfinite(kk) or kk <= 0:
+        kk = 60.0
+    try:
+        threshold = float(min_dense)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    if not math.isfinite(threshold) or threshold < 0:
+        threshold = 0.0
+
+    scores: Dict[str, float] = {}
+    first: Dict[str, Dict[str, Any]] = {}
+    for path in paths or []:
+        seen_in_path = set()
+        rank = 0
+        for cand in path or []:
+            if not isinstance(cand, dict):
+                continue
+            rid = cand.get("id")
+            if rid is None or str(rid) == "":
+                continue
+            dense = _finite_number(cand.get("dense_score", 0.0), 0.0)
+            if dense < threshold:
+                continue
+            key = str(rid)
+            if key in seen_in_path:
+                continue
+            seen_in_path.add(key)
+            rank += 1
+            if key not in first:
+                item = dict(cand)
+                item["rrf_score"] = 0.0
+                first[key] = item
+            scores[key] = scores.get(key, 0.0) + 1.0 / (kk + rank)
+    for key, item in first.items():
+        item["rrf_score"] = scores.get(key, 0.0)
+    # 稳定排序：分数相同的候选保持首次出现顺序。
+    return sorted(
+        first.values(),
+        key=lambda c: c.get("rrf_score", 0.0),
+        reverse=True)
 
 
 def _candidate_pool_size(top_k: int) -> int:
@@ -2056,27 +2128,52 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
         primary_results = client.recall_results(
             query, top_k=pool_k, author_id=user_id, bump=False)
         _check_deadline(deadline)
-        extra_results: List[Dict[str, Any]] = []
+        # E1: 每路召回独立保存为有序列表；路数硬上限 3
+        # （原 query / 实词 keyword / query+options 拼接）。
+        paths: List[List[Dict[str, Any]]] = [list(primary_results or [])]
         if _RECALL_MULTI_QUERY:
             _kw = _keyword_query(query)
             if _kw and _kw != (query or "").strip().lower():
-                extra_results.extend(client.recall_results(
-                    _kw, top_k=pool_k, author_id=user_id, bump=False) or [])
+                paths.append(list(client.recall_results(
+                    _kw, top_k=pool_k, author_id=user_id, bump=False) or []))
                 _check_deadline(deadline)
         options = body.get("options")
         if isinstance(options, list) and options:
             opt_text = " ".join(str(o) for o in options if isinstance(o, str))
             if opt_text:
-                # Phase 0a fix: extend, never reassign -- otherwise the
+                # Phase 0a fix: append, never reassign -- otherwise the
                 # multi-query keyword path above is silently discarded.
-                extra_results.extend(client.recall_results(
+                paths.append(list(client.recall_results(
                     query + " " + opt_text, top_k=pool_k,
-                    author_id=user_id, bump=False) or [])
+                    author_id=user_id, bump=False) or []))
                 _check_deadline(deadline)
-        candidates = _dedup_candidates(
-            list(primary_results or []) + list(extra_results or []))
-        candidates = _sanitize_candidates(candidates)
-        results = _apply_decay(candidates)
+        paths = paths[:3]
+
+        if _RECALL_FUSION_ON:
+            safe_paths = [_sanitize_candidates(path) for path in paths]
+            fused = _rrf_fuse(
+                safe_paths, k=_RRF_K,
+                min_dense=_RECALL_FUSION_MIN_DENSE)
+            if fused:
+                for cand in fused:
+                    # 保留既有衰减语义：复用 core.decay._apply_decay，
+                    # final_score = RRF 分 × 0.5^(days/90)。原始 dense 分
+                    # 留在 _dense_score_raw 以便诊断/回滚比较。
+                    cand["_dense_score_raw"] = cand.get("dense_score", 0.0)
+                    cand["dense_score"] = _finite_number(
+                        cand.get("rrf_score"), 0.0)
+                results = _apply_decay(fused)
+            else:
+                # 门槛把所有路的候选都滤空时退回并集 + 衰减（默认 off 口径），
+                # 避免融合开关把响应变成 0 条；低分候选没有贡献任何 RRF 分。
+                candidates = _sanitize_candidates(_dedup_candidates(
+                    [c for path in paths for c in path]))
+                results = _apply_decay(candidates)
+        else:
+            # 默认路径：与改前逐字节一致的「并集去重 + sanitize + decay」。
+            candidates = _sanitize_candidates(_dedup_candidates(
+                [c for path in paths for c in path]))
+            results = _apply_decay(candidates)
         results = results[:top_k]
     except _BudgetExceeded as e:
         _p0_inc("budget_503")

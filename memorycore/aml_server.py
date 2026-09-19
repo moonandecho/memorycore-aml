@@ -742,6 +742,27 @@ def _candidate_pool_size(top_k: int) -> int:
     return min(max(int(top_k), _RECALL_CANDIDATE_POOL_MIN), _MAX_TOP_K)
 
 
+def _event_date_prefix(ts: Any) -> str:
+    """L1(2026-09-19): 把消息 timestamp(毫秒) 变成证据文本里的日期前缀。
+
+    规范 Add 的 message 可带 timestamp，此前被丢弃 → 时间类问题（维度 C）的证据里
+    看不到任何日期。这里只把"事件时间"带进证据文本；**不改**存储层 timestamp（写入
+    时间）与衰减语义，避免影响既有排序行为。缺失/非法一律返回空串。
+    """
+    if ts is None or isinstance(ts, bool):
+        return ""
+    try:
+        ms = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if ms != ms or ms in (float("inf"), float("-inf")) or ms <= 0:  # NaN/Inf/负
+        return ""
+    secs = ms / 1000.0 if ms > 1e11 else ms   # 秒/毫秒自动判定
+    try:
+        dt = datetime.fromtimestamp(secs, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return ""
+    return dt.strftime("[%Y-%m-%d %H:%M] ")
 def _split_fragments(content: str, max_chars: int = _MAX_FRAGMENT_CHARS) -> List[str]:
     """Split one message into fact fragments at sentence boundaries.
 
@@ -1736,6 +1757,7 @@ def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
     # Validate every message before any write, so one bad message cannot leave
     # a partially-written request behind.
     parsed_messages: List[Tuple[str, str]] = []
+    message_date_prefixes: List[str] = []  # L1: 每条消息的事件日期前缀
     image_events_all: List[Dict[str, Any]] = []
     media_counts = _empty_image_counts()
     cumulative_image_bytes = 0
@@ -1758,8 +1780,10 @@ def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
             media_counts[key] += counts[key]
         media_counts["cumulative_bytes"] = cumulative_image_bytes
         image_events_all.extend(annotated)
+        date_prefix = _event_date_prefix(msg.get("timestamp"))  # L1
         for text in texts:
             parsed_messages.append((role.strip(), text))
+            message_date_prefixes.append(date_prefix)
 
     _log_multimodal_counts(
         media_counts["accepted"],
@@ -1789,9 +1813,10 @@ def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
     # Flatten into (role, fragment) pairs exactly like the old per-fragment loop.
     fragments: List[Tuple[str, str]] = []
     if parsed_messages:
-        for role, text in parsed_messages:
+        for _mi, (role, text) in enumerate(parsed_messages):
+            _prefix = message_date_prefixes[_mi] if _mi < len(message_date_prefixes) else ""
             for frag in _split_fragments(text):
-                fragments.append((role, frag))
+                fragments.append((role, _prefix + frag))
     total_fragments = len(fragments)
     # A legal image-only Add persists one placeholder record.
     effective_total = total_fragments if parsed_messages else 1

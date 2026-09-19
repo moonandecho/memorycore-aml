@@ -63,7 +63,7 @@
 | # | 规范要求 | 我们的状态 |
 |---|---|---|
 | F1 | 提交材料含 "系统名称与版本、联系人、团队、拟参评类型、方法说明、允许公开展示的信息、完整提交说明" | `AML-COMPETITION.md` / `.en.md` 已按此结构改写；**待填：联系人/团队、固定 commit** |
-| F2 | "已部署的 Add/Search API、鉴权与容量声明，以及公开仓库、固定 commit、原始工作引用和方法改动说明" | 全部具备：容量 §2.2（实测）、两个存储层补丁披露 §4.3、改动表 §4.2 |
+| F2 | "已部署的 Add/Search API、鉴权与容量声明，以及公开仓库、固定 commit、原始工作引用和方法改动说明" | 全部具备：容量 §2.2（实测）、两个存储层补丁披露 §4.3、改动表 §4.2；**公开可达性未鉴权复核（2026-09-19 21:0x）**：仓库已置 PUBLIC，`README.md` / `AML-COMPETITION.md` / `AML-COMPETITION.en.md` / `COMPLIANCE.md` / `scripts/bench_capacity.py` 经 raw.githubusercontent.com 未鉴权拉取全部 **200**（此前为 PRIVATE，已修正） |
 | F3 | "选择 full 前，必须逐项勾选提交清单：smoke 已通过、API 契约正确、运行说明完整、原创性披露与诚信承诺" | 待 smoke 通过后逐项确认 |
 | F4 | "Open-source Methods entries must use gpt-4o-mini during both Add and Search"（Full Evaluation Gate 清单项） | **我们不在 Add/Search 中调用任何 LLM**（0 次外部模型调用）→ 无论该条指"平台评测侧模型"还是"限制参赛方法所用模型"，我们都满足；⚠️ 若其被解释为"参赛系统必须调用 gpt-4o-mini"，则与自托管/无外部依赖冲突 → **建议向主办方书面确认**（见 G1） |
 | F5 | "不得跨 user_id、任务、样本或团队共享和检索评测记忆" | 硬隔离（author_id 过滤） |

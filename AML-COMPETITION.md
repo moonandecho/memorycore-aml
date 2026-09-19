@@ -62,8 +62,9 @@ MemoryCore 是一个面向 LLM Agent 的**记忆治理层**（MIT 开源）。�
 
 | 项 | 实测值 | 说明 |
 |---|---|---|
-| Add 64 并发 × 20 消息 | **墙钟 103.5 s，成功率 100%**，p50 56.4 s，p95 100.2 s | **经公网自托管端点实测**（Mac → 公网 → 本机服务）；平台单请求超时 1200 s → **约 11 倍余量** |
-| 同上（内网直连） | 墙钟 109.5 s，p50 60.0 s，p95 107.1 s | 本机直连复核 |
+| Add 64 并发 × 20 消息（2026-09-19 晚复测：探针实例 + E3 三项开启） | **墙钟 216.2 s，成功率 100%**，p50 116.1 s，p95 214.1 s | 同口径对照（E3 前代码 + 开关关）：213.9 s / 113.7 s / 211.6 s → **Add 路径无回归（+1.1%，噪声内）**；每请求 20 条消息（其中 5 条 >300 字符，片段化后 25 片/请求），本机直连；平台超时 1200 s → 约 5.6 倍余量 |
+| Search 32 并发 × 3 轮（同上口径，E3 开启） | 墙钟 **10.3 / 1.3 / 1.3 s**，成功率 100%，p50 6.02 / 0.66 / 0.72 s | 对照 8.3 / 0.5 / 0.5 s；首轮为冷缓存；响应体最大 **2.1 KB**（护栏上限 28 MiB 的 0.008%）；E3 让单次检索更重（候选池 ×2 + 窄路扩路），绝对值仍在秒级 |
+> ⚠️ 口径说明：2026-09-19 白天记录的「Add 64 并发 103.5 s（经公网）/ 109.5 s（内网）」出自更早那套更轻的压测脚本（远程客户端）。本表是同一把尺子（`scripts/bench_capacity.py`，同机同消息混合）的**配对实验**，两套数字不可直接比较，以本表为准。
 | 单次 Add（20 消息） | 3.4～4.5 s | 每一请求含约 4 次嵌入 HTTP（批量） |
 | 单次 Search | 0.28 s | top_k=3 公网实测；top_k=100 响应 155.7 KB（规范上限 30 MiB 的 0.5%） |
 | 健康检查 | **1 ms 级**（最坏情况亦 1 s 内） | 内存快照，不访问存储层 |
@@ -139,6 +140,10 @@ embedding: ollama + 派生模型 qwen3-embedding-aml-ctx1024（FROM qwen3-embedd
 | 数据目录身份守卫 | `memorycore/cold_store_client.py` | 运行时比对 `(st_dev, st_ino)`；数据目录被替换时重建引擎并丢弃旧连接，`/health` 暴露 `db_identity*` |
 | 嵌入预取与写阶段隔离 | `memorycore/aml_server.py` + 补丁 | Phase A 预取全部向量，写阶段不再发起嵌入调用；缓存禁用时也复用预取结果，避免"200 写入但无向量" |
 | 断点续跑与幂等 | `memorycore/aml_server.py` + `cold_store_client.py` | ledger 记录 `phase/checkpoint`，重试续跑剩余片段；已完成请求直接 replay 200；写前 exact 查重避免重放改状态 |
+| 字面/关键词信号重排（E3，**本部署已启用**） | `memorycore/aml_server.py` | `AML_RERANK_LEXICAL=1`：dense/keyword/fts 多信号加权重排；局部缺字段的行按实际存在的信号回退，不按 0 分惩罚 |
+| 候选池放大 + 单 token 扩路（E3，**本部署已启用**） | `memorycore/aml_server.py` | `AML_RECALL_POOL_MULT=2` 放大内部候选池；单一 token 的窄查询扩路（最多 5 路），所有窄路权重之和封顶主路的 `0.5` 倍，避免窄路压过主路高分证据 |
+| RRF 门槛候选保留（c8） | `memorycore/aml_server.py` | 低于 dense 门槛的候选不再从融合结果整段消失，保留候选身份、融合分记 0 排在正分候选之后 |
+| Search 响应字节护栏（**默认生效**） | `memorycore/aml_server.py` | `AML_SEARCH_RESPONSE_MAX_BYTES` 默认 28 MiB（规范上限 30 MiB 留余量）：按 JSON body 精确字节预算从尾部截断，保留最高分前缀，记 `search_response_truncated` 计数并写 warning |
 
 ### 4.3 存储层补丁（明示披露）
 
@@ -226,6 +231,10 @@ docker run -p 8000:8000 -v aml-data:/data memorycore-aml
 | `MEMORYCORE_EMBED_URL` | `http://localhost:11434/v1` | embedding 服务（本机 ollama 或 OpenAI 兼容端点） |
 | `MEMORYCORE_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（1024 维） |
 | `MEMORYCORE_CONTENT_MAX_CHARS` | `2000` | Search 单条证据返回上限（非法值回落到 2000 并记 warning） |
+| `AML_RECALL_FUSION` | `off` | `rrf` = 跨查询路由 RRF 融合；**本部署已置 `rrf`** |
+| `AML_RERANK_LEXICAL` | `0` | `1` = 字面/关键词信号重排；**本部署已置 `1`** |
+| `AML_RECALL_POOL_MULT` | `1` | 内部候选池倍数（≥1）；**本部署已置 `2`** |
+| `AML_SEARCH_RESPONSE_MAX_BYTES` | `29360128`（28 MiB） | `/search` 响应体字节上限；超出按尾部截断并计数（默认即生效，规范上限 30 MiB） |
 
 ## 8. 错误码语义
 

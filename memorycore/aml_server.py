@@ -884,8 +884,10 @@ def _rrf_fuse(
     candidate id 求 RRF 分 = Σ_path 1/(k + rank)。语义：
 
     - 同一路内重复 id 只取第一次出现；
-    - 单路内 ``dense_score``（有限化后）< ``min_dense`` 的候选不参与该路，
-      且不占用名次（通过门槛的候选按 1..n 重新排名）；
+    - 单路内 ``dense_score``（有限化后）< ``min_dense`` 的候选**不再删除**：
+      它们保留候选身份但融合分记 0，且不占名次（通过门槛的候选按 1..n
+      重新排名）。C8 修复：只要任一路有过门槛候选，旧实现会让所有低于
+      门槛的候选整段消失；现在返回集合始终 ⊇ 各路原始候选 id 并集；
     - 缺 id / 非 dict / 空 id 跳过；
     - 返回新的 dict 列表，按 RRF 分降序（分数相同保序：先出现的路先）；
     - **不修改入参**，也不删 candidate 的业务字段。
@@ -909,6 +911,7 @@ def _rrf_fuse(
 
     scores: Dict[str, float] = {}
     first: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
     for path in paths or []:
         seen_in_path = set()
         rank = 0
@@ -918,26 +921,28 @@ def _rrf_fuse(
             rid = cand.get("id")
             if rid is None or str(rid) == "":
                 continue
-            dense = _finite_number(cand.get("dense_score", 0.0), 0.0)
-            if dense < threshold:
-                continue
             key = str(rid)
-            if key in seen_in_path:
-                continue
-            seen_in_path.add(key)
-            rank += 1
+            # C8: 所有候选先登记，低于门槛者只是拿不到正 RRF 贡献
+            #（分记 0），不再从返回集合消失。
             if key not in first:
                 item = dict(cand)
                 item["rrf_score"] = 0.0
                 first[key] = item
+                order.append(key)
+            if key in seen_in_path:
+                continue
+            seen_in_path.add(key)
+            dense = _finite_number(cand.get("dense_score", 0.0), 0.0)
+            if dense < threshold:
+                continue
+            rank += 1
             scores[key] = scores.get(key, 0.0) + 1.0 / (kk + rank)
     for key, item in first.items():
         item["rrf_score"] = scores.get(key, 0.0)
-    # 稳定排序：分数相同的候选保持首次出现顺序。
-    return sorted(
-        first.values(),
-        key=lambda c: c.get("rrf_score", 0.0),
-        reverse=True)
+    # 稳定排序：分数相同的候选保持首次出现顺序；低于门槛者排正分者之后。
+    ordered = [first[key] for key in order]
+    ordered.sort(key=lambda c: c.get("rrf_score", 0.0), reverse=True)
+    return ordered
 
 
 def _candidate_pool_size(top_k: int) -> int:

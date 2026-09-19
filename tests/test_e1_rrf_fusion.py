@@ -103,17 +103,17 @@ def test_rrf_fuse_is_pure_and_ignores_junk():
 
 
 def test_rrf_fuse_min_dense_threshold_is_per_path():
-    # p1 的 low 被滤掉后，a 应补位为 rank 1（被滤候选不占名次）；
-    # p2 的 low2 被滤掉，c 为 rank 2。
+    # p1 的 low 不占名次，a 应补位为 rank 1；p2 的 low2 不占名次，c 为 rank 2。
+    # C8: low/low2 不再从融合结果消失，而是 rrf_score=0 排在正分候选之后。
     p1 = [_cand("low", 0.10), _cand("a", 0.90), _cand("b", 0.90)]
     p2 = [_cand("b", 0.90), _cand("c", 0.90), _cand("low2", 0.20)]
     fused = aml._rrf_fuse([p1, p2], k=60, min_dense=0.3)
-    assert [c["id"] for c in fused] == ["b", "a", "c"]
+    assert [c["id"] for c in fused] == ["b", "a", "c", "low", "low2"]
     score = {c["id"]: c["rrf_score"] for c in fused}
     assert score["a"] == pytest.approx(1 / 61)          # 没有因 low 而被压到 1/62
     assert score["b"] == pytest.approx(1 / 62 + 1 / 61)
     assert score["c"] == pytest.approx(1 / 62)
-    assert "low" not in score and "low2" not in score
+    assert score["low"] == 0.0 and score["low2"] == 0.0
 
 
 def test_rrf_fuse_empty_paths():
@@ -212,3 +212,35 @@ def test_fusion_gate_falls_back_to_union_when_all_below_threshold(
                                 "top_k": 5})
     assert r.status_code == 200, r.text
     assert {d["id"] for d in r.json()["data"]} == {"low-a", "low-b"}
+
+def test_fusion_keeps_below_threshold_gold_from_other_path(
+        aml_http, monkeypatch):
+    """C8: 一路高分时，另一路低于门槛的 gold 不得整段消失。
+
+    改动前：只要任一路有 dense>=门槛，_rrf_fuse 会把所有低于门槛的候选
+    从融合结果删除，gold 不在最终 top_k 内 -> 必红。
+    改动后：低于门槛候选保留候选身份、融合分记 0，排在正分候选之后。
+    """
+    c, fake = aml_http
+    monkeypatch.setattr(aml, "_RECALL_MULTI_QUERY", 1)
+    monkeypatch.setattr(aml, "_RECALL_FUSION_ON", True)
+    monkeypatch.setattr(aml, "_RECALL_FUSION_MIN_DENSE", 0.3)
+
+    calls = []
+
+    def search_fn(query, top_k=5, author_id=None):
+        calls.append(query)
+        if len(calls) == 1:
+            return [_cand("high-1", 0.9), _cand("high-2", 0.9),
+                    _cand("high-3", 0.9)]
+        return [_cand("gold-low", 0.1)]
+
+    fake.search_fn = search_fn
+    r = c.post("/search", json={
+        "query": "What did Alice discuss with Bob about the project?",
+        "user_id": "u-e1:c8",
+        "top_k": 4,
+    })
+    assert r.status_code == 200, r.text
+    ids = [d["id"] for d in r.json()["data"]]
+    assert "gold-low" in ids, ids

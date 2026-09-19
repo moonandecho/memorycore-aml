@@ -18,7 +18,8 @@
 | Prior work | MemoryCore / origin-memorycore (ours, MIT); mnemosyne-memory 3.15.1 (MIT); ollama + qwen3-embedding:0.6b |
 | License | MIT |
 | Availability commitment | publicly reachable, version-fixed until **2026-12-05** (covers the 30-day post-submission commitment, see §2.4) |
-| Contact / team | 【TBD: name / email / team】 |
+| Team (leaderboard attribution) | **moonandecho** (individual entry) |
+| Contact | submitted to the organisers via the **Evaluation Access Request** (real name + email); this public repository does not display personal names |
 | Public-display consent | system name, method description, public repository and fixed commit; evaluation data and private results are not public |
 
 ## 1. Method description

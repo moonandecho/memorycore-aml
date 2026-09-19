@@ -267,6 +267,8 @@ docker run -p 8000:8000 -v aml-data:/data memorycore-aml
 - **Per-request budget**: default 600 s; exceeding it returns a retryable 5xx **before any write**; requests that have
   entered the write phase are never interrupted, so no partial writes can occur (a retry with the same `request_id`
   yields the same result as a single successful execution).
-- **Health**: `/health` serves an in-memory snapshot, never touches storage, and **always responds within 1 s**;
-  it exposes model residency (GPU/CPU) and a degradation flag.
+- **Health**: `/health` serves an in-memory snapshot, never touches storage, and **always responds within 1 s**.
+  `status` reflects real faults only (storage unavailable / data-directory identity mismatch / probe error);
+  model residency and capacity hints are reported separately via `embedding_gpu_resident` and `capacity_warning`
+  (an idle, not-yet-loaded model is normal — it loads on the first call).
 - **Capacity declaration**: see §2.2 (measured numbers for 64 concurrent Add / 32 concurrent Search).

@@ -166,7 +166,7 @@ embedding: ollama + 派生模型 qwen3-embedding-aml-ctx1024（FROM qwen3-embedd
 
 ## 5. 复现步骤
 
-**版本与固定 commit**：系统版本 `0.1.0`；参评代码固定 commit **`68a77c5aee451c13cc987be10f3b4efbfcd8e6b8`**
+**版本与固定 commit**：系统版本 `0.1.0`；参评代码固定 commit **以部署端点 `/health` 的 `commit` 字段为准**
 （部署端点的 `/health` 会返回同一 commit，可交叉核对；材料自身的文档提交不参与版本冻结）。
 
 ### 5.1 本地启动（裸机）

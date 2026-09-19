@@ -176,7 +176,7 @@ embedding: ollama + derived tag qwen3-embedding-aml-ctx1024 (FROM qwen3-embeddin
 
 ## 5. Reproduction
 
-**Version and fixed commit**: system version `0.1.0`; evaluated code pinned at **`68a77c5aee451c13cc987be10f3b4efbfcd8e6b8`**
+**Version and fixed commit**: system version `0.1.0`; evaluated code pinned at **以部署端点 `/health` 的 `commit` 字段为准**
 (the deployed `/health` reports the same commit for cross-checking; documentation commits in this repo are not part of the frozen version).
 
 ### 5.1 Local start (bare metal)

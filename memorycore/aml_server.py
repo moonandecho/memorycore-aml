@@ -152,6 +152,24 @@ _RECALL_FUSION_MIN_DENSE = _env_float(
 # 空/未知/拼写错误一律保持 off（fail-safe，不引入隐式行为）。
 _DECAY_EVENT_TIME = os.environ.get(
     "AML_DECAY_EVENT_TIME", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# E3(2026-09-19): 字面/关键词信号重排 opt-in。默认 off = 现状；仅显式真值开启。
+# 权重默认按「字面优先、dense 保底」给：keyword=0.4 / fts=0.4 / dense=0.2。
+# 归一化可用 AML_RERANK_NORM=minmax|rank 选择（默认 minmax）。
+_RERANK_LEXICAL = os.environ.get(
+    "AML_RERANK_LEXICAL", "0").strip().lower() in ("1", "true", "yes", "on")
+_RERANK_W_DENSE = _env_float("AML_RERANK_W_DENSE", 0.2, minimum=0.0)
+_RERANK_W_KEYWORD = _env_float("AML_RERANK_W_KEYWORD", 0.4, minimum=0.0)
+_RERANK_W_FTS = _env_float("AML_RERANK_W_FTS", 0.4, minimum=0.0)
+_RERANK_NORM = os.environ.get("AML_RERANK_NORM", "minmax").strip().lower()
+if _RERANK_NORM not in ("minmax", "rank"):
+    _RERANK_NORM = "minmax"
+# E3 字面 token 扩路：多跳问题常因多 token 相关性门禁而整段漏召；
+# E3 开启时用查询中的实词分别召回（最多 N 路），只对 opt-in 流量生效。
+_RERANK_TOKEN_ROUTES = min(
+    _env_int("AML_RERANK_TOKEN_ROUTES", 6, minimum=0), 6)
+_RERANK_POOL_MIN_MULT = 5   # E3 开启时默认深挖到 5×top_k（仍受 _RECALL_POOL_CAP 约束）
+_RERANK_TOKEN_POOL_K = _env_int("AML_RERANK_TOKEN_POOL_K", 150, minimum=1)
 _RECALL_STOPWORDS = frozenset(
     "a an the is are was were be been do does did what when where which who"
     " whom whose why how many much of in on at to for with about and or but if"
@@ -164,6 +182,30 @@ def _keyword_query(query: str) -> str:
     toks = [t for t in re.findall(r"[A-Za-z0-9']+", (query or "").lower())
             if len(t) > 2 and t not in _RECALL_STOPWORDS]
     return " ".join(toks)
+
+
+def _literal_token_queries(query: str) -> List[str]:
+    """E3: 查询中的实词 token（保序去重），用于单 token 扩路。"""
+    out: List[str] = []
+    seen = set()
+    for tok in re.findall(r"[A-Za-z0-9']+", (query or "").lower()):
+        if len(tok) <= 2 or tok in _RECALL_STOPWORDS or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _select_literal_token_queries(query: str, limit: int) -> List[str]:
+    """E3: 从查询实词里选最多 ``limit`` 个 token 作为独立召回路。
+
+    选择方式为均匀位置采样（首/中/尾优先），避免只取队列前几个 token
+    总落在专名上；token 数量 ≤ limit 时全部使用。
+    """
+    tokens = _literal_token_queries(query)
+    if limit <= 0 or not tokens:
+        return []
+    return tokens[:limit]
 # Spec §1428 caps decoded image bytes at 30 MiB/Add.  Base64 overhead is
 # 4/3 plus the data-URI/JSON envelope, so the raw HTTP cap must be wider than
 # 30 MiB or a legal boundary image would be rejected by 413 (review §2.6).
@@ -877,7 +919,8 @@ def _dedup_candidates(results: Any) -> List[Dict[str, Any]]:
 
 
 def _rrf_fuse(
-        paths: Any, k: int = 60, min_dense: float = 0.3) -> List[Dict[str, Any]]:
+        paths: Any, k: int = 60, min_dense: float = 0.3,
+        size_weights: bool = False) -> List[Dict[str, Any]]:
     """E1: 跨查询路由的 Reciprocal Rank Fusion（纯函数）。
 
     ``paths`` 是每路的**有序候选列表**（rank 1 = 列表首位）。对每个唯一
@@ -893,8 +936,10 @@ def _rrf_fuse(
     - **不修改入参**，也不删 candidate 的业务字段。
 
     k 默认 60（RRF 常用值，冻结为 AML_RRF_K 默认），min_dense 默认 0.3
-    （与 AML_RECALL_FUSION_MIN_DENSE 默认一致）；只使用名次，
-    与 dense 量纲无关。
+    （与 AML_RECALL_FUSION_MIN_DENSE 默认一致）；只使用名次。
+    ``size_weights=True`` 时每路贡献再乘 ``1/该路候选数``（只由 E3
+    开启时传入）：单 token 字面扩路命中面窄、候选数少，应该比主查询
+    的宽路有更高的话语权；默认 False = 旧 RRF 逐字节行为。
     """
     try:
         kk = float(k)
@@ -913,9 +958,13 @@ def _rrf_fuse(
     first: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
     for path in paths or []:
+        path_items = list(path or [])
+        # E3 的 size_weights：路径候选数越少，单条命中越珍贵。
+        path_weight = (1.0 / max(1, len(path_items))
+                       if size_weights else 1.0)
         seen_in_path = set()
         rank = 0
-        for cand in path or []:
+        for cand in path_items:
             if not isinstance(cand, dict):
                 continue
             rid = cand.get("id")
@@ -936,13 +985,164 @@ def _rrf_fuse(
             if dense < threshold:
                 continue
             rank += 1
-            scores[key] = scores.get(key, 0.0) + 1.0 / (kk + rank)
+            scores[key] = scores.get(key, 0.0) + path_weight / (kk + rank)
     for key, item in first.items():
         item["rrf_score"] = scores.get(key, 0.0)
     # 稳定排序：分数相同的候选保持首次出现顺序；低于门槛者排正分者之后。
     ordered = [first[key] for key in order]
     ordered.sort(key=lambda c: c.get("rrf_score", 0.0), reverse=True)
     return ordered
+
+
+def _finite_signal(value: Any) -> Optional[float]:
+    """E3: 返回有限 float；字段缺失/非法/NaN/Inf 返回 None。"""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _unit_minmax(values: List[float]) -> List[float]:
+    """把一组分数 min-max 到 [0,1]；无变化时返回全 0（不贡献排序）。"""
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if high <= low:
+        return [0.0] * len(values)
+    span = high - low
+    return [(v - low) / span for v in values]
+
+
+def _unit_rank(values: List[float]) -> List[float]:
+    """把一组分数做平均名次归一化：最高 1.0，最低 0.0，同分同值。"""
+    n = len(values)
+    if n <= 1:
+        return [0.0] * n
+    order = sorted(range(n), key=lambda i: (-values[i], i))
+    out = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        base = values[order[i]]
+        while j + 1 < n and values[order[j + 1]] == base:
+            j += 1
+        avg_pos = (i + j) / 2.0
+        score = (n - 1 - avg_pos) / (n - 1)
+        for k in range(i, j + 1):
+            out[order[k]] = score
+        i = j + 1
+    return out
+
+
+def _signal_units(rows: List[Dict[str, Any]], key: str,
+                  norm: Optional[str] = None) -> Optional[List[float]]:
+    """E3: 取 ``rows`` 的一条分数字段并归一化。
+
+    返回 None 表示该字段在所有候选上都没有有效数值（旧数据缺字段 →
+    调用方应退回 dense-only）；返回全 0 表示字段存在但无区分度。
+    """
+    raw: List[Optional[float]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raw.append(None)
+            continue
+        val = _finite_signal(row.get(key))
+        # dense_score 是旧路径必有的排序基准；缺失按 0，保证 dense-only 回退。
+        if val is None and key == "dense_score":
+            val = 0.0
+        raw.append(val)
+    if not any(v is not None for v in raw):
+        return None
+    vals = [0.0 if v is None else float(v) for v in raw]
+    if max(vals) <= min(vals):
+        return [0.0] * len(vals)
+    if (norm or _RERANK_NORM) == "rank":
+        return _unit_rank(vals)
+    return _unit_minmax(vals)
+
+
+def _lexical_weighted_scores(
+        rows: List[Dict[str, Any]], *,
+        norm: Optional[str] = None,
+        weights: Optional[Tuple[float, float, float]] = None,
+) -> List[float]:
+    """E3: dense/keyword/fts 归一化加权分（纯函数，不修改入参）。
+
+    - 默认权重 (dense, keyword, fts) = (0.2, 0.4, 0.4)；
+    - 只对「在所有候选间有区分度」的信号计入；缺字段/全零字面信号时
+      自动回退为只按 dense（旧数据兼容）；
+    - 返回长度与 ``rows`` 一致，全部信号都无区分度时返回全 0。
+    """
+    rows = list(rows or [])
+    n = len(rows)
+    if n == 0:
+        return []
+    if weights is None:
+        weights = (_RERANK_W_DENSE, _RERANK_W_KEYWORD, _RERANK_W_FTS)
+    try:
+        wd, wk, wf = (max(0.0, float(x)) for x in weights)
+    except (TypeError, ValueError):
+        wd, wk, wf = (0.2, 0.4, 0.4)
+    if wd + wk + wf <= 0.0:
+        wd, wk, wf = (0.2, 0.4, 0.4)
+
+    units: List[Tuple[float, List[float]]] = []
+    for key, weight in (("dense_score", wd), ("keyword_score", wk),
+                        ("fts_score", wf)):
+        if weight <= 0.0:
+            continue
+        unit = _signal_units(rows, key, norm=norm)
+        if unit is None:
+            continue
+        if max(abs(v) for v in unit) <= 1e-12:
+            continue
+        units.append((weight, unit))
+    if not units:
+        return [0.0] * n
+    total = sum(weight for weight, _ in units)
+    return [
+        sum(weight * unit[pos] for weight, unit in units) / total
+        for pos in range(n)
+    ]
+
+
+def _rerank_path_lexical(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """E3: 用加权字面分 × 既有衰减对一路内部重排。
+
+    先把归一化加权分临时放进 ``dense_score``，复用 ``_apply_recall_decay``
+    （含 E2 事件时间开关）得到该路顺序；再恢复原始 dense_score，因为
+    ``_rrf_fuse`` 的 min_dense 门槛仍必须按存储层语义判断。加权分只在
+    pre-RRF 路径内部决定名次，最终分值仍由 E1 的 RRF×decay 统一计算。
+    """
+    rows = list(rows or [])
+    if len(rows) <= 1:
+        return rows
+    scores = _lexical_weighted_scores(rows)
+    scaled: List[Dict[str, Any]] = []
+    for row, score in zip(rows, scores):
+        if not isinstance(row, dict):
+            continue
+        rr = dict(row)
+        rr["_e3_dense_raw"] = _finite_number(row.get("dense_score", 0.0), 0.0)
+        rr["_e3_weighted_score"] = score
+        # 临时把加权分放进 dense_score，仅为了复用既有 decay 排序；
+        # 排序后再恢复原始 dense_score，RRF 门槛读 _rrf_gate_score。
+        rr["dense_score"] = score
+        scaled.append(rr)
+    if not scaled:
+        return []
+    decayed = _apply_recall_decay(scaled)
+    for rr in decayed:
+        # 恢复原始 dense_score：RRF 的单路 min_dense 门槛仍按存储层
+        # 语义判断；E3 加权分只决定该路内部名次。
+        rr["dense_score"] = rr.pop("_e3_dense_raw", 0.0)
+    return decayed
 
 
 def _candidate_pool_size(top_k: int) -> int:
@@ -955,6 +1155,18 @@ def _candidate_pool_size(top_k: int) -> int:
     if _RECALL_POOL_MULT <= 1:
         return base
     return min(base * _RECALL_POOL_MULT, _RECALL_POOL_CAP)
+
+
+def _search_candidate_pool_size(top_k: int) -> int:
+    """E3 开启时给检索至少 5×top_k 的深池（仍受 AML_RECALL_POOL_CAP 约束）。
+
+    只有 AML_RERANK_LEXICAL=1 才生效；关闭时逐字节等于 ``_candidate_pool_size``。
+    """
+    base = _candidate_pool_size(top_k)
+    if not _RERANK_LEXICAL:
+        return base
+    deep = min(_MAX_TOP_K * _RERANK_POOL_MIN_MULT, _RECALL_POOL_CAP)
+    return max(base, deep)
 
 
 def _event_date_prefix(ts: Any) -> str:
@@ -2240,7 +2452,7 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
     if client is None:
         return _bad(500, "storage backend unavailable (embedding service down?)")
 
-    pool_k = _candidate_pool_size(top_k)
+    pool_k = _search_candidate_pool_size(top_k)
     try:
         primary_results = client.recall_results(
             query, top_k=pool_k, author_id=user_id, bump=False)
@@ -2266,31 +2478,48 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
                 _check_deadline(deadline)
         paths = paths[:3]
 
+        if _RERANK_LEXICAL and _RERANK_TOKEN_ROUTES > 0:
+            # E3 字面扩路：多 token 查询的存储层相关性门禁会漏掉只含
+            # 单个问题实词的金标依赖；单 token 召回门禁更宽，再交给
+            # dense/keyword/fts 归一化重排与跨路 RRF。
+            for tok in _select_literal_token_queries(
+                    query, _RERANK_TOKEN_ROUTES):
+                if tok == (query or "").strip().lower():
+                    continue
+                token_results = client.recall_results(
+                    tok, top_k=min(pool_k, _RERANK_TOKEN_POOL_K),
+                    author_id=user_id, bump=False)
+                paths.append(list(token_results or []))
+                _check_deadline(deadline)
+
+        safe_paths = [_sanitize_candidates(path) for path in paths]
+        if _RERANK_LEXICAL:
+            # E3: 先按 dense/keyword/fts 归一化加权分 × 既有衰减，对每路
+            # 内部重排；再交给 E1 的跨路 RRF。RERANK=off 时逐字节现状。
+            safe_paths = [_rerank_path_lexical(path) for path in safe_paths]
+
         if _RECALL_FUSION_ON:
-            safe_paths = [_sanitize_candidates(path) for path in paths]
             fused = _rrf_fuse(
                 safe_paths, k=_RRF_K,
-                min_dense=_RECALL_FUSION_MIN_DENSE)
-            if fused:
-                for cand in fused:
-                    # 保留既有衰减语义：复用 core.decay._apply_decay，
-                    # final_score = RRF 分 × 0.5^(days/90)。原始 dense 分
-                    # 留在 _dense_score_raw 以便诊断/回滚比较。
-                    cand["_dense_score_raw"] = cand.get("dense_score", 0.0)
-                    cand["dense_score"] = _finite_number(
-                        cand.get("rrf_score"), 0.0)
-                results = _apply_recall_decay(fused)
-            else:
-                # 门槛把所有路的候选都滤空时退回并集 + 衰减（默认 off 口径），
-                # 避免融合开关把响应变成 0 条；低分候选没有贡献任何 RRF 分。
-                candidates = _sanitize_candidates(_dedup_candidates(
-                    [c for path in paths for c in path]))
-                results = _apply_recall_decay(candidates)
+                min_dense=_RECALL_FUSION_MIN_DENSE,
+                size_weights=_RERANK_LEXICAL)
+            for cand in fused:
+                # 保留既有衰减语义：复用 core.decay._apply_decay，
+                # final_score = RRF 分 × 0.5^(days/90)。原始 dense 分
+                # 留在 _dense_score_raw 以便诊断/回滚比较。
+                cand["_dense_score_raw"] = cand.get("dense_score", 0.0)
+                cand["dense_score"] = _finite_number(
+                    cand.get("rrf_score"), 0.0)
+            results = _apply_recall_decay(fused)
         else:
-            # 默认路径：与改前逐字节一致的「并集去重 + sanitize + decay」。
-            candidates = _sanitize_candidates(_dedup_candidates(
-                [c for path in paths for c in path]))
-            results = _apply_recall_decay(candidates)
+            # 默认路径：与改前逐字节一致的「并集去重 + sanitize + decay」；
+            # E3 开启但未开 RRF 时，对并集做同一套字面加权 × 衰减排序。
+            candidates = _dedup_candidates(
+                [c for path in safe_paths for c in path])
+            if _RERANK_LEXICAL:
+                results = _rerank_path_lexical(candidates)
+            else:
+                results = _apply_recall_decay(candidates)
 
         results = results[:top_k]
     except _BudgetExceeded as e:

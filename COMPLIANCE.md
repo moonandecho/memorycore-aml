@@ -7,7 +7,7 @@
 
 | # | 规范要求（摘句） | 我们的实现 | 证据 |
 |---|---|---|---|
-| A1 | "Open-source methods and commercial products both use participant-hosted Add/Search APIs. AML does not deploy repository-only submissions." | 自托管公网端点：`http://47.108.28.129:18000/add|/search|/health`（阿里云 frps → frpc → echopc 服务） | `TASK-capacity.md`/通道搭建记录；公网 64 并发实测 103.5 s |
+| A1 | "Open-source methods and commercial products both use participant-hosted Add/Search APIs. AML does not deploy repository-only submissions." | 自托管公网端点：`http://47.108.28.129:18000/add|/search|/health`（阿里云 frps → frpc → echopc 服务） | `TASK-capacity.md`/通道搭建记录；2026-09-19 晚同口径配对实测：Add 64 并发墙钟 **216.2 s**（E3 开启）/ **213.9 s**（E3 前对照），成功率均 100%；公网入口自检通过（Mac → 公网：`/health` 200、无密钥 401、带密钥 `/add` 200、`/search` 命中） |
 | A2 | "URL 中不得包含用户名、密码等凭据，也不得指向私有、回环或链路本地地址" | 公网 IPv4 + 非标端口，URL 无凭据；鉴权在请求头 | 公网探针 `/health` 200、`/add` 200 |
 | A3 | "生产环境建议使用 HTTPS"（建议非强制） | 当前 HTTP（IP 证书链路已评估，未采用）；如需 HTTPS 可切换 | 决策记录（Obsidian「配置变更」） |
 | A4 | "If you provide a deployed endpoint, it will remain publicly reachable and stable for at least 30 days after submission." | 到期日设为 **2026-12-05**（覆盖最晚 10/31 提交 + 30 天） | 两边自失效脚本 + `systemctl list-timers` 显示 2026-12-05 12:00 |
@@ -23,7 +23,7 @@
 | B5 | `timestamp` "可选，单位为 Unix 毫秒" | 接受并忽略（排序用持久化时间）——已在材料 §4.5 披露 | 规范第 132-133 行口径 + 材料披露节 |
 | B6 | `user_id` "必填…写入和检索时必须保持一致" | 一对一映射到存储 `author_id`，写入/去重/检索全程携带；SQL 层过滤 | 跨 user_id 检索不到（测试覆盖） |
 | B7 | `session_id` "必填…不作为 Search 的筛选条件" | 记录来源，不参与检索过滤 | 代码 + 测试 |
-| B8 | "单次请求最长 30 分钟" | 单请求预算默认 600 s（可配），实测单次 Add 3.4~4.5 s；64 并发整批 103.5 s | 本机/公网实测 |
+| B8 | "单次请求最长 30 分钟" | 单请求预算默认 600 s（可配），实测单次 Add 3.4~4.5 s；64 并发整批 **216.2 s**（配对对照 213.9 s；平台超时 1200 s → 约 5.6 倍余量） | 本机同口径配对实测（2026-09-19 晚） |
 | B9 | "202 仅当…已审核绑定…Add 状态查询地址时支持；未绑定时返回 202 属于契约错误" | **不返回 202** | 探针 + 测试 |
 | B10 | Add 响应 "success 必填，且必须是布尔值 true；request_id/user_id/session_id 全部必填并完全一致" | 完全符合 | 公网/本机探针响应体 |
 
@@ -72,6 +72,6 @@
 ## G. 待确认 / 待办（提交前必须清零）
 
 - **G1**：F4 的 gpt-4o-mini 条款解释（建议邮件确认；我们两种解释都合规，但要留书面依据）。
-- **G2**：材料两处待填（联系人/团队、固定 commit）；提交前再抓一次官网页面比对（规范可能更新）。
+- **G2**：联系人/团队随**准入申请表**提交给主办方（公开仓库不展示个人姓名/邮箱）；**固定 commit 以部署端点 `/health` 返回值为准**（2026-09-19 晚实测 = `25a7364`，须**推送公开仓库后**才对评委可见）；提交前再抓一次官网页面比对（规范可能更新）。
 - **G3**：smoke → Full #1 排期（建议 9 月底前 Full）。
 - **G4**：评测数据在任务结束后 30 天内删除（赛后处置清单第 1 项）。

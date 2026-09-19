@@ -170,6 +170,11 @@ _RERANK_TOKEN_ROUTES = min(
     _env_int("AML_RERANK_TOKEN_ROUTES", 5, minimum=0), 5)
 _RERANK_POOL_MIN_MULT = 2   # E3 开启时默认深挖到 2×top_k（仍受 _RECALL_POOL_CAP 约束）
 _RERANK_TOKEN_POOL_K = _env_int("AML_RERANK_TOKEN_POOL_K", 150, minimum=1)
+# C③: 单 token 扩路是覆盖补充，不是主路替代。所有 token 路的 RRF 权重
+# 之和上限不得超过主路权重的该倍数，避免同一候选出现在多条窄 token 路时
+# 叠加压过高 dense 主路证据。默认 0.5 = 最多只能接近但压不过主路 rank1。
+_RERANK_TOKEN_RRF_TOTAL_MULT = min(
+    _env_float("AML_RERANK_TOKEN_RRF_TOTAL_MULT", 0.5, minimum=0.0), 1.0)
 _RECALL_STOPWORDS = frozenset(
     "a an the is are was were be been do does did what when where which who"
     " whom whose why how many much of in on at to for with about and or but if"
@@ -215,6 +220,11 @@ def _select_literal_token_queries(query: str, limit: int) -> List[str]:
 # 30 MiB or a legal boundary image would be rejected by 413 (review §2.6).
 AML_MAX_BODY_BYTES = _env_int(
     "AML_MAX_BODY_BYTES", 48 * 1024 * 1024, minimum=1)
+# AML response hard guard (review condition B).  Spec allows 30 MiB per
+# Search response; 28 MiB leaves 2 MiB safety for JSON envelope/headers and
+# future fields.  This is a *body* byte budget, enforced at assembly time.
+_SEARCH_RESPONSE_MAX_BYTES = _env_int(
+    "AML_SEARCH_RESPONSE_MAX_BYTES", 28 * 1024 * 1024, minimum=1024)
 AML_HEALTH_PROBE_INTERVAL_S = _env_float(
     "AML_HEALTH_PROBE_INTERVAL_S", 5.0, minimum=0.2)
 AML_STARTUP_SELF_CHECK = os.environ.get(
@@ -253,6 +263,7 @@ _P0_COUNTS: Dict[str, int] = {
     "embedding_unavailable_503": 0,
     "storage_busy_503": 0,
     "body_too_large_413": 0,
+    "search_response_truncated": 0,
     "health_probe_ok": 0,
     "health_probe_error": 0,
 }
@@ -924,7 +935,8 @@ def _dedup_candidates(results: Any) -> List[Dict[str, Any]]:
 
 def _rrf_fuse(
         paths: Any, k: int = 60, min_dense: float = 0.3,
-        size_weights: bool = False) -> List[Dict[str, Any]]:
+        size_weights: bool = False,
+        path_weights: Optional[List[float]] = None) -> List[Dict[str, Any]]:
     """E1: 跨查询路由的 Reciprocal Rank Fusion（纯函数）。
 
     ``paths`` 是每路的**有序候选列表**（rank 1 = 列表首位）。对每个唯一
@@ -944,6 +956,8 @@ def _rrf_fuse(
     ``size_weights=True`` 时每路贡献再乘 ``1/该路候选数``（只由 E3
     开启时传入）：单 token 字面扩路命中面窄、候选数少，应该比主查询
     的宽路有更高的话语权；默认 False = 旧 RRF 逐字节行为。
+    ``path_weights`` 可选显式每路权重，优先于 ``size_weights``；E3
+    用它给主路保留宽度权重、同时把 token 路权重总和限死在主路权重之下。
     """
     try:
         kk = float(k)
@@ -961,11 +975,20 @@ def _rrf_fuse(
     scores: Dict[str, float] = {}
     first: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
-    for path in paths or []:
+    for path_idx, path in enumerate(paths or []):
         path_items = list(path or [])
         # E3 的 size_weights：路径候选数越少，单条命中越珍贵。
-        path_weight = (1.0 / max(1, len(path_items))
-                       if size_weights else 1.0)
+        # path_weights（C③ 的 token 路上限）优先于 size_weights。
+        if path_weights is not None:
+            try:
+                path_weight = float(path_weights[path_idx])
+            except (IndexError, TypeError, ValueError):
+                path_weight = 0.0
+            if not math.isfinite(path_weight) or path_weight < 0.0:
+                path_weight = 0.0
+        else:
+            path_weight = (1.0 / max(1, len(path_items))
+                           if size_weights else 1.0)
         seen_in_path = set()
         rank = 0
         for cand in path_items:
@@ -1012,7 +1035,12 @@ def _finite_signal(value: Any) -> Optional[float]:
 
 
 def _unit_minmax(values: List[float]) -> List[float]:
-    """把一组分数 min-max 到 [0,1]；无变化时返回全 0（不贡献排序）。"""
+    """把一组分数 min-max 到 [0,1]；无变化时返回全 0（不贡献排序）。
+
+    C② 修复：极端有限分（例如 [-1e308, 1e308]）的 ``high-low`` 会溢出为
+    ``inf``，原实现随后产生 NaN 并把整条字面信号静默丢掉。此时必须保留
+    单调顺序，因此退回平均名次归一化；信号不会消失。
+    """
     if not values:
         return []
     low = min(values)
@@ -1020,6 +1048,8 @@ def _unit_minmax(values: List[float]) -> List[float]:
     if high <= low:
         return [0.0] * len(values)
     span = high - low
+    if not math.isfinite(span):
+        return _unit_rank(values)
     return [(v - low) / span for v in values]
 
 
@@ -1044,31 +1074,49 @@ def _unit_rank(values: List[float]) -> List[float]:
     return out
 
 
-def _signal_units(rows: List[Dict[str, Any]], key: str,
-                  norm: Optional[str] = None) -> Optional[List[float]]:
+def _signal_units(
+        rows: List[Dict[str, Any]], key: str,
+        norm: Optional[str] = None,
+) -> Optional[List[float]]:
     """E3: 取 ``rows`` 的一条分数字段并归一化。
 
     返回 None 表示该字段在所有候选上都没有有效数值（旧数据缺字段 →
     调用方应退回 dense-only）；返回全 0 表示字段存在但无区分度。
     """
+    units, _present = _signal_units_present(rows, key, norm=norm)
+    return units
+
+
+def _signal_units_present(
+        rows: List[Dict[str, Any]], key: str,
+        norm: Optional[str] = None,
+) -> Tuple[Optional[List[float]], List[bool]]:
+    """E3: 与 ``_signal_units`` 同口径，但额外返回有效值掩码。
+
+    返回 ``(None, present)`` 表示该字段在所有候选上都没有有效数值；
+    ``present[pos]`` 标明该行是否真的有此字段，供 C① 局部缺失回退使用。
+    """
     raw: List[Optional[float]] = []
+    present: List[bool] = []
     for row in rows:
-        if not isinstance(row, dict):
-            raw.append(None)
-            continue
-        val = _finite_signal(row.get(key))
+        val = None
+        if isinstance(row, dict):
+            val = _finite_signal(row.get(key))
         # dense_score 是旧路径必有的排序基准；缺失按 0，保证 dense-only 回退。
         if val is None and key == "dense_score":
             val = 0.0
+        present.append(val is not None)
         raw.append(val)
-    if not any(v is not None for v in raw):
-        return None
+    if not any(present):
+        return None, present
+    # 归一化分母沿用旧口径：缺失行按 0 参与 min/max，保持与未修复版本的
+    # 相对尺度稳定；但后续加权时缺字段的行不会被该项惩罚。
     vals = [0.0 if v is None else float(v) for v in raw]
     if max(vals) <= min(vals):
-        return [0.0] * len(vals)
+        return [0.0] * len(vals), present
     if (norm or _RERANK_NORM) == "rank":
-        return _unit_rank(vals)
-    return _unit_minmax(vals)
+        return _unit_rank(vals), present
+    return _unit_minmax(vals), present
 
 
 def _lexical_weighted_scores(
@@ -1079,8 +1127,10 @@ def _lexical_weighted_scores(
     """E3: dense/keyword/fts 归一化加权分（纯函数，不修改入参）。
 
     - 默认权重 (dense, keyword, fts) = (0.2, 0.4, 0.4)；
-    - 只对「在所有候选间有区分度」的信号计入；缺字段/全零字面信号时
-      自动回退为只按 dense（旧数据兼容）；
+    - 只对「在所有候选间有区分度」的信号计入；整列缺字段/全零字面
+      信号时自动回退为只按 dense（旧数据兼容）；
+    - C① 局部缺失回退：某一行的 keyword/fts 缺失时，该行只按实际存在
+      的信号加权，不把缺失当 0 分惩罚；dense 始终作为保底信号；
     - 返回长度与 ``rows`` 一致，全部信号都无区分度时返回全 0。
     """
     rows = list(rows or [])
@@ -1096,24 +1146,29 @@ def _lexical_weighted_scores(
     if wd + wk + wf <= 0.0:
         wd, wk, wf = (0.2, 0.4, 0.4)
 
-    units: List[Tuple[float, List[float]]] = []
+    units: List[Tuple[float, List[float], List[bool]]] = []
     for key, weight in (("dense_score", wd), ("keyword_score", wk),
                         ("fts_score", wf)):
         if weight <= 0.0:
             continue
-        unit = _signal_units(rows, key, norm=norm)
+        unit, present = _signal_units_present(rows, key, norm=norm)
         if unit is None:
             continue
         if max(abs(v) for v in unit) <= 1e-12:
             continue
-        units.append((weight, unit))
+        units.append((weight, unit, present))
     if not units:
         return [0.0] * n
-    total = sum(weight for weight, _ in units)
-    return [
-        sum(weight * unit[pos] for weight, unit in units) / total
-        for pos in range(n)
-    ]
+    scores: List[float] = []
+    for pos in range(n):
+        num = 0.0
+        den = 0.0
+        for weight, unit, present in units:
+            if present[pos]:
+                num += weight * unit[pos]
+                den += weight
+        scores.append(num / den if den > 0.0 else 0.0)
+    return scores
 
 
 def _rerank_path_lexical(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1171,6 +1226,65 @@ def _search_candidate_pool_size(top_k: int) -> int:
         return base
     deep = min(_MAX_TOP_K * _RERANK_POOL_MIN_MULT, _RECALL_POOL_CAP)
     return max(base, deep)
+
+
+def _search_path_weights(paths: Any, main_path_count: int) -> List[float]:
+    """C③: 给 RRF 各路计算权重，限制 token 扩路叠加。
+
+    主路（原 query / keyword / options 路，共 ``main_path_count`` 条）继续
+    沿用 E3 的 ``1/候选数`` 权重；token 扩路权重之和最多为主路权重的
+    ``_RERANK_TOKEN_RRF_TOTAL_MULT`` 倍。这样同一候选即使同时出现在多条
+    窄 token 路，也不能叠加压过主路的同 rank 高分证据。
+    """
+    weights = [1.0 / max(1, len(path or [])) for path in paths or []]
+    if not weights or main_path_count <= 0 or main_path_count >= len(weights):
+        return weights
+    primary_weight = max(0.0, weights[0])
+    cap = primary_weight * _RERANK_TOKEN_RRF_TOTAL_MULT
+    token_total = sum(weights[main_path_count:])
+    if cap <= 0.0:
+        for idx in range(main_path_count, len(weights)):
+            weights[idx] = 0.0
+    elif token_total > cap:
+        scale = cap / token_total
+        for idx in range(main_path_count, len(weights)):
+            weights[idx] *= scale
+    return weights
+
+
+def _json_compact_bytes(obj: Any) -> bytes:
+    """Exact JSONResponse body encoding used by Starlette (compact JSON)."""
+    return json.dumps(
+        obj, ensure_ascii=False, allow_nan=False,
+        separators=(",", ":")).encode("utf-8")
+
+
+def _bounded_search_data(
+        items: List[Dict[str, Any]], max_bytes: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """B: keep a JSON-body prefix of ``items`` within ``max_bytes`` bytes.
+
+    Truncation is tail-first: the highest-ranked items are preserved.  Returns
+    ``(kept_items, dropped_count)``.  The body length calculation mirrors
+    ``JSONResponse.render`` exactly so the caller can guarantee the byte cap
+    before constructing the response.
+    """
+    limit = max(0, int(max_bytes))
+    empty_body = _json_compact_bytes({"data": []})
+    if limit < len(empty_body):
+        return [], len(items)
+    prefix = b'{"data":['
+    suffix = b']}'
+    kept: List[Dict[str, Any]] = []
+    total = len(prefix)
+    for pos, item in enumerate(items):
+        item_bytes = _json_compact_bytes(item)
+        comma = 1 if kept else 0
+        if total + comma + len(item_bytes) + len(suffix) > limit:
+            return kept, len(items) - pos
+        total += comma + len(item_bytes)
+        kept.append(item)
+    return kept, 0
 
 
 def _event_date_prefix(ts: Any) -> str:
@@ -2481,6 +2595,7 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
                     author_id=user_id, bump=False) or []))
                 _check_deadline(deadline)
         paths = paths[:3]
+        main_path_count = len(paths)
 
         if _RERANK_LEXICAL and _RERANK_TOKEN_ROUTES > 0:
             # E3 字面扩路：多 token 查询的存储层相关性门禁会漏掉只含
@@ -2503,10 +2618,13 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
             safe_paths = [_rerank_path_lexical(path) for path in safe_paths]
 
         if _RECALL_FUSION_ON:
+            lane_weights = (
+                _search_path_weights(safe_paths, main_path_count)
+                if _RERANK_LEXICAL else None)
             fused = _rrf_fuse(
                 safe_paths, k=_RRF_K,
                 min_dense=_RECALL_FUSION_MIN_DENSE,
-                size_weights=_RERANK_LEXICAL)
+                path_weights=lane_weights)
             for cand in fused:
                 # 保留既有衰减语义：复用 core.decay._apply_decay，
                 # final_score = RRF 分 × 0.5^(days/90)。原始 dense 分
@@ -2553,6 +2671,13 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
             "created_at": _iso_z(r.get("timestamp")),
         })
     data = data[:top_k]
+    data, dropped = _bounded_search_data(data, _SEARCH_RESPONSE_MAX_BYTES)
+    if dropped:
+        _p0_inc("search_response_truncated", 1)
+        logger.warning(
+            "AML search response truncated: dropped %d tail candidate(s), "
+            "kept %d, byte_limit=%d",
+            dropped, len(data), _SEARCH_RESPONSE_MAX_BYTES)
     return JSONResponse({"data": data}, status_code=200)
 
 

@@ -7,7 +7,7 @@
 
 | Item | Value |
 |---|---|
-| System name and version | MemoryCore (AML edition) v0.1.0; **fixed commit (evaluated code): `68a77c5aee451c13cc987be10f3b4efbfcd8e6b8`** |
+| System name and version | MemoryCore (AML edition) v0.1.0; **fixed commit**: as reported by the deployed `/health` `commit` field |
 | Evaluation type | **Open-Source Methods board** (participant-hosted Add / Search API; not a repository submission) |
 | Track | **Textual memory** (no multimodal track, no code track this cycle) |
 | Add endpoint | `http://47.108.28.129:18000/add` |

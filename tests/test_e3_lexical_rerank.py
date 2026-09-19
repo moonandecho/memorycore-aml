@@ -131,7 +131,7 @@ def test_e3_auto_deep_pool_is_opt_in(monkeypatch):
     monkeypatch.setattr(aml, "_RERANK_LEXICAL", False)
     assert aml._search_candidate_pool_size(100) == 100
     monkeypatch.setattr(aml, "_RERANK_LEXICAL", True)
-    assert aml._search_candidate_pool_size(100) == 500
+    assert aml._search_candidate_pool_size(100) == 200
 
 def test_rrf_size_weights_favor_small_literal_path():
     """E3: 单 token 字面扩路候选少，RRF 贡献按 1/len(path) 放大。"""

@@ -167,8 +167,8 @@ if _RERANK_NORM not in ("minmax", "rank"):
 # E3 字面 token 扩路：多跳问题常因多 token 相关性门禁而整段漏召；
 # E3 开启时用查询中的实词分别召回（最多 N 路），只对 opt-in 流量生效。
 _RERANK_TOKEN_ROUTES = min(
-    _env_int("AML_RERANK_TOKEN_ROUTES", 6, minimum=0), 6)
-_RERANK_POOL_MIN_MULT = 5   # E3 开启时默认深挖到 5×top_k（仍受 _RECALL_POOL_CAP 约束）
+    _env_int("AML_RERANK_TOKEN_ROUTES", 5, minimum=0), 5)
+_RERANK_POOL_MIN_MULT = 2   # E3 开启时默认深挖到 2×top_k（仍受 _RECALL_POOL_CAP 约束）
 _RERANK_TOKEN_POOL_K = _env_int("AML_RERANK_TOKEN_POOL_K", 150, minimum=1)
 _RECALL_STOPWORDS = frozenset(
     "a an the is are was were be been do does did what when where which who"
@@ -205,7 +205,11 @@ def _select_literal_token_queries(query: str, limit: int) -> List[str]:
     tokens = _literal_token_queries(query)
     if limit <= 0 or not tokens:
         return []
-    return tokens[:limit]
+    if len(tokens) <= limit:
+        return tokens
+    # 长词通常更具体、候选面更窄；按长度降序取前 limit 个，
+    # 再交给 1/候选数 加权的 RRF（单 token 窄路权重更高）。
+    return sorted(tokens, key=lambda t: -len(t))[:limit]
 # Spec §1428 caps decoded image bytes at 30 MiB/Add.  Base64 overhead is
 # 4/3 plus the data-URI/JSON envelope, so the raw HTTP cap must be wider than
 # 30 MiB or a legal boundary image would be rejected by 413 (review §2.6).

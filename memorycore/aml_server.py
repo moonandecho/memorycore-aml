@@ -132,6 +132,25 @@ AML_MAX_INFLIGHT = _env_int("AML_MAX_INFLIGHT", 128, minimum=1)
 AML_MAX_QUEUE = _env_int("AML_MAX_QUEUE", 256, minimum=0)
 AML_MAX_INFLIGHT_BYTES = _env_int(
     "AML_MAX_INFLIGHT_BYTES", 256 * 1024 * 1024, minimum=1)
+
+# L3(2026-09-19): 召回覆盖实验开关 —— 默认值与现状完全一致，改由 env 开启。
+# 动机：实测 LoCoMo 拒答题里 88% 是"该证据根本没被召回"（覆盖问题），
+# 而 pool_k 此前被 _MAX_TOP_K 卡在 100，等于按存储层排序取前 100，没有二次挑选空间。
+_RECALL_POOL_MULT = _env_int("AML_RECALL_POOL_MULT", 1, minimum=1)
+_RECALL_POOL_CAP = _env_int("AML_RECALL_POOL_CAP", 500, minimum=100)
+_RECALL_MULTI_QUERY = min(1, _env_int("AML_RECALL_MULTI_QUERY", 0, minimum=0))
+_RECALL_STOPWORDS = frozenset(
+    "a an the is are was were be been do does did what when where which who"
+    " whom whose why how many much of in on at to for with about and or but if"
+    " it its this that these those i you he she they we me my your his her their"
+    " s t".split())
+
+
+def _keyword_query(query: str) -> str:
+    """L3: 去掉疑问词/停用词后的实词查询，用于多路召回。"""
+    toks = [t for t in re.findall(r"[A-Za-z0-9']+", (query or "").lower())
+            if len(t) > 2 and t not in _RECALL_STOPWORDS]
+    return " ".join(toks)
 # Spec §1428 caps decoded image bytes at 30 MiB/Add.  Base64 overhead is
 # 4/3 plus the data-URI/JSON envelope, so the raw HTTP cap must be wider than
 # 30 MiB or a legal boundary image would be rejected by 413 (review §2.6).
@@ -738,8 +757,15 @@ def _dedup_candidates(results: Any) -> List[Dict[str, Any]]:
 
 
 def _candidate_pool_size(top_k: int) -> int:
-    """Recall candidate pool: wider than top_k but bounded by the AML cap."""
-    return min(max(int(top_k), _RECALL_CANDIDATE_POOL_MIN), _MAX_TOP_K)
+    """Recall candidate pool: wider than top_k but bounded by the AML cap.
+
+    L3: AML_RECALL_POOL_MULT > 1 时内部候选池可超过 AML 的 top_k 上限
+    （100 条上限是**响应**约束，不是我们内部池子的约束）。默认 1 = 原行为。
+    """
+    base = min(max(int(top_k), _RECALL_CANDIDATE_POOL_MIN), _MAX_TOP_K)
+    if _RECALL_POOL_MULT <= 1:
+        return base
+    return min(base * _RECALL_POOL_MULT, _RECALL_POOL_CAP)
 
 
 def _event_date_prefix(ts: Any) -> str:
@@ -2031,13 +2057,21 @@ def _aml_search_sync_locked(body: Dict[str, Any], deadline: float) -> JSONRespon
             query, top_k=pool_k, author_id=user_id, bump=False)
         _check_deadline(deadline)
         extra_results: List[Dict[str, Any]] = []
+        if _RECALL_MULTI_QUERY:
+            _kw = _keyword_query(query)
+            if _kw and _kw != (query or "").strip().lower():
+                extra_results.extend(client.recall_results(
+                    _kw, top_k=pool_k, author_id=user_id, bump=False) or [])
+                _check_deadline(deadline)
         options = body.get("options")
         if isinstance(options, list) and options:
             opt_text = " ".join(str(o) for o in options if isinstance(o, str))
             if opt_text:
-                extra_results = client.recall_results(
+                # Phase 0a fix: extend, never reassign -- otherwise the
+                # multi-query keyword path above is silently discarded.
+                extra_results.extend(client.recall_results(
                     query + " " + opt_text, top_k=pool_k,
-                    author_id=user_id, bump=False)
+                    author_id=user_id, bump=False) or [])
                 _check_deadline(deadline)
         candidates = _dedup_candidates(
             list(primary_results or []) + list(extra_results or []))

@@ -7,7 +7,7 @@
 
 | Item | Value |
 |---|---|
-| System name and version | MemoryCore (AML edition) v0.1.0; **fixed commit**: as reported by the deployed `/health` `commit` field |
+| System name and version | MemoryCore (AML edition) v0.2.0; **fixed commit**: as reported by the deployed `/health` `commit` field |
 | Evaluation type | **Open-Source Methods board** (participant-hosted Add / Search API; not a repository submission) |
 | Track | **Textual memory** (no multimodal track, no code track this cycle) |
 | Add endpoint | `http://47.108.28.129:18000/add` |
@@ -150,6 +150,7 @@ embedding: ollama + derived tag qwen3-embedding-aml-ctx1024 (FROM qwen3-embeddin
 | Lexical/keyword rerank (E3, **enabled in this deployment**) | `memorycore/aml_server.py` | `AML_RERANK_LEXICAL=1`: dense/keyword/fts weighted rerank; rows missing a signal field fall back to the signals they do have instead of being penalised as 0 |
 | Candidate-pool widening + single-token routes (E3, **enabled in this deployment**) | `memorycore/aml_server.py` | `AML_RECALL_POOL_MULT=2` widens the internal candidate pool; narrow single-token queries get up to 5 extra routes whose combined weight is capped at `0.5x` the primary routes, so narrow routes cannot outrank high-scoring primary evidence |
 | RRF keeps below-threshold candidates (c8) | `memorycore/aml_server.py` | candidates below the dense threshold are no longer dropped from the fused result: they keep their identity with a fused score of 0 and rank after positive-score candidates |
+| Row-level speaker label (**enabled in this deployment**) | `memorycore/aml_server.py` | `AML_ROW_ROLE_LABEL=1` appends the message `role` (user/assistant) to the stored row prefix (`[YYYY-MM-DD HH:MM] user: text`). The platform's Add payload already carries `role`, but the previous behaviour dropped that attribution at write time (rows kept only the date). Rows are neither merged nor re-split and the fragment granularity is unchanged; with the switch off the rows are byte-for-byte the legacy ones (`tests/test_row_role_label.py`) |
 | Search response byte guard (**on by default**) | `memorycore/aml_server.py` | `AML_SEARCH_RESPONSE_MAX_BYTES` defaults to 28 MiB (2 MiB headroom under the 30 MiB spec cap): the JSON body is truncated from the tail on an exact byte budget, keeping the highest-scoring prefix, and every truncation bumps `search_response_truncated` and logs a warning |
 
 ### 4.3 Storage-layer patch (explicit disclosure)
@@ -181,7 +182,7 @@ embedding: ollama + derived tag qwen3-embedding-aml-ctx1024 (FROM qwen3-embeddin
 
 ## 5. Reproduction
 
-**Version and fixed commit**: system version `0.1.0`; evaluated code pinned at **以部署端点 `/health` 的 `commit` 字段为准**
+**Version and fixed commit**: system version `0.2.0`; evaluated code pinned at **以部署端点 `/health` 的 `commit` 字段为准**
 (the deployed `/health` reports the same commit for cross-checking; documentation commits in this repo are not part of the frozen version).
 
 ### 5.1 Local start (bare metal)
@@ -246,6 +247,7 @@ docker run -p 8000:8000 -v aml-data:/data memorycore-aml
 | `AML_RECALL_FUSION` | `off` | `rrf` = cross-query-route RRF fusion; **set to `rrf` in this deployment** |
 | `AML_RERANK_LEXICAL` | `0` | `1` = lexical/keyword rerank; **set to `1` in this deployment** |
 | `AML_RECALL_POOL_MULT` | `1` | internal candidate-pool multiplier (>=1); **set to `2` in this deployment** |
+| `AML_ROW_ROLE_LABEL` | `0` | `1` = row-level speaker label (`[date] user: text`); **set to `1` in this deployment** |
 | `AML_SEARCH_RESPONSE_MAX_BYTES` | `29360128` (28 MiB) | `/search` response byte cap; overflow is truncated from the tail and counted (effective by default, under the 30 MiB spec cap) |
 
 ## 8. Error-code semantics

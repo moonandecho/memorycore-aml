@@ -7,7 +7,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 系统名称与版本 | MemoryCore（AML 适配版）v0.1.0；**固定 commit**：以部署端点 `/health` 返回的 `commit` 字段为准（提交申请表时同步声明） |
+| 系统名称与版本 | MemoryCore（AML 适配版）v0.2.0；**固定 commit**：以部署端点 `/health` 返回的 `commit` 字段为准（提交申请表时同步声明） |
 | 参评类型 | **开源方法榜**（参赛方自托管 Add / Search API，非仓库提交） |
 | 参评赛道 | **文本记忆**（本期不报多模态赛道、不报代码赛道） |
 | Add 端点 | `http://47.108.28.129:18000/add` |
@@ -143,6 +143,7 @@ embedding: ollama + 派生模型 qwen3-embedding-aml-ctx1024（FROM qwen3-embedd
 | 字面/关键词信号重排（E3，**本部署已启用**） | `memorycore/aml_server.py` | `AML_RERANK_LEXICAL=1`：dense/keyword/fts 多信号加权重排；局部缺字段的行按实际存在的信号回退，不按 0 分惩罚 |
 | 候选池放大 + 单 token 扩路（E3，**本部署已启用**） | `memorycore/aml_server.py` | `AML_RECALL_POOL_MULT=2` 放大内部候选池；单一 token 的窄查询扩路（最多 5 路），所有窄路权重之和封顶主路的 `0.5` 倍，避免窄路压过主路高分证据 |
 | RRF 门槛候选保留（c8） | `memorycore/aml_server.py` | 低于 dense 门槛的候选不再从融合结果整段消失，保留候选身份、融合分记 0 排在正分候选之后 |
+| 行内说话人标签（**本部署已启用**） | `memorycore/aml_server.py` | `AML_ROW_ROLE_LABEL=1`：写入时把消息 `role`（user/assistant）追加到行前缀（`[日期] user: 正文`）。平台 Add 请求本就带 `role`，但旧行为落库时丢弃了归属信息（行文本只有日期）；改动不合并、不拆片、不改行粒度，开关关闭时逐字节等同旧行为（`tests/test_row_role_label.py` 断言） |
 | Search 响应字节护栏（**默认生效**） | `memorycore/aml_server.py` | `AML_SEARCH_RESPONSE_MAX_BYTES` 默认 28 MiB（规范上限 30 MiB 留余量）：按 JSON body 精确字节预算从尾部截断，保留最高分前缀，记 `search_response_truncated` 计数并写 warning |
 
 ### 4.3 存储层补丁（明示披露）
@@ -171,7 +172,7 @@ embedding: ollama + 派生模型 qwen3-embedding-aml-ctx1024（FROM qwen3-embedd
 
 ## 5. 复现步骤
 
-**版本与固定 commit**：系统版本 `0.1.0`；参评代码固定 commit **以部署端点 `/health` 的 `commit` 字段为准**
+**版本与固定 commit**：系统版本 `0.2.0`；参评代码固定 commit **以部署端点 `/health` 的 `commit` 字段为准**
 （部署端点的 `/health` 会返回同一 commit，可交叉核对；材料自身的文档提交不参与版本冻结）。
 
 ### 5.1 本地启动（裸机）
@@ -234,6 +235,7 @@ docker run -p 8000:8000 -v aml-data:/data memorycore-aml
 | `AML_RECALL_FUSION` | `off` | `rrf` = 跨查询路由 RRF 融合；**本部署已置 `rrf`** |
 | `AML_RERANK_LEXICAL` | `0` | `1` = 字面/关键词信号重排；**本部署已置 `1`** |
 | `AML_RECALL_POOL_MULT` | `1` | 内部候选池倍数（≥1）；**本部署已置 `2`** |
+| `AML_ROW_ROLE_LABEL` | `0` | `1` = 行内说话人标签（`[日期] user: 正文`）；**本部署已置 `1`** |
 | `AML_SEARCH_RESPONSE_MAX_BYTES` | `29360128`（28 MiB） | `/search` 响应体字节上限；超出按尾部截断并计数（默认即生效，规范上限 30 MiB） |
 
 ## 8. 错误码语义

@@ -122,6 +122,20 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
     return max(minimum, value)
 
 
+def _env_switch(name: str, default: str = "0") -> bool:
+    """Truthy env switch: 1/true/yes/on (case-insensitive); anything else off."""
+    raw = os.environ.get(name, default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Row-level speaker label (opt-in, default off).
+# 平台 Add 请求本就带 role(user/assistant)，但落库行文本只保留了日期前缀，
+# 说话人归属在写入时被丢弃。打开后行前缀追加 "user: " / "assistant: "，
+# 不合并、不拆片、不改行粒度；关闭时逐字节等同旧行为
+# （tests/test_row_role_label.py 断言）。
+_ROW_ROLE_LABEL = _env_switch("AML_ROW_ROLE_LABEL")
+
+
 # P0 concurrency / capacity knobs (all env-configurable; defaults chosen for
 # the 64-Add platform shape and the MX150 GPU model).
 AML_WORKERS = _env_int("AML_WORKERS", 4, minimum=1)
@@ -1255,6 +1269,20 @@ def _event_date_prefix(ts: Any) -> str:
     except (OverflowError, OSError, ValueError):
         return ""
     return dt.strftime("[%Y-%m-%d %H:%M] ")
+def _with_role_label(prefix: str, role: str) -> str:
+    """Append a speaker label to ``prefix`` when AML_ROW_ROLE_LABEL is on.
+
+    Fail-safe: an unknown/empty role keeps the prefix untouched, so a caller
+    that passes something unexpected can never produce a bogus label.
+    """
+    if not _ROW_ROLE_LABEL:
+        return prefix
+    who = (role or "").strip().lower()
+    if who not in ("user", "assistant"):
+        return prefix
+    return prefix + who + ": "
+
+
 def _split_fragments(content: str, max_chars: int = _MAX_FRAGMENT_CHARS) -> List[str]:
     """Split one message into fact fragments at sentence boundaries.
 
@@ -2307,6 +2335,7 @@ def _aml_add_sync_locked(body: Dict[str, Any], deadline: float) -> JSONResponse:
     if parsed_messages:
         for _mi, (role, text) in enumerate(parsed_messages):
             _prefix = message_date_prefixes[_mi] if _mi < len(message_date_prefixes) else ""
+            _prefix = _with_role_label(_prefix, role)
             for frag in _split_fragments(text):
                 fragments.append((role, _prefix + frag))
     total_fragments = len(fragments)
